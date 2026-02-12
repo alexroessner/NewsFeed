@@ -56,6 +56,7 @@ Deliver a daily and on-demand Telegram briefing where:
 
 ### M4 — Memory and cache integration
 - [x] Preference memory updates from natural language controls (weight/style mutators).
+- [x] Natural-language preference command parser (more/less, tone, format).
 - [x] Reserved-candidate cache with freshness policy.
 - [x] “Show me more” retrieval path.
 
