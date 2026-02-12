@@ -3,6 +3,10 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
+
+from newsfeed.agents.simulated import ExpertCouncil, SimulatedResearchAgent
+from newsfeed.delivery.telegram import TelegramFormatter
+from newsfeed.memory.commands import parse_preference_commands
 from datetime import datetime, timezone
 
 from newsfeed.agents.simulated import ExpertCouncil, SimulatedResearchAgent
@@ -128,3 +132,25 @@ class NewsFeedEngine:
     def show_more(self, user_id: str, topic: str, already_seen_ids: set[str], limit: int = 5) -> list[str]:
         more = self.cache.get_more(user_id=user_id, topic=topic, already_seen_ids=already_seen_ids, limit=limit)
         return [f"{c.title} ({c.source})" for c in more]
+
+    def apply_user_feedback(self, user_id: str, feedback_text: str) -> dict[str, str]:
+        profile = self.preferences.get_or_create(user_id)
+        results: dict[str, str] = {}
+        commands = parse_preference_commands(feedback_text)
+
+        for cmd in commands:
+            if cmd.action == "topic_delta" and cmd.topic and cmd.value:
+                delta = float(cmd.value)
+                updated = self.preferences.apply_weight_adjustment(user_id, cmd.topic, delta)
+                results[f"topic:{cmd.topic}"] = str(updated.topic_weights.get(cmd.topic, 0.0))
+            elif cmd.action == "tone" and cmd.value:
+                self.preferences.apply_style_update(user_id, tone=cmd.value)
+                results["tone"] = cmd.value
+            elif cmd.action == "format" and cmd.value:
+                self.preferences.apply_style_update(user_id, fmt=cmd.value)
+                results["format"] = cmd.value
+
+        # ensure profile object touched for potential side effects/lints
+        _ = profile
+        return results
+

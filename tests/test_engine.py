@@ -63,5 +63,21 @@ class EngineTests(unittest.TestCase):
         self.assertIn("confidence bands", stack.refine_outlook("Base outlook."))
 
 
+    def test_apply_user_feedback_updates_profile(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        cfg = load_runtime_config(root / "config")
+        engine = NewsFeedEngine(cfg.agents, cfg.pipeline, cfg.personas, root / "personas")
+
+        updates = engine.apply_user_feedback(
+            "u-feedback",
+            "more geopolitics less celebrity news tone analyst format sections",
+        )
+
+        self.assertEqual(updates.get("tone"), "analyst")
+        self.assertEqual(updates.get("format"), "sections")
+        self.assertIn("topic:geopolitics", updates)
+        self.assertIn("topic:celebrity_news", updates)
+
+
 if __name__ == "__main__":
     unittest.main()
