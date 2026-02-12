@@ -5,7 +5,9 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
-from newsfeed.agents.simulated import ExpertCouncil, SimulatedResearchAgent
+from newsfeed.agents.base import ResearchAgent
+from newsfeed.agents.registry import create_agent
+from newsfeed.agents.simulated import ExpertCouncil
 from newsfeed.delivery.telegram import TelegramFormatter
 from newsfeed.intelligence.clustering import StoryClustering
 from newsfeed.intelligence.credibility import (
@@ -139,10 +141,12 @@ class NewsFeedEngine:
             ",".join(sorted(self._enabled_stages)),
         )
 
-    def _research_agents(self) -> list[SimulatedResearchAgent]:
+    def _research_agents(self) -> list[ResearchAgent]:
+        api_keys = self.pipeline.get("api_keys", {})
         agents = []
         for a in self.config.get("research_agents", []):
-            agents.append(SimulatedResearchAgent(a["id"], a["source"], a["mandate"]))
+            agent = create_agent(a, api_keys)
+            agents.append(agent)
         return agents
 
     async def _run_research_async(self, task: ResearchTask, top_k: int) -> list:

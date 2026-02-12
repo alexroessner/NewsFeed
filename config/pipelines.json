@@ -172,5 +172,12 @@
   "persistence": {
     "enabled": false,
     "state_dir": "state"
+  },
+  "api_keys": {
+    "_comment": "Add your API keys here. Agents without keys fall back to simulated data.",
+    "guardian": "",
+    "newsapi": "",
+    "reddit_client_id": "",
+    "reddit_client_secret": ""
   }
 }
