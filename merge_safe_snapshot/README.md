@@ -10,7 +10,6 @@ Ship a single-user vertical slice with:
 - cache-backed "show me more",
 - natural-language preference updates,
 - persona-driven review lenses.
-- natural-language preference updates.
 
 ## Project Structure
 - `config/agents.json`: declarative registry of agent roles and capabilities.
@@ -28,9 +27,6 @@ Ship a single-user vertical slice with:
 - `tools/open_clean_pr_branch.sh`: creates a fresh PR branch from latest `main` and validates before push.
 - `tools/repair_pr_branch.sh`: force-aligns a stale PR branch to `main` with backup tagging.
 - `tools/bootstrap_github_remote.sh`: configures `origin` from env secrets (`GH_TOKEN`/`GITHUB_TOKEN` + repo slug).
-- `docs/V1_EXECUTION_PLAN.md`: build sequence, milestones, and acceptance criteria.
-- `docs/SYSTEM_ARCHITECTURE.md`: architecture blueprint for runtime components.
-- `src/newsfeed/`: runtime scaffold for orchestration, memory, and delivery.
 
 ## Quick start
 ```bash
