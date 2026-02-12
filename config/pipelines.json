@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "limits": {
     "default_max_items": 10,
     "adjacent_reads_per_item": {"min": 2, "max": 3},
@@ -9,97 +9,168 @@
     "prediction_market_weight": "medium",
     "prediction_market_cap": "non-dominant"
   },
+  "scoring": {
+    "composite_weights": {
+      "evidence": 0.30,
+      "novelty": 0.25,
+      "preference_fit": 0.30,
+      "prediction_signal": 0.15
+    },
+    "trust_factor_weights": {
+      "reliability": 0.50,
+      "historical_accuracy": 0.30,
+      "corroboration": 0.20
+    },
+    "credibility_weights": {
+      "composite": 0.70,
+      "trust": 0.20,
+      "evidence": 0.10,
+      "corroboration_bonus_per_source": 0.08,
+      "corroboration_bonus_cap": 0.20
+    },
+    "thread_scoring": {
+      "source_bonus_per": 0.05,
+      "source_bonus_cap": 0.15,
+      "urgency_bonus": {
+        "routine": 0.0,
+        "elevated": 0.05,
+        "breaking": 0.15,
+        "critical": 0.25
+      }
+    },
+    "confidence_band_offset": 0.15,
+    "confidence_labels": {
+      "high_threshold": 0.80,
+      "moderate_threshold": 0.55
+    }
+  },
+  "expert_council": {
+    "keep_threshold": 0.62,
+    "confidence_min": 0.51,
+    "confidence_max": 0.99,
+    "min_votes_to_accept": "majority"
+  },
   "intelligence": {
+    "enabled_stages": [
+      "credibility",
+      "corroboration",
+      "urgency",
+      "diversity",
+      "clustering",
+      "georisk",
+      "trends"
+    ],
     "velocity_window_minutes": 30,
     "breaking_source_threshold": 3,
     "clustering_similarity": 0.6,
+    "cross_source_similarity_factor": 0.7,
     "trend_window_minutes": 60,
     "anomaly_threshold": 2.0,
+    "baseline_decay": 0.8,
     "max_items_per_source": 3,
+    "contrarian_novelty_threshold": 0.8,
+    "contrarian_evidence_threshold": 0.6,
     "source_tiers": {
-      "tier_1": ["reuters", "ap", "bbc", "guardian", "ft"],
-      "tier_2": ["x", "reddit", "web"]
-    }
+      "tier_1": {"sources": ["reuters", "ap", "bbc", "guardian", "ft"], "base_reliability": 0.85},
+      "tier_2": {"sources": ["x", "reddit", "web"], "base_reliability": 0.55},
+      "unknown_base_reliability": 0.50
+    },
+    "bias_profiles": {
+      "reuters": "center",
+      "ap": "center",
+      "bbc": "center-left",
+      "guardian": "left-leaning",
+      "ft": "center-right",
+      "x": "variable",
+      "reddit": "community-driven",
+      "web": "unverified"
+    },
+    "corroboration_increment": 0.02,
+    "urgency_velocity_thresholds": {
+      "critical": 0.8,
+      "breaking": 0.5,
+      "elevated": 0.3
+    },
+    "recency_elevated_minutes": 5,
+    "waning_novelty_threshold": 0.3
+  },
+  "georisk": {
+    "default_previous_risk": 0.3,
+    "escalation_threshold": 0.05,
+    "risk_weights": {
+      "base": 0.4,
+      "escalation_per_keyword": 0.03,
+      "volume_per_item": 0.02,
+      "volume_cap": 0.15
+    },
+    "urgency_risk_factor": {
+      "critical": 0.3,
+      "breaking": 0.2,
+      "elevated": 0.1
+    },
+    "max_drivers": 5,
+    "regions": {
+      "east_asia": ["china", "taiwan", "japan", "korea", "beijing", "tokyo", "seoul", "pyongyang"],
+      "south_asia": ["india", "pakistan", "bangladesh", "sri_lanka", "delhi", "islamabad"],
+      "middle_east": ["iran", "israel", "saudi", "yemen", "syria", "iraq", "gaza", "lebanon", "tehran"],
+      "europe": ["eu", "nato", "ukraine", "russia", "germany", "france", "uk", "brussels", "moscow", "kyiv"],
+      "africa": ["nigeria", "ethiopia", "kenya", "south_africa", "sahel", "sudan", "congo"],
+      "americas": ["us", "usa", "brazil", "mexico", "canada", "washington", "congress", "fed"],
+      "southeast_asia": ["asean", "philippines", "vietnam", "indonesia", "myanmar", "thailand"],
+      "central_asia": ["kazakhstan", "uzbekistan", "turkmenistan", "afghanistan", "taliban"],
+      "arctic": ["arctic", "greenland", "svalbard", "northern_passage"]
+    },
+    "escalation_keywords": [
+      "war", "invasion", "sanctions", "military", "nuclear", "missile",
+      "conflict", "coup", "blockade", "mobilization", "escalation",
+      "strike", "attack", "troops", "deployment"
+    ],
+    "deescalation_keywords": [
+      "ceasefire", "peace", "treaty", "negotiations", "diplomacy",
+      "withdrawal", "agreement", "talks", "summit", "cooperation"
+    ]
+  },
+  "urgency_keywords": {
+    "breaking": [
+      "breaking", "crisis", "war", "attack", "emergency", "collapse",
+      "invasion", "coup", "assassination", "catastrophe", "pandemic",
+      "shutdown", "explosion", "sanctions", "ceasefire", "martial_law"
+    ],
+    "elevated": [
+      "escalation", "tension", "warning", "alert", "surge", "protest",
+      "election", "summit", "treaty", "regulation", "volatility",
+      "disruption", "shortage", "scandal", "indictment"
+    ]
+  },
+  "briefing_type_thresholds": {
+    "breaking_alert_critical_min": 1,
+    "breaking_alert_breaking_min": 2
+  },
+  "preference_deltas": {
+    "more": 0.2,
+    "less": -0.2
   },
   "stages": [
     {"id": "ingress", "owner": "communication_agent", "outputs": ["request"]},
-    {
-      "id": "briefing",
-      "owner": "orchestrator_agent",
-      "inputs": ["request", "user_profile", "memory"],
-      "outputs": ["weighted_brief"]
-    },
-    {
-      "id": "research",
-      "owner": "orchestrator_agent",
-      "fanout": "research_agents",
-      "inputs": ["weighted_brief"],
-      "outputs": ["agent_reports", "agent_top5"]
-    },
-    {
-      "id": "intelligence_enrichment",
-      "owner": "orchestrator_agent",
-      "inputs": ["agent_top5"],
-      "outputs": ["enriched_candidates"],
-      "substages": [
-        "credibility_scoring",
-        "cross_corroboration",
-        "urgency_detection",
-        "source_diversity"
-      ]
-    },
-    {
-      "id": "expert_roundtable",
-      "owners": ["expert_quality_agent", "expert_relevance_agent", "expert_preference_fit_agent"],
-      "inputs": ["enriched_candidates", "user_profile"],
-      "outputs": ["ranked_candidates", "selected_items", "reserve_items"]
-    },
-    {
-      "id": "narrative_threading",
-      "owner": "orchestrator_agent",
-      "inputs": ["selected_items"],
-      "outputs": ["narrative_threads", "thread_map"]
-    },
-    {
-      "id": "geo_risk_assessment",
-      "owner": "orchestrator_agent",
-      "inputs": ["enriched_candidates"],
-      "outputs": ["geo_risk_index", "escalation_alerts"]
-    },
-    {
-      "id": "trend_analysis",
-      "owner": "orchestrator_agent",
-      "inputs": ["enriched_candidates"],
-      "outputs": ["trend_snapshots", "emerging_topics"]
-    },
-    {
-      "id": "internal_report_drafting",
-      "owner": "orchestrator_agent",
-      "inputs": ["selected_items", "narrative_threads", "geo_risk_index", "trend_snapshots"],
-      "outputs": ["internal_reports"]
-    },
-    {
-      "id": "editorial_review",
-      "owners": ["review_agent_style", "review_agent_clarity"],
-      "inputs": ["internal_reports", "user_style_profile"],
-      "outputs": ["final_user_report"]
-    },
-    {
-      "id": "delivery",
-      "owner": "communication_agent",
-      "inputs": ["final_user_report"],
-      "outputs": ["delivery_receipt"]
-    },
-    {
-      "id": "feedback_writeback",
-      "owner": "orchestrator_agent",
-      "inputs": ["delivery_receipt", "user_feedback"],
-      "outputs": ["memory_updates", "cache_updates"]
-    }
+    {"id": "briefing", "owner": "orchestrator_agent", "inputs": ["request", "user_profile", "memory"], "outputs": ["weighted_brief"]},
+    {"id": "research", "owner": "orchestrator_agent", "fanout": "research_agents", "inputs": ["weighted_brief"], "outputs": ["agent_reports", "agent_top5"]},
+    {"id": "intelligence_enrichment", "owner": "orchestrator_agent", "inputs": ["agent_top5"], "outputs": ["enriched_candidates"]},
+    {"id": "expert_roundtable", "owners": ["expert_quality_agent", "expert_relevance_agent", "expert_preference_fit_agent"], "inputs": ["enriched_candidates", "user_profile"], "outputs": ["ranked_candidates", "selected_items", "reserve_items"]},
+    {"id": "narrative_threading", "owner": "orchestrator_agent", "inputs": ["selected_items"], "outputs": ["narrative_threads", "thread_map"]},
+    {"id": "geo_risk_assessment", "owner": "orchestrator_agent", "inputs": ["enriched_candidates"], "outputs": ["geo_risk_index", "escalation_alerts"]},
+    {"id": "trend_analysis", "owner": "orchestrator_agent", "inputs": ["enriched_candidates"], "outputs": ["trend_snapshots", "emerging_topics"]},
+    {"id": "internal_report_drafting", "owner": "orchestrator_agent", "inputs": ["selected_items", "narrative_threads", "geo_risk_index", "trend_snapshots"], "outputs": ["internal_reports"]},
+    {"id": "editorial_review", "owners": ["review_agent_style", "review_agent_clarity"], "inputs": ["internal_reports", "user_style_profile"], "outputs": ["final_user_report"]},
+    {"id": "delivery", "owner": "communication_agent", "inputs": ["final_user_report"], "outputs": ["delivery_receipt"]},
+    {"id": "feedback_writeback", "owner": "orchestrator_agent", "inputs": ["delivery_receipt", "user_feedback"], "outputs": ["memory_updates", "cache_updates"]}
   ],
   "cache_policy": {
     "key_dimensions": ["user_id", "topic_cluster", "recency_window", "confidence_band"],
     "serve_cache_before_rerun": true,
     "stale_after_minutes": 180
+  },
+  "persistence": {
+    "enabled": false,
+    "state_dir": "state"
   }
 }

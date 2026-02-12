@@ -7,10 +7,11 @@ from newsfeed.models.domain import CandidateItem, TrendSnapshot
 
 
 class TrendDetector:
-    def __init__(self, window_minutes: int = 60, anomaly_threshold: float = 2.0) -> None:
+    def __init__(self, window_minutes: int = 60, anomaly_threshold: float = 2.0, baseline_decay: float = 0.8) -> None:
         self.window = timedelta(minutes=window_minutes)
         self.window_minutes = window_minutes
         self.anomaly_threshold = anomaly_threshold
+        self.baseline_decay = baseline_decay
         self._baseline: dict[str, float] = {}
 
     def analyze(self, candidates: list[CandidateItem]) -> list[TrendSnapshot]:
@@ -36,7 +37,9 @@ class TrendDetector:
             anomaly_score = velocity / max(baseline, 0.01)
             is_emerging = anomaly_score >= self.anomaly_threshold and total >= 2
 
-            self._baseline[topic] = round(baseline * 0.8 + velocity * 0.2, 4)
+            self._baseline[topic] = round(
+                baseline * self.baseline_decay + velocity * (1 - self.baseline_decay), 4
+            )
 
             snapshots.append(TrendSnapshot(
                 topic=topic,
@@ -53,3 +56,6 @@ class TrendDetector:
     def get_emerging_topics(self, candidates: list[CandidateItem]) -> list[str]:
         snapshots = self.analyze(candidates)
         return [s.topic for s in snapshots if s.is_emerging]
+
+    def snapshot(self) -> dict[str, float]:
+        return dict(self._baseline)

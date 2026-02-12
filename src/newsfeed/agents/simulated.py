@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
 
 from newsfeed.models.domain import CandidateItem, DebateRecord, DebateVote, ResearchTask
 
@@ -47,17 +48,38 @@ class SimulatedResearchAgent:
 
 
 class ExpertCouncil:
-    def __init__(self, expert_ids: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        expert_ids: list[str] | None = None,
+        keep_threshold: float = 0.62,
+        confidence_min: float = 0.51,
+        confidence_max: float = 0.99,
+        min_votes_to_accept: str = "majority",
+    ) -> None:
         self.expert_ids = expert_ids or [
             "expert_quality_agent",
             "expert_relevance_agent",
             "expert_preference_fit_agent",
         ]
+        self.keep_threshold = keep_threshold
+        self.confidence_min = confidence_min
+        self.confidence_max = confidence_max
+        self.min_votes_to_accept = min_votes_to_accept
+
+    def _required_votes(self) -> int:
+        if self.min_votes_to_accept == "majority":
+            return math.ceil(len(self.expert_ids) / 2)
+        if self.min_votes_to_accept == "unanimous":
+            return len(self.expert_ids)
+        try:
+            return int(self.min_votes_to_accept)
+        except (ValueError, TypeError):
+            return math.ceil(len(self.expert_ids) / 2)
 
     def _vote(self, expert_id: str, candidate: CandidateItem) -> DebateVote:
         score = candidate.composite_score()
-        keep = score >= 0.62
-        confidence = min(0.99, max(0.51, score))
+        keep = score >= self.keep_threshold
+        confidence = min(self.confidence_max, max(self.confidence_min, score))
         return DebateVote(
             expert_id=expert_id,
             candidate_id=candidate.candidate_id,
@@ -76,15 +98,16 @@ class ExpertCouncil:
 
     def select(self, candidates: list[CandidateItem], max_items: int) -> tuple[list[CandidateItem], list[CandidateItem], DebateRecord]:
         debate = self.debate(candidates)
+        required = self._required_votes()
 
         votes_by_candidate: dict[str, list[DebateVote]] = {}
         for vote in debate.votes:
             votes_by_candidate.setdefault(vote.candidate_id, []).append(vote)
 
         accepted_ids: set[str] = set()
-        for candidate_id, votes in votes_by_candidate.items():
-            keep_votes = sum(1 for v in votes if v.keep)
-            if keep_votes >= 2:
+        for candidate_id, cvotes in votes_by_candidate.items():
+            keep_votes = sum(1 for v in cvotes if v.keep)
+            if keep_votes >= required:
                 accepted_ids.add(candidate_id)
 
         deduped: dict[str, CandidateItem] = {}
