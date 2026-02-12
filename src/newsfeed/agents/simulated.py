@@ -4,6 +4,9 @@ import asyncio
 import hashlib
 
 from newsfeed.models.domain import CandidateItem, DebateRecord, DebateVote, ResearchTask
+import hashlib
+
+from newsfeed.models.domain import CandidateItem, ResearchTask
 
 
 class SimulatedResearchAgent:
@@ -91,6 +94,11 @@ class ExpertCouncil:
         for c in sorted(candidates, key=lambda x: x.composite_score(), reverse=True):
             if c.candidate_id not in accepted_ids:
                 continue
+
+class ExpertCouncil:
+    def select(self, candidates: list[CandidateItem], max_items: int) -> tuple[list[CandidateItem], list[CandidateItem]]:
+        deduped: dict[str, CandidateItem] = {}
+        for c in sorted(candidates, key=lambda x: x.composite_score(), reverse=True):
             dedupe_key = c.title.lower().strip()
             if dedupe_key not in deduped:
                 deduped[dedupe_key] = c
@@ -99,3 +107,4 @@ class ExpertCouncil:
         selected = ranked[:max_items]
         reserve = ranked[max_items:]
         return selected, reserve, debate
+        return selected, reserve
