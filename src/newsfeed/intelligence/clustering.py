@@ -13,8 +13,9 @@ from newsfeed.models.domain import (
 
 
 class StoryClustering:
-    def __init__(self, similarity_threshold: float = 0.6) -> None:
+    def __init__(self, similarity_threshold: float = 0.6, cross_source_factor: float = 0.7) -> None:
         self.similarity_threshold = similarity_threshold
+        self.cross_source_factor = cross_source_factor
 
     def cluster(self, candidates: list[CandidateItem]) -> list[NarrativeThread]:
         by_topic: dict[str, list[CandidateItem]] = defaultdict(list)
@@ -88,7 +89,7 @@ class StoryClustering:
 
         if a.source == b.source:
             return overlap >= self.similarity_threshold
-        return overlap >= (self.similarity_threshold * 0.7)
+        return overlap >= (self.similarity_threshold * self.cross_source_factor)
 
     def _aggregate_urgency(self, items: list[CandidateItem]) -> UrgencyLevel:
         priority = {
@@ -115,9 +116,8 @@ class StoryClustering:
         avg = sum(scores) / len(scores)
         spread = max(scores) - min(scores) if len(scores) > 1 else 0.1
 
-        multi_source = len(sources) >= 2
         assumptions = []
-        if multi_source:
+        if len(sources) >= 2:
             assumptions.append(f"Corroborated across {len(sources)} sources")
         else:
             assumptions.append("Single-source reporting")

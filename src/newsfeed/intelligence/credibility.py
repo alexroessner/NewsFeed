@@ -1,41 +1,49 @@
 from __future__ import annotations
 
 import hashlib
+from typing import Any
 
 from newsfeed.models.domain import CandidateItem, SourceReliability
 
 
-# Known tier-1 wire services and outlets with strong editorial standards
-_TIER1_SOURCES = frozenset({"reuters", "ap", "bbc", "guardian", "ft"})
-_TIER2_SOURCES = frozenset({"x", "reddit", "web"})
-
-_BIAS_PROFILES: dict[str, str] = {
-    "reuters": "center",
-    "ap": "center",
-    "bbc": "center-left",
-    "guardian": "left-leaning",
-    "ft": "center-right",
-    "x": "variable",
-    "reddit": "community-driven",
-    "web": "unverified",
-}
-
-
 class CredibilityTracker:
-    def __init__(self) -> None:
+    def __init__(self, intel_cfg: dict[str, Any] | None = None) -> None:
+        cfg = intel_cfg or {}
         self._sources: dict[str, SourceReliability] = {}
 
+        tiers = cfg.get("source_tiers", {})
+        t1 = tiers.get("tier_1", {})
+        t2 = tiers.get("tier_2", {})
+        self._tier1_sources = frozenset(t1.get("sources", ["reuters", "ap", "bbc", "guardian", "ft"]))
+        self._tier2_sources = frozenset(t2.get("sources", ["x", "reddit", "web"]))
+        self._tier1_base = t1.get("base_reliability", 0.85)
+        self._tier2_base = t2.get("base_reliability", 0.55)
+        self._unknown_base = tiers.get("unknown_base_reliability", 0.50)
+        self._bias_profiles: dict[str, str] = cfg.get("bias_profiles", {
+            "reuters": "center", "ap": "center", "bbc": "center-left",
+            "guardian": "left-leaning", "ft": "center-right",
+            "x": "variable", "reddit": "community-driven", "web": "unverified",
+        })
+        self._corroboration_increment = cfg.get("corroboration_increment", 0.02)
+
+        scoring = cfg.get("_scoring", {}).get("credibility_weights", {})
+        self._w_composite = scoring.get("composite", 0.70)
+        self._w_trust = scoring.get("trust", 0.20)
+        self._w_evidence = scoring.get("evidence", 0.10)
+        self._bonus_per = scoring.get("corroboration_bonus_per_source", 0.08)
+        self._bonus_cap = scoring.get("corroboration_bonus_cap", 0.20)
+
     def _init_source(self, source_id: str) -> SourceReliability:
-        if source_id in _TIER1_SOURCES:
-            base = 0.85
-        elif source_id in _TIER2_SOURCES:
-            base = 0.55
+        if source_id in self._tier1_sources:
+            base = self._tier1_base
+        elif source_id in self._tier2_sources:
+            base = self._tier2_base
         else:
-            base = 0.50
+            base = self._unknown_base
         return SourceReliability(
             source_id=source_id,
             reliability_score=base,
-            bias_rating=_BIAS_PROFILES.get(source_id, "unrated"),
+            bias_rating=self._bias_profiles.get(source_id, "unrated"),
             historical_accuracy=base,
             corroboration_rate=0.5,
         )
@@ -53,13 +61,18 @@ class CredibilityTracker:
         for sid in (source_a, source_b):
             sr = self.get_source(sid)
             old = sr.corroboration_rate
-            sr.corroboration_rate = round(min(1.0, old + 0.02), 3)
+            sr.corroboration_rate = round(min(1.0, old + self._corroboration_increment), 3)
 
     def score_candidate(self, item: CandidateItem) -> float:
         sr = self.get_source(item.source)
         trust = sr.trust_factor()
-        corroboration_bonus = min(0.2, 0.08 * len(item.corroborated_by))
-        return min(1.0, item.composite_score() * 0.7 + trust * 0.2 + corroboration_bonus + 0.1 * item.evidence_score)
+        corroboration_bonus = min(self._bonus_cap, self._bonus_per * len(item.corroborated_by))
+        return min(1.0, item.composite_score() * self._w_composite + trust * self._w_trust + corroboration_bonus + self._w_evidence * item.evidence_score)
+
+    def snapshot(self) -> dict[str, dict]:
+        return {sid: {"reliability": sr.reliability_score, "accuracy": sr.historical_accuracy,
+                       "corroboration": sr.corroboration_rate, "seen": sr.total_items_seen}
+                for sid, sr in self._sources.items()}
 
 
 def detect_cross_corroboration(candidates: list[CandidateItem]) -> list[CandidateItem]:

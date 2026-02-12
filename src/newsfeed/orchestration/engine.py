@@ -16,7 +16,7 @@ from newsfeed.intelligence.georisk import GeoRiskIndex
 from newsfeed.intelligence.trends import TrendDetector
 from newsfeed.intelligence.urgency import BreakingDetector
 from newsfeed.memory.commands import parse_preference_commands
-from newsfeed.memory.store import CandidateCache, PreferenceStore
+from newsfeed.memory.store import CandidateCache, PreferenceStore, StatePersistence
 from newsfeed.models.domain import (
     BriefingType,
     ConfidenceBand,
@@ -24,6 +24,7 @@ from newsfeed.models.domain import (
     ReportItem,
     ResearchTask,
     UrgencyLevel,
+    configure_scoring,
 )
 from newsfeed.review.personas import PersonaReviewStack
 
@@ -33,11 +34,27 @@ class NewsFeedEngine:
         self.config = config
         self.pipeline = pipeline
         self.personas = personas
+
+        # Inject scoring config into domain models
+        scoring_cfg = pipeline.get("scoring", {})
+        configure_scoring(scoring_cfg)
+
         stale_after = pipeline.get("cache_policy", {}).get("stale_after_minutes", 180)
         expert_ids = [e.get("id") for e in config.get("expert_agents", []) if e.get("id")]
+
         self.preferences = PreferenceStore()
         self.cache = CandidateCache(stale_after_minutes=stale_after)
-        self.experts = ExpertCouncil(expert_ids=expert_ids)
+
+        # Expert council with configurable thresholds
+        ec_cfg = pipeline.get("expert_council", {})
+        self.experts = ExpertCouncil(
+            expert_ids=expert_ids,
+            keep_threshold=ec_cfg.get("keep_threshold", 0.62),
+            confidence_min=ec_cfg.get("confidence_min", 0.51),
+            confidence_max=ec_cfg.get("confidence_max", 0.99),
+            min_votes_to_accept=ec_cfg.get("min_votes_to_accept", "majority"),
+        )
+
         self.formatter = TelegramFormatter()
         self.review_stack = PersonaReviewStack(
             personas_dir=personas_dir,
@@ -45,20 +62,52 @@ class NewsFeedEngine:
             persona_notes=personas.get("persona_notes", {}),
         )
 
+        # Intelligence modules with full config propagation
         intel_cfg = pipeline.get("intelligence", {})
-        self.credibility = CredibilityTracker()
+        self._enabled_stages = set(intel_cfg.get("enabled_stages", [
+            "credibility", "corroboration", "urgency",
+            "diversity", "clustering", "georisk", "trends",
+        ]))
+
+        self.credibility = CredibilityTracker(intel_cfg={
+            **intel_cfg,
+            "_scoring": scoring_cfg,
+        })
         self.breaking_detector = BreakingDetector(
             velocity_window_minutes=intel_cfg.get("velocity_window_minutes", 30),
             breaking_source_threshold=intel_cfg.get("breaking_source_threshold", 3),
+            urgency_keywords_cfg=pipeline.get("urgency_keywords"),
+            velocity_thresholds=intel_cfg.get("urgency_velocity_thresholds"),
+            recency_elevated_minutes=intel_cfg.get("recency_elevated_minutes", 5),
+            waning_novelty_threshold=intel_cfg.get("waning_novelty_threshold", 0.3),
         )
         self.clustering = StoryClustering(
             similarity_threshold=intel_cfg.get("clustering_similarity", 0.6),
+            cross_source_factor=intel_cfg.get("cross_source_similarity_factor", 0.7),
         )
-        self.georisk = GeoRiskIndex()
+        self.georisk = GeoRiskIndex(georisk_cfg=pipeline.get("georisk"))
         self.trends = TrendDetector(
             window_minutes=intel_cfg.get("trend_window_minutes", 60),
             anomaly_threshold=intel_cfg.get("anomaly_threshold", 2.0),
+            baseline_decay=intel_cfg.get("baseline_decay", 0.8),
         )
+
+        # Configurable thresholds
+        self._confidence_offset = scoring_cfg.get("confidence_band_offset", 0.15)
+        self._contrarian_novelty = intel_cfg.get("contrarian_novelty_threshold", 0.8)
+        self._contrarian_evidence = intel_cfg.get("contrarian_evidence_threshold", 0.6)
+        self._preference_deltas = pipeline.get("preference_deltas", {"more": 0.2, "less": -0.2})
+
+        bt = pipeline.get("briefing_type_thresholds", {})
+        self._bt_critical_min = bt.get("breaking_alert_critical_min", 1)
+        self._bt_breaking_min = bt.get("breaking_alert_breaking_min", 2)
+
+        # State persistence
+        persist_cfg = pipeline.get("persistence", {})
+        self._persistence: StatePersistence | None = None
+        if persist_cfg.get("enabled", False):
+            state_dir = Path(persist_cfg.get("state_dir", "state"))
+            self._persistence = StatePersistence(state_dir)
 
     def _research_agents(self) -> list[SimulatedResearchAgent]:
         agents = []
@@ -88,14 +137,20 @@ class NewsFeedEngine:
         top_k = self.pipeline.get("limits", {}).get("top_discoveries_per_research_agent", 5)
         all_candidates = asyncio.run(self._run_research_async(task, top_k))
 
-        # Stage 2: Intelligence enrichment
-        for c in all_candidates:
-            self.credibility.record_item(c)
+        # Stage 2: Intelligence enrichment (conditionally enabled)
+        if "credibility" in self._enabled_stages:
+            for c in all_candidates:
+                self.credibility.record_item(c)
 
-        all_candidates = detect_cross_corroboration(all_candidates)
-        all_candidates = self.breaking_detector.assess(all_candidates)
-        max_per_source = self.pipeline.get("intelligence", {}).get("max_items_per_source", 3)
-        all_candidates = enforce_source_diversity(all_candidates, max_per_source=max_per_source)
+        if "corroboration" in self._enabled_stages:
+            all_candidates = detect_cross_corroboration(all_candidates)
+
+        if "urgency" in self._enabled_stages:
+            all_candidates = self.breaking_detector.assess(all_candidates)
+
+        if "diversity" in self._enabled_stages:
+            max_per_source = self.pipeline.get("intelligence", {}).get("max_items_per_source", 3)
+            all_candidates = enforce_source_diversity(all_candidates, max_per_source=max_per_source)
 
         # Stage 3: Expert council selection
         selected, reserve, debate = self.experts.select(all_candidates, limit)
@@ -104,13 +159,19 @@ class NewsFeedEngine:
         self.cache.put(user_id, dominant_topic, reserve)
 
         # Stage 4: Narrative threading
-        threads = self.clustering.cluster(selected)
+        threads = []
+        if "clustering" in self._enabled_stages:
+            threads = self.clustering.cluster(selected)
 
         # Stage 5: Geo-risk assessment
-        geo_risks = self.georisk.assess(all_candidates)
+        geo_risks = []
+        if "georisk" in self._enabled_stages:
+            geo_risks = self.georisk.assess(all_candidates)
 
         # Stage 6: Trend analysis
-        trend_snapshots = self.trends.analyze(all_candidates)
+        trend_snapshots = []
+        if "trends" in self._enabled_stages:
+            trend_snapshots = self.trends.analyze(all_candidates)
 
         # Stage 7: Report assembly with intelligence enrichment
         report_items = []
@@ -132,17 +193,18 @@ class NewsFeedEngine:
             )
 
             cred_score = self.credibility.score_candidate(c)
+            offset = self._confidence_offset
             confidence = ConfidenceBand(
-                low=round(max(0.0, cred_score - 0.15), 3),
+                low=round(max(0.0, cred_score - offset), 3),
                 mid=round(cred_score, 3),
-                high=round(min(1.0, cred_score + 0.15), 3),
+                high=round(min(1.0, cred_score + offset), 3),
                 key_assumptions=self._build_assumptions(c),
             )
 
             contrarian = ""
             if c.contrarian_signal:
                 contrarian = c.contrarian_signal
-            elif c.novelty_score > 0.8 and c.evidence_score < 0.6:
+            elif c.novelty_score > self._contrarian_novelty and c.evidence_score < self._contrarian_evidence:
                 contrarian = "High novelty but limited evidence — monitor for confirmation."
 
             report_items.append(
@@ -161,6 +223,12 @@ class NewsFeedEngine:
         # Stage 8: Determine briefing type
         briefing_type = self._determine_briefing_type(selected)
 
+        # Collect active intelligence stages for metadata
+        active_stages = [s for s in [
+            "credibility", "corroboration", "urgency",
+            "diversity", "clustering", "georisk", "trends",
+        ] if s in self._enabled_stages]
+
         payload = DeliveryPayload(
             user_id=user_id,
             generated_at=datetime.now(timezone.utc),
@@ -174,16 +242,18 @@ class NewsFeedEngine:
                 "thread_count": len(threads),
                 "geo_risk_regions": len(geo_risks),
                 "emerging_trends": sum(1 for t in trend_snapshots if t.is_emerging),
-                "intelligence_stages": [
-                    "credibility", "corroboration", "urgency",
-                    "diversity", "clustering", "georisk", "trends",
-                ],
+                "intelligence_stages": active_stages,
             },
             briefing_type=briefing_type,
             threads=threads,
             geo_risks=geo_risks,
             trends=trend_snapshots,
         )
+
+        # Persist state if enabled
+        if self._persistence:
+            self._save_state()
+
         return self.formatter.format(payload)
 
     def show_more(self, user_id: str, topic: str, already_seen_ids: set[str], limit: int = 5) -> list[str]:
@@ -191,9 +261,8 @@ class NewsFeedEngine:
         return [f"{c.title} ({c.source})" for c in more]
 
     def apply_user_feedback(self, user_id: str, feedback_text: str) -> dict[str, str]:
-        profile = self.preferences.get_or_create(user_id)
         results: dict[str, str] = {}
-        commands = parse_preference_commands(feedback_text)
+        commands = parse_preference_commands(feedback_text, deltas=self._preference_deltas)
 
         for cmd in commands:
             if cmd.action == "topic_delta" and cmd.topic and cmd.value:
@@ -206,8 +275,16 @@ class NewsFeedEngine:
             elif cmd.action == "format" and cmd.value:
                 self.preferences.apply_style_update(user_id, fmt=cmd.value)
                 results["format"] = cmd.value
+            elif cmd.action == "region" and cmd.value:
+                self.preferences.apply_region(user_id, cmd.value)
+                results["region"] = cmd.value
+            elif cmd.action == "cadence" and cmd.value:
+                self.preferences.apply_cadence(user_id, cmd.value)
+                results["cadence"] = cmd.value
+            elif cmd.action == "max_items" and cmd.value:
+                self.preferences.apply_max_items(user_id, int(cmd.value))
+                results["max_items"] = cmd.value
 
-        _ = profile
         return results
 
     def _build_assumptions(self, c) -> list[str]:
@@ -229,8 +306,16 @@ class NewsFeedEngine:
         critical_count = sum(1 for c in selected if c.urgency == UrgencyLevel.CRITICAL)
         breaking_count = sum(1 for c in selected if c.urgency == UrgencyLevel.BREAKING)
 
-        if critical_count >= 1:
+        if critical_count >= self._bt_critical_min:
             return BriefingType.BREAKING_ALERT
-        if breaking_count >= 2:
+        if breaking_count >= self._bt_breaking_min:
             return BriefingType.BREAKING_ALERT
         return BriefingType.MORNING_DIGEST
+
+    def _save_state(self) -> None:
+        if not self._persistence:
+            return
+        self._persistence.save("preferences", self.preferences.snapshot())
+        self._persistence.save("credibility", self.credibility.snapshot())
+        self._persistence.save("georisk", self.georisk.snapshot())
+        self._persistence.save("trends", self.trends.snapshot())
