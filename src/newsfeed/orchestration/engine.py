@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -19,14 +20,34 @@ from newsfeed.memory.commands import parse_preference_commands
 from newsfeed.memory.store import CandidateCache, PreferenceStore, StatePersistence
 from newsfeed.models.domain import (
     BriefingType,
+    CandidateItem,
     ConfidenceBand,
     DeliveryPayload,
     ReportItem,
     ResearchTask,
     UrgencyLevel,
     configure_scoring,
+    validate_candidate,
 )
 from newsfeed.review.personas import PersonaReviewStack
+
+log = logging.getLogger(__name__)
+
+
+def _run_sync(coro: object) -> object:
+    """Run a coroutine safely, whether or not an event loop is already running."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop is not None and loop.is_running():
+        # Already inside an async context — run agents synchronously to avoid
+        # nested event-loop errors.
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(asyncio.run, coro).result()
+    return asyncio.run(coro)
 
 
 class NewsFeedEngine:
@@ -34,6 +55,8 @@ class NewsFeedEngine:
         self.config = config
         self.pipeline = pipeline
         self.personas = personas
+
+        log.info("Initializing NewsFeedEngine (config v%s)", pipeline.get("version", "?"))
 
         # Inject scoring config into domain models
         scoring_cfg = pipeline.get("scoring", {})
@@ -109,6 +132,13 @@ class NewsFeedEngine:
             state_dir = Path(persist_cfg.get("state_dir", "state"))
             self._persistence = StatePersistence(state_dir)
 
+        log.info(
+            "Engine ready: %d agents, %d experts, stages=%s",
+            len(config.get("research_agents", [])),
+            len(expert_ids),
+            ",".join(sorted(self._enabled_stages)),
+        )
+
     def _research_agents(self) -> list[SimulatedResearchAgent]:
         agents = []
         for a in self.config.get("research_agents", []):
@@ -123,7 +153,12 @@ class NewsFeedEngine:
             flattened.extend(chunk)
         return flattened
 
+    def _run_research(self, task: ResearchTask, top_k: int) -> list[CandidateItem]:
+        """Run research fan-out, safely handling sync/async contexts."""
+        return _run_sync(self._run_research_async(task, top_k))
+
     def handle_request(self, user_id: str, prompt: str, weighted_topics: dict[str, float], max_items: int | None = None) -> str:
+        log.info("handle_request user=%s prompt=%r", user_id, prompt[:80])
         profile = self.preferences.get_or_create(user_id)
         limit = min(max_items or profile.max_items, self.pipeline.get("limits", {}).get("default_max_items", 10))
         task = ResearchTask(
@@ -135,25 +170,25 @@ class NewsFeedEngine:
 
         # Stage 1: Research fan-out
         top_k = self.pipeline.get("limits", {}).get("top_discoveries_per_research_agent", 5)
-        all_candidates = asyncio.run(self._run_research_async(task, top_k))
+        all_candidates = self._run_research(task, top_k)
+        log.info("Research produced %d candidates", len(all_candidates))
 
-        # Stage 2: Intelligence enrichment (conditionally enabled)
-        if "credibility" in self._enabled_stages:
-            for c in all_candidates:
-                self.credibility.record_item(c)
+        # Validate candidates from agents
+        valid_candidates: list[CandidateItem] = []
+        for c in all_candidates:
+            issues = validate_candidate(c)
+            if issues:
+                log.warning("Candidate %s has issues: %s — skipping", c.candidate_id, "; ".join(issues))
+            else:
+                valid_candidates.append(c)
+        all_candidates = valid_candidates
 
-        if "corroboration" in self._enabled_stages:
-            all_candidates = detect_cross_corroboration(all_candidates)
-
-        if "urgency" in self._enabled_stages:
-            all_candidates = self.breaking_detector.assess(all_candidates)
-
-        if "diversity" in self._enabled_stages:
-            max_per_source = self.pipeline.get("intelligence", {}).get("max_items_per_source", 3)
-            all_candidates = enforce_source_diversity(all_candidates, max_per_source=max_per_source)
+        # Stage 2: Intelligence enrichment (conditionally enabled, with error isolation)
+        all_candidates = self._run_intelligence(all_candidates)
 
         # Stage 3: Expert council selection
         selected, reserve, debate = self.experts.select(all_candidates, limit)
+        log.info("Expert council: %d selected, %d reserve, %d votes", len(selected), len(reserve), len(debate.votes))
 
         dominant_topic = max(weighted_topics, key=weighted_topics.get, default="general")
         self.cache.put(user_id, dominant_topic, reserve)
@@ -161,64 +196,29 @@ class NewsFeedEngine:
         # Stage 4: Narrative threading
         threads = []
         if "clustering" in self._enabled_stages:
-            threads = self.clustering.cluster(selected)
+            try:
+                threads = self.clustering.cluster(selected)
+            except Exception:
+                log.exception("Clustering stage failed, continuing without threads")
 
         # Stage 5: Geo-risk assessment
         geo_risks = []
         if "georisk" in self._enabled_stages:
-            geo_risks = self.georisk.assess(all_candidates)
+            try:
+                geo_risks = self.georisk.assess(all_candidates)
+            except Exception:
+                log.exception("Georisk stage failed, continuing without geo risks")
 
         # Stage 6: Trend analysis
         trend_snapshots = []
         if "trends" in self._enabled_stages:
-            trend_snapshots = self.trends.analyze(all_candidates)
+            try:
+                trend_snapshots = self.trends.analyze(all_candidates)
+            except Exception:
+                log.exception("Trend stage failed, continuing without trends")
 
-        # Stage 7: Report assembly with intelligence enrichment
-        report_items = []
-        adjacent_bounds = self.pipeline.get("limits", {}).get("adjacent_reads_per_item", {"min": 2, "max": 3})
-        adjacent_count = adjacent_bounds.get("max", 3)
-
-        thread_map: dict[str, str] = {}
-        for thread in threads:
-            for c in thread.candidates:
-                thread_map[c.candidate_id] = thread.thread_id
-
-        for c in selected:
-            reads = [f"Context read {i + 1} for {c.topic}" for i in range(adjacent_count)]
-            why = self.review_stack.refine_why(
-                f"Aligned with your weighted interest in {c.topic} and strong source quality."
-            )
-            outlook = self.review_stack.refine_outlook(
-                "Market and narrative signals suggest elevated watch priority."
-            )
-
-            cred_score = self.credibility.score_candidate(c)
-            offset = self._confidence_offset
-            confidence = ConfidenceBand(
-                low=round(max(0.0, cred_score - offset), 3),
-                mid=round(cred_score, 3),
-                high=round(min(1.0, cred_score + offset), 3),
-                key_assumptions=self._build_assumptions(c),
-            )
-
-            contrarian = ""
-            if c.contrarian_signal:
-                contrarian = c.contrarian_signal
-            elif c.novelty_score > self._contrarian_novelty and c.evidence_score < self._contrarian_evidence:
-                contrarian = "High novelty but limited evidence — monitor for confirmation."
-
-            report_items.append(
-                ReportItem(
-                    candidate=c,
-                    why_it_matters=why,
-                    what_changed="New cross-source confirmation and discussion momentum since last cycle.",
-                    predictive_outlook=outlook,
-                    adjacent_reads=reads,
-                    confidence=confidence,
-                    thread_id=thread_map.get(c.candidate_id),
-                    contrarian_note=contrarian,
-                )
-            )
+        # Stage 7: Report assembly
+        report_items = self._assemble_report(selected, threads)
 
         # Stage 8: Determine briefing type
         briefing_type = self._determine_briefing_type(selected)
@@ -252,15 +252,99 @@ class NewsFeedEngine:
 
         # Persist state if enabled
         if self._persistence:
-            self._save_state()
+            try:
+                self._save_state()
+            except Exception:
+                log.exception("State persistence failed")
 
+        log.info("Report generated: %d items, briefing=%s", len(report_items), briefing_type.value)
         return self.formatter.format(payload)
+
+    def _run_intelligence(self, candidates: list[CandidateItem]) -> list[CandidateItem]:
+        """Run intelligence enrichment stages with error isolation."""
+        if "credibility" in self._enabled_stages:
+            try:
+                for c in candidates:
+                    self.credibility.record_item(c)
+            except Exception:
+                log.exception("Credibility stage failed")
+
+        if "corroboration" in self._enabled_stages:
+            try:
+                candidates = detect_cross_corroboration(candidates)
+            except Exception:
+                log.exception("Corroboration stage failed")
+
+        if "urgency" in self._enabled_stages:
+            try:
+                candidates = self.breaking_detector.assess(candidates)
+            except Exception:
+                log.exception("Urgency stage failed")
+
+        if "diversity" in self._enabled_stages:
+            try:
+                max_per_source = self.pipeline.get("intelligence", {}).get("max_items_per_source", 3)
+                candidates = enforce_source_diversity(candidates, max_per_source=max_per_source)
+            except Exception:
+                log.exception("Diversity stage failed")
+
+        return candidates
+
+    def _assemble_report(self, selected: list[CandidateItem], threads: list) -> list[ReportItem]:
+        """Assemble report items from selected candidates."""
+        report_items = []
+        adjacent_bounds = self.pipeline.get("limits", {}).get("adjacent_reads_per_item", {"min": 2, "max": 3})
+        adjacent_count = adjacent_bounds.get("max", 3)
+
+        thread_map: dict[str, str] = {}
+        for thread in threads:
+            for c in thread.candidates:
+                thread_map[c.candidate_id] = thread.thread_id
+
+        for c in selected:
+            reads = [f"Context read {i + 1} for {c.topic}" for i in range(adjacent_count)]
+            why = self.review_stack.refine_why(
+                f"Aligned with your weighted interest in {c.topic} and strong source quality."
+            )
+            outlook = self.review_stack.refine_outlook(
+                "Market and narrative signals suggest elevated watch priority."
+            )
+
+            cred_score = self.credibility.score_candidate(c)
+            offset = self._confidence_offset
+            confidence = ConfidenceBand(
+                low=round(max(0.0, cred_score - offset), 3),
+                mid=round(min(1.0, cred_score), 3),
+                high=round(min(1.0, cred_score + offset), 3),
+                key_assumptions=self._build_assumptions(c),
+            )
+
+            contrarian = ""
+            if c.contrarian_signal:
+                contrarian = c.contrarian_signal
+            elif c.novelty_score > self._contrarian_novelty and c.evidence_score < self._contrarian_evidence:
+                contrarian = "High novelty but limited evidence — monitor for confirmation."
+
+            report_items.append(
+                ReportItem(
+                    candidate=c,
+                    why_it_matters=why,
+                    what_changed="New cross-source confirmation and discussion momentum since last cycle.",
+                    predictive_outlook=outlook,
+                    adjacent_reads=reads,
+                    confidence=confidence,
+                    thread_id=thread_map.get(c.candidate_id),
+                    contrarian_note=contrarian,
+                )
+            )
+        return report_items
 
     def show_more(self, user_id: str, topic: str, already_seen_ids: set[str], limit: int = 5) -> list[str]:
         more = self.cache.get_more(user_id=user_id, topic=topic, already_seen_ids=already_seen_ids, limit=limit)
         return [f"{c.title} ({c.source})" for c in more]
 
     def apply_user_feedback(self, user_id: str, feedback_text: str) -> dict[str, str]:
+        log.info("Feedback from user=%s: %r", user_id, feedback_text[:80])
         results: dict[str, str] = {}
         commands = parse_preference_commands(feedback_text, deltas=self._preference_deltas)
 
@@ -285,6 +369,7 @@ class NewsFeedEngine:
                 self.preferences.apply_max_items(user_id, int(cmd.value))
                 results["max_items"] = cmd.value
 
+        log.info("Applied %d preference updates for user=%s", len(results), user_id)
         return results
 
     def _build_assumptions(self, c) -> list[str]:

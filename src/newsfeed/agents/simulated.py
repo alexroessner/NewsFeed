@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import math
 
 from newsfeed.models.domain import CandidateItem, DebateRecord, DebateVote, ResearchTask
+
+log = logging.getLogger(__name__)
 
 
 class SimulatedResearchAgent:
@@ -67,14 +70,22 @@ class ExpertCouncil:
         self.min_votes_to_accept = min_votes_to_accept
 
     def _required_votes(self) -> int:
+        n = len(self.expert_ids)
         if self.min_votes_to_accept == "majority":
-            return math.ceil(len(self.expert_ids) / 2)
+            return math.ceil(n / 2)
         if self.min_votes_to_accept == "unanimous":
-            return len(self.expert_ids)
+            return n
         try:
-            return int(self.min_votes_to_accept)
+            requested = int(self.min_votes_to_accept)
         except (ValueError, TypeError):
-            return math.ceil(len(self.expert_ids) / 2)
+            return math.ceil(n / 2)
+        if requested > n:
+            log.warning(
+                "min_votes_to_accept=%d exceeds expert count=%d, clamping",
+                requested, n,
+            )
+            return n
+        return max(1, requested)
 
     def _vote(self, expert_id: str, candidate: CandidateItem) -> DebateVote:
         score = candidate.composite_score()
