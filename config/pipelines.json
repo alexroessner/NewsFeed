@@ -48,7 +48,9 @@
     "keep_threshold": 0.62,
     "confidence_min": 0.51,
     "confidence_max": 0.99,
-    "min_votes_to_accept": "majority"
+    "min_votes_to_accept": "majority",
+    "llm_model": "claude-sonnet-4-5-20250929",
+    "llm_base_url": "https://api.anthropic.com/v1"
   },
   "intelligence": {
     "enabled_stages": [
@@ -72,7 +74,9 @@
     "contrarian_evidence_threshold": 0.6,
     "source_tiers": {
       "tier_1": {"sources": ["reuters", "ap", "bbc", "guardian", "ft"], "base_reliability": 0.85},
-      "tier_2": {"sources": ["x", "reddit", "web"], "base_reliability": 0.55},
+      "tier_1b": {"sources": ["aljazeera"], "base_reliability": 0.78},
+      "tier_2": {"sources": ["x", "reddit", "web", "hackernews", "gdelt"], "base_reliability": 0.55},
+      "tier_academic": {"sources": ["arxiv"], "base_reliability": 0.72},
       "unknown_base_reliability": 0.50
     },
     "bias_profiles": {
@@ -81,9 +85,13 @@
       "bbc": "center-left",
       "guardian": "left-leaning",
       "ft": "center-right",
+      "aljazeera": "global-south-perspective",
       "x": "variable",
       "reddit": "community-driven",
-      "web": "unverified"
+      "web": "unverified",
+      "hackernews": "tech-centric",
+      "arxiv": "academic-empirical",
+      "gdelt": "algorithmic-aggregation"
     },
     "corroboration_increment": 0.02,
     "urgency_velocity_thresholds": {
@@ -174,10 +182,13 @@
     "state_dir": "state"
   },
   "api_keys": {
-    "_comment": "Add your API keys here. Agents without keys fall back to simulated data.",
+    "_comment": "Add your API keys here. Agents without keys fall back to simulated data. Free agents (BBC, HN, Al Jazeera, arXiv, GDELT, Google News) work without any keys.",
     "guardian": "",
     "newsapi": "",
     "reddit_client_id": "",
-    "reddit_client_secret": ""
+    "reddit_client_secret": "",
+    "x_bearer_token": "",
+    "telegram_bot_token": "",
+    "anthropic_api_key": ""
   }
 }
