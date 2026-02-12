@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
+from datetime import datetime, timezone
 
 from newsfeed.agents.simulated import ExpertCouncil, SimulatedResearchAgent
 from newsfeed.delivery.telegram import TelegramFormatter
@@ -27,6 +28,17 @@ class NewsFeedEngine:
             active_personas=personas.get("default_personas", []),
             persona_notes=personas.get("persona_notes", {}),
         )
+
+
+class NewsFeedEngine:
+    def __init__(self, config: dict, pipeline: dict) -> None:
+        self.config = config
+        self.pipeline = pipeline
+        stale_after = pipeline.get("cache_policy", {}).get("stale_after_minutes", 180)
+        self.preferences = PreferenceStore()
+        self.cache = CandidateCache(stale_after_minutes=stale_after)
+        self.experts = ExpertCouncil()
+        self.formatter = TelegramFormatter()
 
     def _research_agents(self) -> list[SimulatedResearchAgent]:
         agents = []
@@ -56,6 +68,17 @@ class NewsFeedEngine:
         all_candidates = asyncio.run(self._run_research_async(task, top_k))
 
         selected, reserve, debate = self.experts.select(all_candidates, limit)
+    def handle_request(self, user_id: str, prompt: str, weighted_topics: dict[str, float], max_items: int | None = None) -> str:
+        profile = self.preferences.get_or_create(user_id)
+        limit = min(max_items or profile.max_items, self.pipeline.get("limits", {}).get("default_max_items", 10))
+        task = ResearchTask(request_id=f"req-{int(datetime.now(timezone.utc).timestamp())}", user_id=user_id, prompt=prompt, weighted_topics=weighted_topics)
+
+        all_candidates = []
+        top_k = self.pipeline.get("limits", {}).get("top_discoveries_per_research_agent", 5)
+        for agent in self._research_agents():
+            all_candidates.extend(agent.run(task, top_k=top_k))
+
+        selected, reserve = self.experts.select(all_candidates, limit)
 
         dominant_topic = max(weighted_topics, key=weighted_topics.get, default="general")
         self.cache.put(user_id, dominant_topic, reserve)
@@ -77,6 +100,12 @@ class NewsFeedEngine:
                     why_it_matters=why,
                     what_changed="New cross-source confirmation and discussion momentum since last cycle.",
                     predictive_outlook=outlook,
+            report_items.append(
+                ReportItem(
+                    candidate=c,
+                    why_it_matters=f"Aligned with your weighted interest in {c.topic} and strong source quality.",
+                    what_changed="New cross-source confirmation and discussion momentum since last cycle.",
+                    predictive_outlook="Market and narrative signals suggest elevated watch priority.",
                     adjacent_reads=reads,
                 )
             )
@@ -92,6 +121,7 @@ class NewsFeedEngine:
                 "selected_count": len(selected),
                 "review_personas": self.personas.get("default_personas", []),
             },
+            metadata={"tone": profile.tone, "format": profile.format},
         )
         return self.formatter.format(payload)
 
