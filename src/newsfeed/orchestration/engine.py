@@ -28,9 +28,14 @@ from newsfeed.models.domain import (
     ReportItem,
     ResearchTask,
     UrgencyLevel,
+    UserProfile,
     configure_scoring,
     validate_candidate,
 )
+from newsfeed.orchestration.communication import CommunicationAgent
+from newsfeed.orchestration.orchestrator import OrchestratorAgent, RequestStage
+from newsfeed.orchestration.optimizer import SystemOptimizationAgent
+from newsfeed.review.agents import ClarityReviewAgent, StyleReviewAgent
 from newsfeed.review.personas import PersonaReviewStack
 
 log = logging.getLogger(__name__)
@@ -86,11 +91,16 @@ class NewsFeedEngine:
 
         # Telegram bot (initialized only when token is available)
         self._bot = None
+        self._comm_agent = None
         telegram_token = api_keys.get("telegram_bot_token", "")
         if telegram_token:
-            from newsfeed.delivery.bot import TelegramBot
+            from newsfeed.delivery.bot import BriefingScheduler, TelegramBot
             self._bot = TelegramBot(bot_token=telegram_token)
-            log.info("Telegram bot initialized")
+            self._scheduler = BriefingScheduler()
+            self._comm_agent = CommunicationAgent(
+                engine=self, bot=self._bot, scheduler=self._scheduler,
+            )
+            log.info("Telegram bot + communication agent initialized")
 
         self.formatter = TelegramFormatter()
         self.review_stack = PersonaReviewStack(
@@ -98,6 +108,27 @@ class NewsFeedEngine:
             active_personas=personas.get("default_personas", []),
             persona_notes=personas.get("persona_notes", {}),
         )
+
+        # Review agents (editorial layer)
+        llm_key = api_keys.get("anthropic_api_key", "")
+        llm_model = ec_cfg.get("llm_model", "claude-sonnet-4-5-20250929")
+        llm_base = ec_cfg.get("llm_base_url", "https://api.anthropic.com/v1")
+        self._style_reviewer = StyleReviewAgent(
+            persona_context=self.review_stack.active_context(),
+            llm_api_key=llm_key, llm_model=llm_model, llm_base_url=llm_base,
+        )
+        self._clarity_reviewer = ClarityReviewAgent(
+            llm_api_key=llm_key, llm_model=llm_model, llm_base_url=llm_base,
+        )
+
+        # Orchestrator agent (lifecycle management)
+        self.orchestrator = OrchestratorAgent(
+            agent_configs=config.get("research_agents", []),
+            pipeline_cfg=pipeline,
+        )
+
+        # System optimization agent (health monitoring)
+        self.optimizer = SystemOptimizationAgent()
 
         # Intelligence modules with full config propagation
         intel_cfg = pipeline.get("intelligence", {})
@@ -177,16 +208,18 @@ class NewsFeedEngine:
         log.info("handle_request user=%s prompt=%r", user_id, prompt[:80])
         profile = self.preferences.get_or_create(user_id)
         limit = min(max_items or profile.max_items, self.pipeline.get("limits", {}).get("default_max_items", 10))
-        task = ResearchTask(
-            request_id=f"req-{int(datetime.now(timezone.utc).timestamp())}",
-            user_id=user_id,
-            prompt=prompt,
-            weighted_topics=weighted_topics,
-        )
+
+        # Orchestrator compiles brief and tracks lifecycle
+        task, lifecycle = self.orchestrator.compile_brief(user_id, prompt, profile, limit)
+        # Override with caller-provided topics if specified
+        if weighted_topics:
+            task.weighted_topics = weighted_topics
 
         # Stage 1: Research fan-out
+        lifecycle.advance(RequestStage.RESEARCHING)
         top_k = self.pipeline.get("limits", {}).get("top_discoveries_per_research_agent", 5)
         all_candidates = self._run_research(task, top_k)
+        self.orchestrator.record_research_results(lifecycle, len(all_candidates))
         log.info("Research produced %d candidates", len(all_candidates))
 
         # Validate candidates from agents
@@ -202,11 +235,13 @@ class NewsFeedEngine:
         # Stage 2: Intelligence enrichment (conditionally enabled, with error isolation)
         all_candidates = self._run_intelligence(all_candidates)
 
-        # Stage 3: Expert council selection
+        # Stage 3: Expert council selection (with arbitration)
+        lifecycle.advance(RequestStage.EXPERT_REVIEW)
         selected, reserve, debate = self.experts.select(all_candidates, limit)
+        self.orchestrator.record_selection(lifecycle, len(selected))
         log.info("Expert council: %d selected, %d reserve, %d votes", len(selected), len(reserve), len(debate.votes))
 
-        dominant_topic = max(weighted_topics, key=weighted_topics.get, default="general")
+        dominant_topic = max(task.weighted_topics, key=task.weighted_topics.get, default="general")
         self.cache.put(user_id, dominant_topic, reserve)
 
         # Stage 4: Narrative threading
@@ -233,8 +268,9 @@ class NewsFeedEngine:
             except Exception:
                 log.exception("Trend stage failed, continuing without trends")
 
-        # Stage 7: Report assembly
-        report_items = self._assemble_report(selected, threads)
+        # Stage 7: Report assembly with editorial review
+        lifecycle.advance(RequestStage.EDITORIAL_REVIEW)
+        report_items = self._assemble_report(selected, threads, profile)
 
         # Stage 8: Determine briefing type
         briefing_type = self._determine_briefing_type(selected)
@@ -273,6 +309,10 @@ class NewsFeedEngine:
             except Exception:
                 log.exception("State persistence failed")
 
+        # Record completion in orchestrator
+        lifecycle.advance(RequestStage.FORMATTING)
+        self.orchestrator.record_completion(lifecycle)
+
         log.info("Report generated: %d items, briefing=%s", len(report_items), briefing_type.value)
         return self.formatter.format(payload)
 
@@ -306,8 +346,9 @@ class NewsFeedEngine:
 
         return candidates
 
-    def _assemble_report(self, selected: list[CandidateItem], threads: list) -> list[ReportItem]:
-        """Assemble report items from selected candidates."""
+    def _assemble_report(self, selected: list[CandidateItem], threads: list,
+                         profile: UserProfile | None = None) -> list[ReportItem]:
+        """Assemble report items from selected candidates, then apply editorial review."""
         report_items = []
         adjacent_bounds = self.pipeline.get("limits", {}).get("adjacent_reads_per_item", {"min": 2, "max": 3})
         adjacent_count = adjacent_bounds.get("max", 3)
@@ -353,6 +394,20 @@ class NewsFeedEngine:
                     contrarian_note=contrarian,
                 )
             )
+
+        # Editorial review: style agent rewrites for tone/voice, clarity agent tightens
+        if profile is None:
+            profile = UserProfile(user_id="default")
+        for item in report_items:
+            try:
+                self._style_reviewer.review(item, profile)
+            except Exception:
+                log.exception("Style review failed for %s", item.candidate.candidate_id)
+            try:
+                self._clarity_reviewer.review(item, profile)
+            except Exception:
+                log.exception("Clarity review failed for %s", item.candidate.candidate_id)
+
         return report_items
 
     def show_more(self, user_id: str, topic: str, already_seen_ids: set[str], limit: int = 5) -> list[str]:
@@ -422,6 +477,8 @@ class NewsFeedEngine:
             "llm_backed": bool(self.experts._use_llm),
             "telegram_connected": self._bot is not None,
             "cache_entries": sum(len(v) for v in self.cache._entries.values()),
+            "orchestrator_metrics": self.orchestrator.metrics(),
+            "optimizer_health": self.optimizer.health_report(),
         }
 
     def _save_state(self) -> None:
@@ -431,3 +488,4 @@ class NewsFeedEngine:
         self._persistence.save("credibility", self.credibility.snapshot())
         self._persistence.save("georisk", self.georisk.snapshot())
         self._persistence.save("trends", self.trends.snapshot())
+        self._persistence.save("optimizer", self.optimizer.snapshot())
