@@ -10,9 +10,6 @@ class RuntimeConfig:
         self.agents = agents
         self.pipeline = pipeline
         self.personas = personas
-    def __init__(self, agents: dict[str, Any], pipeline: dict[str, Any]) -> None:
-        self.agents = agents
-        self.pipeline = pipeline
 
     def validate(self) -> None:
         required_agent_sections = ["control_agents", "research_agents", "expert_agents", "review_agents"]
@@ -37,6 +34,5 @@ def load_runtime_config(config_dir: Path) -> RuntimeConfig:
     pipeline = load_json(config_dir / "pipelines.json")
     personas = load_json(config_dir / "review_personas.json")
     cfg = RuntimeConfig(agents=agents, pipeline=pipeline, personas=personas)
-    cfg = RuntimeConfig(agents=agents, pipeline=pipeline)
     cfg.validate()
     return cfg

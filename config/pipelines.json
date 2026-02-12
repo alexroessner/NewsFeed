@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "limits": {
     "default_max_items": 10,
     "adjacent_reads_per_item": {"min": 2, "max": 3},
@@ -8,6 +8,18 @@
   "signals": {
     "prediction_market_weight": "medium",
     "prediction_market_cap": "non-dominant"
+  },
+  "intelligence": {
+    "velocity_window_minutes": 30,
+    "breaking_source_threshold": 3,
+    "clustering_similarity": 0.6,
+    "trend_window_minutes": 60,
+    "anomaly_threshold": 2.0,
+    "max_items_per_source": 3,
+    "source_tiers": {
+      "tier_1": ["reuters", "ap", "bbc", "guardian", "ft"],
+      "tier_2": ["x", "reddit", "web"]
+    }
   },
   "stages": [
     {"id": "ingress", "owner": "communication_agent", "outputs": ["request"]},
@@ -25,15 +37,45 @@
       "outputs": ["agent_reports", "agent_top5"]
     },
     {
+      "id": "intelligence_enrichment",
+      "owner": "orchestrator_agent",
+      "inputs": ["agent_top5"],
+      "outputs": ["enriched_candidates"],
+      "substages": [
+        "credibility_scoring",
+        "cross_corroboration",
+        "urgency_detection",
+        "source_diversity"
+      ]
+    },
+    {
       "id": "expert_roundtable",
       "owners": ["expert_quality_agent", "expert_relevance_agent", "expert_preference_fit_agent"],
-      "inputs": ["agent_top5", "user_profile"],
+      "inputs": ["enriched_candidates", "user_profile"],
       "outputs": ["ranked_candidates", "selected_items", "reserve_items"]
+    },
+    {
+      "id": "narrative_threading",
+      "owner": "orchestrator_agent",
+      "inputs": ["selected_items"],
+      "outputs": ["narrative_threads", "thread_map"]
+    },
+    {
+      "id": "geo_risk_assessment",
+      "owner": "orchestrator_agent",
+      "inputs": ["enriched_candidates"],
+      "outputs": ["geo_risk_index", "escalation_alerts"]
+    },
+    {
+      "id": "trend_analysis",
+      "owner": "orchestrator_agent",
+      "inputs": ["enriched_candidates"],
+      "outputs": ["trend_snapshots", "emerging_topics"]
     },
     {
       "id": "internal_report_drafting",
       "owner": "orchestrator_agent",
-      "inputs": ["selected_items"],
+      "inputs": ["selected_items", "narrative_threads", "geo_risk_index", "trend_snapshots"],
       "outputs": ["internal_reports"]
     },
     {
