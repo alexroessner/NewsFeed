@@ -52,3 +52,17 @@ git push --force-with-lease origin work
 ```
 
 Use `--force-with-lease` only after intentional rebase.
+
+## Pre-PR mergeability check
+Run this before opening or updating a PR:
+
+```bash
+tools/check_merge_readiness.sh main work
+```
+
+Exit meanings:
+- `0`: merge-ready (or rebase recommended but no textual conflicts),
+- `3`: head branch is behind base branch,
+- `4`: merge conflicts detected.
+
+If conflict (`4`), resolve locally via rebase and re-run tests before pushing.

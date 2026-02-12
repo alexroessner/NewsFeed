@@ -23,6 +23,7 @@ Ship a single-user vertical slice with:
 - `src/newsfeed/`: runtime scaffold for orchestration, memory, review, and delivery.
 - `docs/CONFLICT_PREVENTION.md`: branch/rebase workflow to avoid unmergeable PRs.
 - `tools/sync_main_and_validate.sh`: one-command branch sync + validation helper.
+- `tools/check_merge_readiness.sh`: detects behind/diverged/conflict state before opening PR.
 
 ## Quick start
 ```bash

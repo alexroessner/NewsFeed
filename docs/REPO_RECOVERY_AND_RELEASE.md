@@ -58,3 +58,23 @@ If an old PR is unmergeable:
 - Keep feature work on `work` (or short-lived feature branches).
 - Rebase/merge into `main` only after tests pass.
 - Run CI before push (see `.github/workflows/ci.yml`).
+
+## 7) If a draft PR stays unmergeable
+Use a fresh branch from updated `main` and avoid stacking old conflict history:
+
+```bash
+git checkout main
+git pull --ff-only origin main
+git checkout -b pr/refresh-newsfeed
+# if needed: cherry-pick specific commits from old branch
+# git cherry-pick <sha1> <sha2> ...
+
+# validate
+PYTHONPATH=src python -m unittest discover -s tests -p 'test_*.py'
+PYTHONPATH=src python -m compileall -q src tests
+
+# push
+git push -u origin pr/refresh-newsfeed
+```
+
+Then open a **new PR** and close the stale draft PR.
