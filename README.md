@@ -21,6 +21,8 @@ Ship a single-user vertical slice with:
 - `docs/REPO_RECOVERY_AND_RELEASE.md`: git recovery and release steps for blocked PR scenarios.
 - `tools/git_health_check.sh`: local repo integrity checks before push.
 - `src/newsfeed/`: runtime scaffold for orchestration, memory, review, and delivery.
+- `docs/CONFLICT_PREVENTION.md`: branch/rebase workflow to avoid unmergeable PRs.
+- `tools/sync_main_and_validate.sh`: one-command branch sync + validation helper.
 
 ## Quick start
 ```bash
