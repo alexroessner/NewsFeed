@@ -6,8 +6,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from newsfeed.agents.base import ResearchAgent
+from newsfeed.agents.experts import ExpertCouncil
 from newsfeed.agents.registry import create_agent
-from newsfeed.agents.simulated import ExpertCouncil
 from newsfeed.delivery.telegram import TelegramFormatter
 from newsfeed.intelligence.clustering import StoryClustering
 from newsfeed.intelligence.credibility import (
@@ -70,15 +70,27 @@ class NewsFeedEngine:
         self.preferences = PreferenceStore()
         self.cache = CandidateCache(stale_after_minutes=stale_after)
 
-        # Expert council with configurable thresholds
+        # Expert council with configurable thresholds and optional LLM backing
         ec_cfg = pipeline.get("expert_council", {})
+        api_keys = pipeline.get("api_keys", {})
         self.experts = ExpertCouncil(
             expert_ids=expert_ids,
             keep_threshold=ec_cfg.get("keep_threshold", 0.62),
             confidence_min=ec_cfg.get("confidence_min", 0.51),
             confidence_max=ec_cfg.get("confidence_max", 0.99),
             min_votes_to_accept=ec_cfg.get("min_votes_to_accept", "majority"),
+            llm_api_key=api_keys.get("anthropic_api_key", ""),
+            llm_model=ec_cfg.get("llm_model", "claude-sonnet-4-5-20250929"),
+            llm_base_url=ec_cfg.get("llm_base_url", "https://api.anthropic.com/v1"),
         )
+
+        # Telegram bot (initialized only when token is available)
+        self._bot = None
+        telegram_token = api_keys.get("telegram_bot_token", "")
+        if telegram_token:
+            from newsfeed.delivery.bot import TelegramBot
+            self._bot = TelegramBot(bot_token=telegram_token)
+            log.info("Telegram bot initialized")
 
         self.formatter = TelegramFormatter()
         self.review_stack = PersonaReviewStack(
@@ -400,6 +412,17 @@ class NewsFeedEngine:
         if breaking_count >= self._bt_breaking_min:
             return BriefingType.BREAKING_ALERT
         return BriefingType.MORNING_DIGEST
+
+    def engine_status(self) -> dict:
+        """Return engine status info for the communication agent."""
+        return {
+            "agent_count": len(self.config.get("research_agents", [])),
+            "expert_count": len(self.experts.expert_ids),
+            "stage_count": len(self._enabled_stages),
+            "llm_backed": bool(self.experts._use_llm),
+            "telegram_connected": self._bot is not None,
+            "cache_entries": sum(len(v) for v in self.cache._entries.values()),
+        }
 
     def _save_state(self) -> None:
         if not self._persistence:
