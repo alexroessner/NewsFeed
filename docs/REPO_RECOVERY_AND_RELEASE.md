@@ -78,3 +78,25 @@ git push -u origin pr/refresh-newsfeed
 ```
 
 Then open a **new PR** and close the stale draft PR.
+
+
+## 8) Bootstrap `origin` from environment secrets
+If this environment has a GitHub token secret but no `origin` configured:
+
+```bash
+# set one token var + one repo var
+# export GH_TOKEN=***
+# export GH_REPO=owner/repo
+
+tools/bootstrap_github_remote.sh
+```
+
+Accepted env vars:
+- token: `GH_TOKEN` or `GITHUB_TOKEN`
+- repo slug: `GH_REPO`, `GITHUB_REPOSITORY`, or `ORIGIN_REPO`
+
+After bootstrap, push normally:
+
+```bash
+git push -u origin main
+```
