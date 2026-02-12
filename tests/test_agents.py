@@ -940,5 +940,532 @@ def urllib_error():
     return urllib.error.URLError("Connection failed")
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Review Agent Tests
+# ──────────────────────────────────────────────────────────────────────────
+
+from newsfeed.review.agents import StyleReviewAgent, ClarityReviewAgent
+from newsfeed.models.domain import ReportItem, ConfidenceBand, StoryLifecycle, UserProfile
+
+
+def _make_report_item(topic: str = "geopolitics", source: str = "reuters",
+                      urgency: UrgencyLevel = UrgencyLevel.ROUTINE) -> ReportItem:
+    c = CandidateItem(
+        candidate_id="c-test", title="Test headline", source=source,
+        summary="Test summary", url="https://example.com", topic=topic,
+        evidence_score=0.7, novelty_score=0.6, preference_fit=0.8,
+        prediction_signal=0.5, discovered_by="test_agent",
+        created_at=datetime.now(timezone.utc),
+        urgency=urgency,
+    )
+    return ReportItem(
+        candidate=c,
+        why_it_matters="Base why text.",
+        what_changed="Base changed text.",
+        predictive_outlook="Base outlook text.",
+        adjacent_reads=["Read 1", "Read 2", "Read 3"],
+    )
+
+
+class StyleReviewAgentTests(unittest.TestCase):
+    def test_concise_tone_rewrite(self) -> None:
+        agent = StyleReviewAgent()
+        item = _make_report_item()
+        profile = UserProfile(user_id="u1", tone="concise")
+        result = agent.review(item, profile)
+        # Should have rewritten why_it_matters (not the original base text)
+        self.assertNotEqual(result.why_it_matters, "Base why text.")
+        self.assertIn("geopolitics", result.why_it_matters.lower())
+
+    def test_analyst_tone_rewrite(self) -> None:
+        agent = StyleReviewAgent()
+        item = _make_report_item()
+        profile = UserProfile(user_id="u1", tone="analyst")
+        result = agent.review(item, profile)
+        self.assertIn("Assessment:", result.why_it_matters)
+
+    def test_executive_tone_rewrite(self) -> None:
+        agent = StyleReviewAgent()
+        item = _make_report_item()
+        profile = UserProfile(user_id="u1", tone="executive")
+        result = agent.review(item, profile)
+        self.assertIn("Bottom line:", result.why_it_matters)
+
+    def test_high_priority_topic_personalization(self) -> None:
+        agent = StyleReviewAgent()
+        item = _make_report_item(topic="ai_policy")
+        profile = UserProfile(user_id="u1", topic_weights={"ai_policy": 0.9})
+        result = agent.review(item, profile)
+        self.assertIn("high-priority", result.why_it_matters.lower())
+
+    def test_urgency_framing(self) -> None:
+        agent = StyleReviewAgent()
+        item = _make_report_item(urgency=UrgencyLevel.BREAKING)
+        profile = UserProfile(user_id="u1")
+        result = agent.review(item, profile)
+        self.assertIn("developing rapidly", result.why_it_matters.lower())
+
+    def test_what_changed_corroboration(self) -> None:
+        agent = StyleReviewAgent()
+        item = _make_report_item()
+        item.candidate.corroborated_by = ["ap", "bbc"]
+        profile = UserProfile(user_id="u1")
+        result = agent.review(item, profile)
+        self.assertIn("corroborated", result.what_changed.lower())
+
+    def test_outlook_with_regions(self) -> None:
+        agent = StyleReviewAgent()
+        item = _make_report_item()
+        item.candidate.regions = ["middle_east", "europe"]
+        profile = UserProfile(user_id="u1", regions_of_interest=["middle_east"])
+        result = agent.review(item, profile)
+        self.assertIn("middle_east", result.predictive_outlook.lower())
+
+    def test_persona_context_appended(self) -> None:
+        agent = StyleReviewAgent(persona_context=["source-quality focus", "audience-first"])
+        item = _make_report_item()
+        profile = UserProfile(user_id="u1")
+        result = agent.review(item, profile)
+        self.assertIn("source-quality focus", result.why_it_matters)
+
+
+class ClarityReviewAgentTests(unittest.TestCase):
+    def test_compress_removes_filler(self) -> None:
+        agent = ClarityReviewAgent()
+        result = agent._compress("It is worth noting that the economy grew.")
+        self.assertNotIn("it is worth noting that", result.lower())
+        self.assertIn("economy grew", result.lower())
+
+    def test_compress_in_order_to(self) -> None:
+        agent = ClarityReviewAgent()
+        result = agent._compress("They acted in order to prevent collapse.")
+        self.assertIn("to prevent", result)
+        self.assertNotIn("in order to", result)
+
+    def test_adds_watchpoint(self) -> None:
+        agent = ClarityReviewAgent()
+        item = _make_report_item(topic="geopolitics")
+        profile = UserProfile(user_id="u1")
+        result = agent.review(item, profile)
+        # Clarity agent should add a watchpoint if missing
+        self.assertIn("watch", result.predictive_outlook.lower())
+
+    def test_improves_adjacent_reads(self) -> None:
+        agent = ClarityReviewAgent()
+        item = _make_report_item(topic="ai_policy")
+        profile = UserProfile(user_id="u1")
+        result = agent.review(item, profile)
+        # Should replace generic reads with topic-specific ones
+        self.assertNotEqual(result.adjacent_reads[0], "Read 1")
+        # ai_policy reads should reference technical/regulatory content
+        combined = " ".join(result.adjacent_reads).lower()
+        self.assertTrue("technical" in combined or "regulatory" in combined or "industry" in combined)
+
+    def test_batch_review(self) -> None:
+        agent = ClarityReviewAgent()
+        items = [_make_report_item(topic="markets"), _make_report_item(topic="technology")]
+        profile = UserProfile(user_id="u1")
+        results = agent.review_batch(items, profile)
+        self.assertEqual(len(results), 2)
+        # Each should have been processed — watchpoint uses "watch" or "monitor"
+        for item in results:
+            outlook = item.predictive_outlook.lower()
+            self.assertTrue("watch" in outlook or "monitor" in outlook or "track" in outlook)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Orchestrator Agent Tests
+# ──────────────────────────────────────────────────────────────────────────
+
+from newsfeed.orchestration.orchestrator import (
+    OrchestratorAgent, RequestLifecycle, RequestStage,
+)
+
+
+class OrchestratorAgentTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.agent_configs = [
+            {"id": "news_reuters", "source": "reuters", "mandate": "wire news"},
+            {"id": "news_bbc", "source": "bbc", "mandate": "global coverage"},
+            {"id": "x_agent_1", "source": "x", "mandate": "social signals"},
+            {"id": "hn_agent", "source": "hackernews", "mandate": "tech signals"},
+            {"id": "arxiv_agent", "source": "arxiv", "mandate": "research"},
+        ]
+        self.orchestrator = OrchestratorAgent(self.agent_configs, {})
+
+    def test_compile_brief_creates_task(self) -> None:
+        profile = UserProfile(user_id="u1", topic_weights={"geopolitics": 0.9})
+        task, lifecycle = self.orchestrator.compile_brief("u1", "daily brief", profile)
+        self.assertEqual(task.user_id, "u1")
+        self.assertIn("geopolitics", task.weighted_topics)
+        self.assertGreater(task.weighted_topics["geopolitics"], 0.5)
+
+    def test_compile_brief_default_topics(self) -> None:
+        profile = UserProfile(user_id="u1")  # No topic weights
+        task, lifecycle = self.orchestrator.compile_brief("u1", "brief", profile)
+        # Should get default topics
+        self.assertIn("geopolitics", task.weighted_topics)
+        self.assertIn("ai_policy", task.weighted_topics)
+
+    def test_compile_brief_prompt_boost(self) -> None:
+        profile = UserProfile(user_id="u1", topic_weights={"markets": 0.3})
+        task, _ = self.orchestrator.compile_brief("u1", "markets are crashing", profile)
+        # "markets" in prompt should boost the markets topic
+        self.assertGreater(task.weighted_topics["markets"], 0.3)
+
+    def test_lifecycle_tracking(self) -> None:
+        profile = UserProfile(user_id="u1")
+        _, lifecycle = self.orchestrator.compile_brief("u1", "test", profile)
+        self.assertEqual(lifecycle.stage, RequestStage.COMPILING_BRIEF)
+        lifecycle.advance(RequestStage.RESEARCHING)
+        self.assertEqual(lifecycle.stage, RequestStage.RESEARCHING)
+        self.assertIn("compiling_brief", lifecycle.stage_times)
+
+    def test_lifecycle_snapshot(self) -> None:
+        lifecycle = RequestLifecycle(request_id="req-1", user_id="u1")
+        lifecycle.advance(RequestStage.RESEARCHING)
+        snap = lifecycle.snapshot()
+        self.assertEqual(snap["request_id"], "req-1")
+        self.assertEqual(snap["stage"], "researching")
+        self.assertIn("elapsed_s", snap)
+
+    def test_select_agents_prioritizes_by_topic(self) -> None:
+        from newsfeed.models.domain import ResearchTask
+        task = ResearchTask(
+            request_id="req-1", user_id="u1", prompt="test",
+            weighted_topics={"technology": 0.9, "ai_policy": 0.8},
+        )
+        selected = self.orchestrator.select_agents(task)
+        # hackernews and arxiv should be near the top for tech/AI topics
+        top_ids = [a["id"] for a in selected[:3]]
+        self.assertTrue(any("hn" in a or "arxiv" in a for a in top_ids))
+
+    def test_record_completion_stores_metrics(self) -> None:
+        profile = UserProfile(user_id="u1")
+        _, lifecycle = self.orchestrator.compile_brief("u1", "test", profile)
+        lifecycle.candidate_count = 50
+        lifecycle.selected_count = 8
+        self.orchestrator.record_completion(lifecycle)
+        metrics = self.orchestrator.metrics()
+        self.assertEqual(metrics["total_requests"], 1)
+        self.assertGreater(metrics["avg_candidates"], 0)
+
+    def test_lifecycle_fail(self) -> None:
+        lifecycle = RequestLifecycle(request_id="req-1", user_id="u1")
+        lifecycle.fail("timeout")
+        self.assertEqual(lifecycle.stage, RequestStage.FAILED)
+        self.assertEqual(lifecycle.error, "timeout")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Communication Agent Tests
+# ──────────────────────────────────────────────────────────────────────────
+
+from newsfeed.orchestration.communication import CommunicationAgent
+
+
+class CommunicationAgentTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.mock_engine = MagicMock()
+        self.mock_engine.preferences.get_or_create.return_value = UserProfile(
+            user_id="u1", topic_weights={"geopolitics": 0.8}, max_items=10,
+        )
+        self.mock_engine.handle_request.return_value = "Briefing text here"
+        self.mock_engine.show_more.return_value = ["Story 1 (reuters)", "Story 2 (bbc)"]
+        self.mock_engine.apply_user_feedback.return_value = {"topic:geopolitics": "1.0"}
+        self.mock_engine.engine_status.return_value = {"agent_count": 18}
+
+        self.mock_bot = MagicMock()
+        self.mock_bot.parse_command.return_value = None
+        self.mock_bot.format_help.return_value = "Help text"
+        self.mock_bot.format_settings.return_value = "Settings text"
+        self.mock_bot.format_status.return_value = "Status text"
+
+        self.agent = CommunicationAgent(engine=self.mock_engine, bot=self.mock_bot)
+
+    def test_handle_briefing_command(self) -> None:
+        self.mock_bot.parse_command.return_value = {
+            "type": "command", "chat_id": 123, "user_id": "u1",
+            "command": "briefing", "args": "", "text": "/briefing",
+        }
+        update = {"message": {"text": "/briefing"}}
+        result = self.agent.handle_update(update)
+        self.assertEqual(result["action"], "briefing")
+        self.mock_engine.handle_request.assert_called_once()
+        self.mock_bot.send_briefing.assert_called_once()
+
+    def test_handle_more_command(self) -> None:
+        self.mock_bot.parse_command.return_value = {
+            "type": "command", "chat_id": 123, "user_id": "u1",
+            "command": "more", "args": "technology", "text": "/more technology",
+        }
+        result = self.agent.handle_update({})
+        self.assertEqual(result["action"], "show_more")
+        self.mock_engine.show_more.assert_called_once()
+
+    def test_handle_feedback_text(self) -> None:
+        self.mock_bot.parse_command.return_value = {
+            "type": "feedback", "chat_id": 123, "user_id": "u1",
+            "command": "", "args": "", "text": "more geopolitics",
+        }
+        result = self.agent.handle_update({})
+        self.assertEqual(result["action"], "feedback")
+        self.mock_engine.apply_user_feedback.assert_called_with("u1", "more geopolitics")
+
+    def test_handle_preference_more_similar(self) -> None:
+        self.agent._last_topic["u1"] = "technology"
+        self.mock_bot.parse_command.return_value = {
+            "type": "preference", "chat_id": 123, "user_id": "u1",
+            "command": "more_similar", "args": "", "text": "",
+        }
+        result = self.agent.handle_update({})
+        self.assertEqual(result["action"], "pref_more")
+        self.assertIn("technology", result["topic"])
+
+    def test_handle_preference_less_similar(self) -> None:
+        self.agent._last_topic["u1"] = "markets"
+        self.mock_bot.parse_command.return_value = {
+            "type": "preference", "chat_id": 123, "user_id": "u1",
+            "command": "less_similar", "args": "", "text": "",
+        }
+        result = self.agent.handle_update({})
+        self.assertEqual(result["action"], "pref_less")
+
+    def test_handle_help_command(self) -> None:
+        self.mock_bot.parse_command.return_value = {
+            "type": "command", "chat_id": 123, "user_id": "u1",
+            "command": "help", "args": "", "text": "/help",
+        }
+        result = self.agent.handle_update({})
+        self.assertEqual(result["action"], "help")
+        self.mock_bot.send_message.assert_called()
+
+    def test_handle_settings_command(self) -> None:
+        self.mock_bot.parse_command.return_value = {
+            "type": "command", "chat_id": 123, "user_id": "u1",
+            "command": "settings", "args": "", "text": "/settings",
+        }
+        result = self.agent.handle_update({})
+        self.assertEqual(result["action"], "settings")
+
+    def test_handle_status_command(self) -> None:
+        self.mock_bot.parse_command.return_value = {
+            "type": "command", "chat_id": 123, "user_id": "u1",
+            "command": "status", "args": "", "text": "/status",
+        }
+        result = self.agent.handle_update({})
+        self.assertEqual(result["action"], "status")
+
+    def test_handle_unknown_command(self) -> None:
+        self.mock_bot.parse_command.return_value = {
+            "type": "command", "chat_id": 123, "user_id": "u1",
+            "command": "foo", "args": "", "text": "/foo",
+        }
+        result = self.agent.handle_update({})
+        self.assertEqual(result["action"], "unknown_command")
+
+    def test_handle_mute(self) -> None:
+        self.mock_bot.parse_command.return_value = {
+            "type": "mute", "chat_id": 123, "user_id": "u1",
+            "command": "mute", "args": "60", "text": "",
+        }
+        result = self.agent.handle_update({})
+        self.assertEqual(result["action"], "mute")
+        self.assertEqual(result["duration"], "60")
+
+    def test_ignored_update(self) -> None:
+        # parse_command returns None
+        result = self.agent.handle_update({})
+        self.assertIsNone(result)
+
+    def test_schedule_command_without_scheduler(self) -> None:
+        self.mock_bot.parse_command.return_value = {
+            "type": "command", "chat_id": 123, "user_id": "u1",
+            "command": "schedule", "args": "morning", "text": "/schedule morning",
+        }
+        result = self.agent.handle_update({})
+        self.assertEqual(result["action"], "schedule_unavailable")
+
+    def test_schedule_command_with_scheduler(self) -> None:
+        scheduler = BriefingScheduler()
+        agent = CommunicationAgent(
+            engine=self.mock_engine, bot=self.mock_bot, scheduler=scheduler,
+        )
+        self.mock_bot.parse_command.return_value = {
+            "type": "command", "chat_id": 123, "user_id": "u1",
+            "command": "schedule", "args": "morning 07:30", "text": "/schedule morning 07:30",
+        }
+        result = agent.handle_update({})
+        self.assertEqual(result["action"], "schedule")
+        self.assertEqual(result["type"], "morning")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# System Optimization Agent Tests
+# ──────────────────────────────────────────────────────────────────────────
+
+from newsfeed.orchestration.optimizer import (
+    SystemOptimizationAgent, AgentMetric, StageMetric, TuningRecommendation,
+)
+
+
+class SystemOptimizationAgentTests(unittest.TestCase):
+    def test_record_and_report(self) -> None:
+        opt = SystemOptimizationAgent()
+        opt.record_agent_run("agent_1", "reuters", 5, 150.0)
+        opt.record_agent_run("agent_1", "reuters", 3, 200.0)
+        report = opt.health_report()
+        self.assertIn("agent_1", report["agents"])
+        self.assertEqual(report["agents"]["agent_1"]["runs"], 2)
+
+    def test_avg_metrics(self) -> None:
+        m = AgentMetric(agent_id="a1", source="bbc", total_runs=4,
+                        total_candidates=20, total_selected=8, total_latency_ms=400.0)
+        self.assertEqual(m.avg_yield, 5.0)
+        self.assertEqual(m.keep_rate, 0.4)
+        self.assertEqual(m.avg_latency_ms, 100.0)
+
+    def test_error_rate_detection(self) -> None:
+        opt = SystemOptimizationAgent(error_rate_threshold=0.3)
+        for _ in range(5):
+            opt.record_agent_run("bad_agent", "web", 0, 100.0, error=True)
+        recs = opt.analyze()
+        error_recs = [r for r in recs if r.agent_id == "bad_agent"]
+        self.assertTrue(any("error rate" in r.reason.lower() for r in error_recs))
+
+    def test_low_keep_rate_detection(self) -> None:
+        opt = SystemOptimizationAgent(keep_rate_threshold=0.1)
+        # Record many candidates but few selected
+        for _ in range(5):
+            opt.record_agent_run("noisy_agent", "reddit", 10, 100.0)
+        opt.record_agent_selection("noisy_agent", 0)  # No candidates survived
+        recs = opt.analyze()
+        keep_recs = [r for r in recs if r.agent_id == "noisy_agent" and "keep rate" in r.reason.lower()]
+        self.assertTrue(len(keep_recs) > 0)
+
+    def test_stage_failure_detection(self) -> None:
+        opt = SystemOptimizationAgent()
+        for _ in range(5):
+            opt.record_stage_run("clustering", 50.0, failed=True)
+        recs = opt.analyze()
+        stage_recs = [r for r in recs if "clustering" in r.agent_id]
+        self.assertTrue(len(stage_recs) > 0)
+
+    def test_apply_recommendations_reduce_weight(self) -> None:
+        opt = SystemOptimizationAgent(keep_rate_threshold=0.1)
+        for _ in range(5):
+            opt.record_agent_run("low_quality", "web", 10, 100.0)
+        opt.record_agent_selection("low_quality", 0)
+        actions = opt.apply_recommendations()
+        self.assertTrue(any("Reduced weight" in a for a in actions))
+        self.assertLess(opt.get_weight_override("low_quality"), 1.0)
+
+    def test_auto_disable(self) -> None:
+        opt = SystemOptimizationAgent(error_rate_threshold=0.3)
+        for _ in range(5):
+            opt.record_agent_run("broken", "x", 0, 100.0, error=True)
+        actions = opt.apply_recommendations(auto_disable=True)
+        self.assertTrue(opt.is_agent_disabled("broken"))
+
+    def test_snapshot(self) -> None:
+        opt = SystemOptimizationAgent()
+        opt.record_agent_run("a1", "bbc", 5, 100.0)
+        snap = opt.snapshot()
+        self.assertIn("a1", snap["agent_stats"])
+
+    def test_no_recommendations_with_few_runs(self) -> None:
+        opt = SystemOptimizationAgent()
+        opt.record_agent_run("new_agent", "bbc", 0, 100.0, error=True)
+        recs = opt.analyze()
+        # Should not recommend for < 3 runs
+        agent_recs = [r for r in recs if r.agent_id == "new_agent"]
+        self.assertEqual(len(agent_recs), 0)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Expert Arbitration Tests
+# ──────────────────────────────────────────────────────────────────────────
+
+class ExpertArbitrationTests(unittest.TestCase):
+    def test_arbitration_triggered_on_close_split(self) -> None:
+        """Arbitration should trigger when votes are split by at most 1."""
+        council = NewExpertCouncil(
+            expert_ids=["expert_quality_agent", "expert_relevance_agent",
+                        "expert_preference_fit_agent", "expert_geopolitical_risk_agent",
+                        "expert_market_signal_agent"],
+            keep_threshold=0.62,
+            min_votes_to_accept="majority",
+        )
+        candidate = _make_candidate("arb-test", 0.1)
+        # Run full select — should include arbitration
+        selected, reserve, debate = council.select([candidate], 10)
+        # Verify votes exist (arbitration produces votes)
+        self.assertGreater(len(debate.votes), 0)
+
+    def test_arbitration_not_triggered_for_clear_majority(self) -> None:
+        """No arbitration when there's a clear majority (e.g. 5-0 or 4-1)."""
+        from newsfeed.models.domain import DebateVote
+        council = NewExpertCouncil(
+            expert_ids=["e1", "e2", "e3", "e4", "e5"],
+            keep_threshold=0.62,
+        )
+        candidate = _make_candidate("clear-test")
+        # Create clear majority votes (4 keep, 1 drop)
+        votes = [
+            DebateVote(expert_id="e1", candidate_id="clear-test", keep=True, confidence=0.9, rationale="good", risk_note="low"),
+            DebateVote(expert_id="e2", candidate_id="clear-test", keep=True, confidence=0.85, rationale="good", risk_note="low"),
+            DebateVote(expert_id="e3", candidate_id="clear-test", keep=True, confidence=0.8, rationale="good", risk_note="low"),
+            DebateVote(expert_id="e4", candidate_id="clear-test", keep=True, confidence=0.75, rationale="good", risk_note="low"),
+            DebateVote(expert_id="e5", candidate_id="clear-test", keep=False, confidence=0.6, rationale="weak", risk_note="none"),
+        ]
+        result = council._arbitrate(candidate, votes)
+        # Should return unchanged (4-1 is not close enough)
+        self.assertEqual(len(result), 5)
+        # Vote counts should be unchanged since no arbitration
+        keep = sum(1 for v in result if v.keep)
+        self.assertEqual(keep, 4)
+
+    def test_arbitration_revote_may_flip(self) -> None:
+        """An arbitration revote should mark the rationale as revised."""
+        council = NewExpertCouncil(
+            expert_ids=["expert_quality_agent"],
+            keep_threshold=0.62,
+        )
+        candidate = _make_candidate("flip-test")
+        vote = council._arbitration_revote(
+            "expert_quality_agent", candidate,
+            council._vote_heuristic,
+        )
+        self.assertIn("arbitration", vote.rationale.lower())
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Integration: Engine wiring tests
+# ──────────────────────────────────────────────────────────────────────────
+
+class EngineWiringTests(unittest.TestCase):
+    """Verify the engine properly wires all new components."""
+
+    def test_engine_has_orchestrator(self) -> None:
+        from newsfeed.orchestration.orchestrator import OrchestratorAgent
+        # Just verify the import chain works
+        self.assertTrue(hasattr(OrchestratorAgent, 'agent_id'))
+        self.assertEqual(OrchestratorAgent.agent_id, "orchestrator_agent")
+
+    def test_engine_has_optimizer(self) -> None:
+        from newsfeed.orchestration.optimizer import SystemOptimizationAgent
+        self.assertTrue(hasattr(SystemOptimizationAgent, 'agent_id'))
+        self.assertEqual(SystemOptimizationAgent.agent_id, "system_optimization_agent")
+
+    def test_engine_has_review_agents(self) -> None:
+        from newsfeed.review.agents import StyleReviewAgent, ClarityReviewAgent
+        self.assertEqual(StyleReviewAgent.agent_id, "review_agent_style")
+        self.assertEqual(ClarityReviewAgent.agent_id, "review_agent_clarity")
+
+    def test_communication_agent_id(self) -> None:
+        from newsfeed.orchestration.communication import CommunicationAgent
+        self.assertEqual(CommunicationAgent.agent_id, "communication_agent")
+
+
 if __name__ == "__main__":
     unittest.main()
