@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from newsfeed.models.domain import CandidateItem, UserProfile
 
@@ -29,6 +31,36 @@ class PreferenceStore:
             profile.format = fmt
         return profile
 
+    def apply_region(self, user_id: str, region: str) -> UserProfile:
+        profile = self.get_or_create(user_id)
+        if region not in profile.regions_of_interest:
+            profile.regions_of_interest.append(region)
+        return profile
+
+    def apply_cadence(self, user_id: str, cadence: str) -> UserProfile:
+        profile = self.get_or_create(user_id)
+        profile.briefing_cadence = cadence
+        return profile
+
+    def apply_max_items(self, user_id: str, max_items: int) -> UserProfile:
+        profile = self.get_or_create(user_id)
+        profile.max_items = max(1, min(max_items, 50))
+        return profile
+
+    def snapshot(self) -> dict[str, dict]:
+        result = {}
+        for uid, p in self._profiles.items():
+            result[uid] = {
+                "topic_weights": dict(p.topic_weights),
+                "source_weights": dict(p.source_weights),
+                "tone": p.tone,
+                "format": p.format,
+                "max_items": p.max_items,
+                "cadence": p.briefing_cadence,
+                "regions": list(p.regions_of_interest),
+            }
+        return result
+
 
 class CandidateCache:
     def __init__(self, stale_after_minutes: int = 180) -> None:
@@ -54,3 +86,26 @@ class CandidateCache:
         unseen = [replace(c) for c in candidates if c.candidate_id not in already_seen_ids]
         unseen.sort(key=lambda c: c.composite_score(), reverse=True)
         return unseen[:limit]
+
+
+class StatePersistence:
+    def __init__(self, state_dir: Path) -> None:
+        self.state_dir = state_dir
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+
+    def save(self, key: str, data: dict) -> None:
+        path = self.state_dir / f"{key}.json"
+        tmp = path.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, default=str)
+        tmp.rename(path)
+
+    def load(self, key: str) -> dict | None:
+        path = self.state_dir / f"{key}.json"
+        if not path.exists():
+            return None
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return None

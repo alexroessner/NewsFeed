@@ -6,6 +6,13 @@ from enum import Enum
 from typing import Any
 
 
+_SCORING_CFG: dict[str, Any] = {}
+
+
+def configure_scoring(cfg: dict[str, Any]) -> None:
+    _SCORING_CFG.update(cfg)
+
+
 class StoryLifecycle(Enum):
     DEVELOPING = "developing"
     BREAKING = "breaking"
@@ -36,9 +43,10 @@ class ConfidenceBand:
     key_assumptions: list[str] = field(default_factory=list)
 
     def label(self) -> str:
-        if self.mid >= 0.8:
+        labels = _SCORING_CFG.get("confidence_labels", {})
+        if self.mid >= labels.get("high_threshold", 0.80):
             return "high confidence"
-        if self.mid >= 0.55:
+        if self.mid >= labels.get("moderate_threshold", 0.55):
             return "moderate confidence"
         return "low confidence"
 
@@ -53,7 +61,11 @@ class SourceReliability:
     total_items_seen: int = 0
 
     def trust_factor(self) -> float:
-        return 0.5 * self.reliability_score + 0.3 * self.historical_accuracy + 0.2 * self.corroboration_rate
+        weights = _SCORING_CFG.get("trust_factor_weights", {})
+        w_rel = weights.get("reliability", 0.50)
+        w_acc = weights.get("historical_accuracy", 0.30)
+        w_cor = weights.get("corroboration", 0.20)
+        return w_rel * self.reliability_score + w_acc * self.historical_accuracy + w_cor * self.corroboration_rate
 
 
 @dataclass(slots=True)
@@ -97,11 +109,16 @@ class CandidateItem:
     contrarian_signal: str = ""
 
     def composite_score(self) -> float:
+        weights = _SCORING_CFG.get("composite_weights", {})
+        w_ev = weights.get("evidence", 0.30)
+        w_no = weights.get("novelty", 0.25)
+        w_pf = weights.get("preference_fit", 0.30)
+        w_ps = weights.get("prediction_signal", 0.15)
         return (
-            0.30 * self.evidence_score
-            + 0.25 * self.novelty_score
-            + 0.30 * self.preference_fit
-            + 0.15 * self.prediction_signal
+            w_ev * self.evidence_score
+            + w_no * self.novelty_score
+            + w_pf * self.preference_fit
+            + w_ps * self.prediction_signal
         )
 
 
@@ -134,13 +151,15 @@ class NarrativeThread:
         if not self.candidates:
             return 0.0
         avg = sum(c.composite_score() for c in self.candidates) / len(self.candidates)
-        source_bonus = min(0.15, 0.05 * self.source_count)
-        urgency_bonus = {
-            UrgencyLevel.ROUTINE: 0.0,
-            UrgencyLevel.ELEVATED: 0.05,
-            UrgencyLevel.BREAKING: 0.15,
-            UrgencyLevel.CRITICAL: 0.25,
-        }.get(self.urgency, 0.0)
+
+        ts_cfg = _SCORING_CFG.get("thread_scoring", {})
+        bonus_per = ts_cfg.get("source_bonus_per", 0.05)
+        bonus_cap = ts_cfg.get("source_bonus_cap", 0.15)
+        source_bonus = min(bonus_cap, bonus_per * self.source_count)
+
+        urgency_map = ts_cfg.get("urgency_bonus", {})
+        urgency_bonus = urgency_map.get(self.urgency.value, 0.0)
+
         return min(1.0, avg + source_bonus + urgency_bonus)
 
 
@@ -153,7 +172,8 @@ class GeoRiskEntry:
     drivers: list[str] = field(default_factory=list)
 
     def is_escalating(self) -> bool:
-        return self.escalation_delta > 0.05
+        threshold = _SCORING_CFG.get("_georisk_escalation_threshold", 0.05)
+        return self.escalation_delta > threshold
 
 
 @dataclass(slots=True)
