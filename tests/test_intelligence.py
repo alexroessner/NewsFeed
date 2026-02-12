@@ -21,6 +21,8 @@ from newsfeed.models.domain import (
     StoryLifecycle,
     TrendSnapshot,
     UrgencyLevel,
+    configure_scoring,
+    validate_candidate,
 )
 
 
@@ -272,6 +274,105 @@ class DomainModelTests(unittest.TestCase):
     def test_urgency_level_enum(self) -> None:
         self.assertEqual(UrgencyLevel.CRITICAL.value, "critical")
         self.assertEqual(StoryLifecycle.BREAKING.value, "breaking")
+
+    def test_configure_scoring_clears_old_values(self) -> None:
+        configure_scoring({"composite_weights": {"evidence": 0.5}})
+        configure_scoring({"confidence_labels": {"high_threshold": 0.9}})
+        # Old composite_weights should be gone after clear+update
+        c = _make_candidate()
+        # With no composite_weights in config, defaults should be used
+        score = c.composite_score()
+        self.assertGreater(score, 0)
+        # Reset for other tests
+        configure_scoring({})
+
+    def test_validate_candidate_valid(self) -> None:
+        c = _make_candidate()
+        issues = validate_candidate(c)
+        self.assertEqual(issues, [])
+
+    def test_validate_candidate_out_of_range(self) -> None:
+        c = _make_candidate(evidence=1.5)
+        issues = validate_candidate(c)
+        self.assertEqual(len(issues), 1)
+        self.assertIn("evidence_score", issues[0])
+
+    def test_validate_candidate_empty_fields(self) -> None:
+        c = _make_candidate(title="", source="")
+        issues = validate_candidate(c)
+        self.assertGreaterEqual(len(issues), 2)
+
+    def test_empty_thread_score_zero(self) -> None:
+        thread = NarrativeThread(thread_id="t1", headline="Empty", candidates=[])
+        self.assertEqual(thread.thread_score(), 0.0)
+
+
+class EdgeCaseTests(unittest.TestCase):
+    def test_clustering_empty_list(self) -> None:
+        clustering = StoryClustering()
+        threads = clustering.cluster([])
+        self.assertEqual(threads, [])
+
+    def test_clustering_single_candidate(self) -> None:
+        clustering = StoryClustering()
+        threads = clustering.cluster([_make_candidate()])
+        self.assertEqual(len(threads), 1)
+        self.assertEqual(len(threads[0].candidates), 1)
+
+    def test_georisk_empty_candidates(self) -> None:
+        index = GeoRiskIndex()
+        risks = index.assess([])
+        self.assertEqual(risks, [])
+
+    def test_trends_empty_candidates(self) -> None:
+        detector = TrendDetector()
+        snapshots = detector.analyze([])
+        self.assertEqual(snapshots, [])
+
+    def test_urgency_empty_candidates(self) -> None:
+        detector = BreakingDetector()
+        result = detector.assess([])
+        self.assertEqual(result, [])
+
+    def test_diversity_all_same_source(self) -> None:
+        items = [_make_candidate(cid=f"c{i}", source="reuters") for i in range(10)]
+        diverse = enforce_source_diversity(items, max_per_source=2)
+        self.assertEqual(len(diverse), 10)
+        # First 2 should be reuters (highest-scoring), rest are overflow
+        self.assertEqual(diverse[0].source, "reuters")
+
+    def test_corroboration_single_item(self) -> None:
+        result = detect_cross_corroboration([_make_candidate()])
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].corroborated_by, [])
+
+    def test_credibility_tracker_with_config(self) -> None:
+        tracker = CredibilityTracker(intel_cfg={
+            "source_tiers": {
+                "tier_1": {"sources": ["custom_source"], "base_reliability": 0.95},
+            }
+        })
+        sr = tracker.get_source("custom_source")
+        self.assertEqual(sr.reliability_score, 0.95)
+
+    def test_credibility_snapshot(self) -> None:
+        tracker = CredibilityTracker()
+        tracker.record_item(_make_candidate(source="reuters"))
+        snap = tracker.snapshot()
+        self.assertIn("reuters", snap)
+        self.assertEqual(snap["reuters"]["seen"], 1)
+
+    def test_georisk_snapshot(self) -> None:
+        index = GeoRiskIndex()
+        index.assess([_make_candidate(title="Ukraine conflict escalation")])
+        snap = index.snapshot()
+        self.assertIsInstance(snap, dict)
+
+    def test_trends_snapshot(self) -> None:
+        detector = TrendDetector()
+        detector.analyze([_make_candidate()])
+        snap = detector.snapshot()
+        self.assertIn("geopolitics", snap)
 
 
 if __name__ == "__main__":

@@ -1,16 +1,24 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
+log = logging.getLogger(__name__)
 
+# Module-level scoring config for convenience; engines can also pass config explicitly.
 _SCORING_CFG: dict[str, Any] = {}
 
 
 def configure_scoring(cfg: dict[str, Any]) -> None:
+    _SCORING_CFG.clear()
     _SCORING_CFG.update(cfg)
+
+
+def _get_scoring() -> dict[str, Any]:
+    return _SCORING_CFG
 
 
 class StoryLifecycle(Enum):
@@ -43,7 +51,7 @@ class ConfidenceBand:
     key_assumptions: list[str] = field(default_factory=list)
 
     def label(self) -> str:
-        labels = _SCORING_CFG.get("confidence_labels", {})
+        labels = _get_scoring().get("confidence_labels", {})
         if self.mid >= labels.get("high_threshold", 0.80):
             return "high confidence"
         if self.mid >= labels.get("moderate_threshold", 0.55):
@@ -61,7 +69,7 @@ class SourceReliability:
     total_items_seen: int = 0
 
     def trust_factor(self) -> float:
-        weights = _SCORING_CFG.get("trust_factor_weights", {})
+        weights = _get_scoring().get("trust_factor_weights", {})
         w_rel = weights.get("reliability", 0.50)
         w_acc = weights.get("historical_accuracy", 0.30)
         w_cor = weights.get("corroboration", 0.20)
@@ -109,7 +117,7 @@ class CandidateItem:
     contrarian_signal: str = ""
 
     def composite_score(self) -> float:
-        weights = _SCORING_CFG.get("composite_weights", {})
+        weights = _get_scoring().get("composite_weights", {})
         w_ev = weights.get("evidence", 0.30)
         w_no = weights.get("novelty", 0.25)
         w_pf = weights.get("preference_fit", 0.30)
@@ -120,6 +128,26 @@ class CandidateItem:
             + w_pf * self.preference_fit
             + w_ps * self.prediction_signal
         )
+
+
+def validate_candidate(c: CandidateItem) -> list[str]:
+    """Validate candidate data integrity. Returns list of issues found."""
+    issues: list[str] = []
+    for fname, val in [
+        ("evidence_score", c.evidence_score),
+        ("novelty_score", c.novelty_score),
+        ("preference_fit", c.preference_fit),
+        ("prediction_signal", c.prediction_signal),
+    ]:
+        if not (0.0 <= val <= 1.0):
+            issues.append(f"{fname}={val} outside [0, 1]")
+    if not c.title.strip():
+        issues.append("empty title")
+    if not c.source.strip():
+        issues.append("empty source")
+    if not c.topic.strip():
+        issues.append("empty topic")
+    return issues
 
 
 @dataclass(slots=True)
@@ -152,7 +180,7 @@ class NarrativeThread:
             return 0.0
         avg = sum(c.composite_score() for c in self.candidates) / len(self.candidates)
 
-        ts_cfg = _SCORING_CFG.get("thread_scoring", {})
+        ts_cfg = _get_scoring().get("thread_scoring", {})
         bonus_per = ts_cfg.get("source_bonus_per", 0.05)
         bonus_cap = ts_cfg.get("source_bonus_cap", 0.15)
         source_bonus = min(bonus_cap, bonus_per * self.source_count)
@@ -172,7 +200,7 @@ class GeoRiskEntry:
     drivers: list[str] = field(default_factory=list)
 
     def is_escalating(self) -> bool:
-        threshold = _SCORING_CFG.get("_georisk_escalation_threshold", 0.05)
+        threshold = _get_scoring().get("_georisk_escalation_threshold", 0.05)
         return self.escalation_delta > threshold
 
 
