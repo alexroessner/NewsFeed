@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "control_agents": [
     {
       "id": "orchestrator_agent",
@@ -9,7 +9,7 @@
     {
       "id": "communication_agent",
       "persona": "Telegram communication interface",
-      "responsibilities": ["render_user_payload", "send_telegram_messages", "capture_user_feedback"]
+      "responsibilities": ["render_user_payload", "send_telegram_messages", "capture_user_feedback", "schedule_briefings"]
     },
     {
       "id": "system_optimization_agent",
@@ -18,28 +18,54 @@
     }
   ],
   "research_agents": [
-    {"id": "x_agent_1", "source": "x", "mandate": "trending geopolitics and macro"},
-    {"id": "x_agent_2", "source": "x", "mandate": "technology and AI policy"},
-    {"id": "x_agent_3", "source": "x", "mandate": "markets and global events"},
-    {"id": "reddit_agent_1", "source": "reddit", "mandate": "high-signal community discussions"},
-    {"id": "reddit_agent_2", "source": "reddit", "mandate": "niche vertical and domain discovery"},
-    {"id": "reddit_agent_3", "source": "reddit", "mandate": "consensus and dissent mapping"},
-    {"id": "news_agent_guardian", "source": "guardian", "mandate": "source-specific major developments"},
-    {"id": "news_agent_reuters", "source": "reuters", "mandate": "wire-level factual updates"},
-    {"id": "news_agent_ap", "source": "ap", "mandate": "nonpartisan coverage sweep"},
-    {"id": "news_agent_bbc_world", "source": "bbc", "mandate": "global context updates"},
-    {"id": "news_agent_ft_world", "source": "ft", "mandate": "economic and policy implications"},
-    {"id": "web_scraper_agent_1", "source": "web", "mandate": "broad open-web discovery"},
-    {"id": "web_scraper_agent_2", "source": "web", "mandate": "emerging topic expansion"},
-    {"id": "web_scraper_agent_3", "source": "web", "mandate": "verification and cross-reference search"}
+    {"id": "x_agent_1", "source": "x", "mandate": "Monitor high-signal geopolitics and macro accounts for breaking developments, sanctions, military movements, and diplomatic shifts"},
+    {"id": "x_agent_2", "source": "x", "mandate": "Track AI policy discourse, LLM releases, regulation debates, and technology leadership commentary from key researchers and executives"},
+    {"id": "x_agent_3", "source": "x", "mandate": "Surface market-moving signals, economic data reactions, central bank commentary, and financial sector sentiment shifts"},
+    {"id": "reddit_agent_1", "source": "reddit", "mandate": "Mine r/worldnews and r/geopolitics for high-engagement discussions that signal emerging consensus or surprising dissent on global events"},
+    {"id": "reddit_agent_2", "source": "reddit", "mandate": "Scan niche verticals (r/MachineLearning, r/CryptoCurrency, r/science) for domain-expert insights missed by mainstream coverage"},
+    {"id": "reddit_agent_3", "source": "reddit", "mandate": "Map consensus vs dissent patterns across subreddits to detect narrative formation and contrarian signals"},
+    {"id": "news_agent_guardian", "source": "guardian", "mandate": "Track Guardian investigative and analytical coverage with emphasis on long-form context that wire services lack"},
+    {"id": "news_agent_reuters", "source": "reuters", "mandate": "Capture Reuters wire-level factual updates with highest reliability rating for baseline truth establishment"},
+    {"id": "news_agent_ap", "source": "ap", "mandate": "Sweep AP nonpartisan coverage for stories that serve as independent corroboration anchors"},
+    {"id": "news_agent_bbc", "source": "bbc", "mandate": "Monitor BBC 12 topic feeds for global context updates with strong UK, Europe, and Commonwealth perspective"},
+    {"id": "news_agent_ft", "source": "ft", "mandate": "Track Financial Times economic and policy analysis for market implications and regulatory signals"},
+    {"id": "news_agent_aljazeera", "source": "aljazeera", "mandate": "Capture global south perspective and Middle East/Africa coverage underrepresented in Western wire services"},
+    {"id": "hackernews_agent", "source": "hackernews", "mandate": "Surface technology signals — AI breakthroughs, startup developments, engineering discussions, open source movements that precede mainstream coverage"},
+    {"id": "arxiv_agent", "source": "arxiv", "mandate": "Monitor academic preprints for AI/ML breakthroughs, quantitative research, and scientific findings that foreshadow industry and policy developments"},
+    {"id": "gdelt_agent", "source": "gdelt", "mandate": "Leverage GDELT global event monitoring for early crisis detection, conflict tracking, and cross-border escalation signals across 100+ languages"},
+    {"id": "web_agent_discovery", "source": "web", "mandate": "Broad open-web discovery via Google News RSS for stories that fall outside individual source agent coverage"},
+    {"id": "web_agent_verification", "source": "web", "mandate": "Cross-reference search to verify and corroborate claims from social and tier-2 sources against mainstream coverage"},
+    {"id": "web_agent_emerging", "source": "web", "mandate": "Emerging topic expansion — search for developing stories with low current coverage but rising signals"}
   ],
   "expert_agents": [
-    {"id": "expert_quality_agent", "criteria": ["source_quality", "evidence_strength"]},
-    {"id": "expert_relevance_agent", "criteria": ["topic_relevance", "novelty_delta"]},
-    {"id": "expert_preference_fit_agent", "criteria": ["user_affinity_probability", "style_alignment"]}
+    {
+      "id": "expert_quality_agent",
+      "criteria": ["source_quality", "evidence_strength", "corroboration", "recency"],
+      "description": "Evaluates evidential strength, source reliability, corroboration status, and information freshness"
+    },
+    {
+      "id": "expert_relevance_agent",
+      "criteria": ["topic_relevance", "novelty_delta", "signal_noise", "lifecycle_stage"],
+      "description": "Assesses genuine novelty, topic alignment, signal-to-noise ratio, and story lifecycle position"
+    },
+    {
+      "id": "expert_preference_fit_agent",
+      "criteria": ["user_affinity_probability", "style_alignment", "decision_utility", "briefing_fit"],
+      "description": "Evaluates user preference alignment, decision utility, cognitive load management, and briefing format fit"
+    },
+    {
+      "id": "expert_geopolitical_risk_agent",
+      "criteria": ["escalation_potential", "regional_impact", "actor_significance", "pattern_match"],
+      "description": "Analyzes geopolitical significance, escalation dynamics, regional contagion risk, and historical pattern matching"
+    },
+    {
+      "id": "expert_market_signal_agent",
+      "criteria": ["market_impact", "leading_indicator", "sector_exposure", "policy_signal"],
+      "description": "Assesses market-moving potential, leading economic indicators, sector exposure breadth, and policy signal strength"
+    }
   ],
   "review_agents": [
-    {"id": "review_agent_style", "focus": "voice, tone, and personalization"},
-    {"id": "review_agent_clarity", "focus": "clarity, structure, and concision"}
+    {"id": "review_agent_style", "focus": "voice, tone, personalization, and audience-appropriate language"},
+    {"id": "review_agent_clarity", "focus": "clarity, structure, concision, and actionable framing"}
   ]
 }
