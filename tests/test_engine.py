@@ -8,8 +8,6 @@ from newsfeed.models.config import load_runtime_config
 from newsfeed.models.domain import ResearchTask
 from newsfeed.orchestration.engine import NewsFeedEngine
 from newsfeed.review.personas import PersonaReviewStack
-from newsfeed.models.config import load_runtime_config
-from newsfeed.orchestration.engine import NewsFeedEngine
 
 
 class EngineTests(unittest.TestCase):
@@ -24,7 +22,6 @@ class EngineTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         cfg = load_runtime_config(root / "config")
         engine = NewsFeedEngine(cfg.agents, cfg.pipeline, cfg.personas, root / "personas")
-        engine = NewsFeedEngine(cfg.agents, cfg.pipeline)
 
         output = engine.handle_request(
             user_id="u1",
@@ -32,12 +29,47 @@ class EngineTests(unittest.TestCase):
             weighted_topics={"geopolitics": 0.9, "macro": 0.4},
         )
 
-        self.assertIn("NewsFeed Brief", output)
+        # Briefing type is dynamic based on urgency detection
+        self.assertTrue(
+            "Morning Intelligence Digest" in output or "BREAKING ALERT" in output,
+            "Expected a briefing header in output",
+        )
         self.assertIn("Why it matters", output)
         self.assertIn("Review lenses", output)
 
+        # Intelligence enrichment outputs
+        self.assertIn("Confidence:", output)
+        self.assertIn("NARRATIVE THREADS", output)
+
         more = engine.show_more("u1", "geopolitics", already_seen_ids=set(), limit=3)
         self.assertLessEqual(len(more), 3)
+
+    def test_engine_report_contains_geo_risks(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        cfg = load_runtime_config(root / "config")
+        engine = NewsFeedEngine(cfg.agents, cfg.pipeline, cfg.personas, root / "personas")
+
+        output = engine.handle_request(
+            user_id="u-geo",
+            prompt="geopolitics briefing",
+            weighted_topics={"geopolitics": 1.0},
+        )
+
+        self.assertIn("[", output)
+        self.assertIn("Lifecycle:", output)
+
+    def test_engine_metadata_includes_intelligence(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        cfg = load_runtime_config(root / "config")
+        engine = NewsFeedEngine(cfg.agents, cfg.pipeline, cfg.personas, root / "personas")
+
+        output = engine.handle_request(
+            user_id="u-meta",
+            prompt="tech update",
+            weighted_topics={"ai_policy": 0.8},
+        )
+
+        self.assertIn("Intelligence:", output)
 
     def test_expert_council_produces_votes(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -61,7 +93,6 @@ class EngineTests(unittest.TestCase):
         context = stack.active_context()
         self.assertGreaterEqual(len(context), 1)
         self.assertIn("confidence bands", stack.refine_outlook("Base outlook."))
-
 
     def test_apply_user_feedback_updates_profile(self) -> None:
         root = Path(__file__).resolve().parents[1]
