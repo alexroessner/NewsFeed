@@ -8,6 +8,8 @@ from newsfeed.models.config import load_runtime_config
 from newsfeed.models.domain import ResearchTask
 from newsfeed.orchestration.engine import NewsFeedEngine
 from newsfeed.review.personas import PersonaReviewStack
+from newsfeed.models.config import load_runtime_config
+from newsfeed.orchestration.engine import NewsFeedEngine
 
 
 class EngineTests(unittest.TestCase):
@@ -22,6 +24,7 @@ class EngineTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         cfg = load_runtime_config(root / "config")
         engine = NewsFeedEngine(cfg.agents, cfg.pipeline, cfg.personas, root / "personas")
+        engine = NewsFeedEngine(cfg.agents, cfg.pipeline)
 
         output = engine.handle_request(
             user_id="u1",

@@ -20,6 +20,7 @@ def main() -> None:
     print(f"Loaded research agents: {len(research_agents)}")
 
     engine = NewsFeedEngine(config=cfg.agents, pipeline=cfg.pipeline, personas=cfg.personas, personas_dir=personas_dir)
+    engine = NewsFeedEngine(config=cfg.agents, pipeline=cfg.pipeline)
     report = engine.handle_request(
         user_id="demo-user",
         prompt="Give me high-signal geopolitics and AI policy updates",
