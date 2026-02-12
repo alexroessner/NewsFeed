@@ -28,10 +28,6 @@ Deliver a daily and on-demand Telegram briefing where:
 7. **Persona-driven editorial review** (engineer/source-critic/audience/forecaster lenses).
 8. **Delivery** through communication agent.
 9. **Feedback writeback** to preference memory + cache.
-7. **Internal deep report** drafting.
-8. **Two-agent editorial optimization** for tone + clarity.
-9. **Delivery** through communication agent.
-10. **Feedback writeback** to preference memory + cache.
 
 ## Milestones
 ### M1 — Runtime and config foundation
@@ -44,9 +40,6 @@ Deliver a daily and on-demand Telegram briefing where:
 - [x] Candidate normalization and dedupe.
 - [x] Expert scoring contract + arbitration rule.
 - [x] Explicit debate vote records from expert council.
-- [x] Fan-out API for research agents (simulated deterministic implementation).
-- [x] Candidate normalization and dedupe.
-- [x] Expert scoring contract + arbitration rule (single pass selection in council).
 
 ### M3 — Report generation and delivery
 - [x] Internal report data model.
@@ -72,9 +65,3 @@ Deliver a daily and on-demand Telegram briefing where:
 3. Wire Telegram send/edit/retry adapter with durable delivery logs.
 4. Add structured observability (latency per stage, keep/drop audit, cache hit rate).
 5. Add runtime commands to switch active persona set per user.
-
-## Next technical priorities
-1. Replace simulated research agents with real source adapters.
-2. Add asynchronous execution per research fanout stage.
-3. Wire Telegram send/edit/retry adapter with durable delivery logs.
-4. Persist profile/cache stores in SQLite or Postgres.
