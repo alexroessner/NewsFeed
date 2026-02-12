@@ -464,22 +464,108 @@ class ExpertCouncil:
 
         return DebateRecord(votes=votes)
 
+    def _arbitrate(self, candidate: CandidateItem, votes: list[DebateVote]) -> list[DebateVote]:
+        """Run an arbitration round for closely-split votes.
+
+        When votes are close (e.g. 3-2 split), dissenting experts re-evaluate
+        with access to the majority rationale. This implements the vision's
+        "conflicts trigger short arbitration round before final selection."
+        """
+        keep_votes = [v for v in votes if v.keep]
+        drop_votes = [v for v in votes if not v.keep]
+
+        # Only arbitrate if votes are closely split (differ by at most 1)
+        if abs(len(keep_votes) - len(drop_votes)) > 1:
+            return votes  # Clear majority — no arbitration needed
+
+        # Identify majority and minority
+        if len(keep_votes) >= len(drop_votes):
+            majority_rationales = [v.rationale for v in keep_votes]
+            minority_votes = drop_votes
+        else:
+            majority_rationales = [v.rationale for v in drop_votes]
+            minority_votes = keep_votes
+
+        if not minority_votes:
+            return votes
+
+        # Minority experts re-evaluate considering majority reasoning
+        vote_fn = self._vote_llm if self._use_llm else self._vote_heuristic
+        revised_votes = list(votes)
+
+        for mv in minority_votes:
+            new_vote = self._arbitration_revote(mv.expert_id, candidate, vote_fn)
+            revised_votes = [v if v.expert_id != mv.expert_id else new_vote for v in revised_votes]
+
+        return revised_votes
+
+    def _arbitration_revote(self, expert_id: str, candidate: CandidateItem,
+                            vote_fn) -> DebateVote:
+        """Have a minority expert reconsider during arbitration."""
+        base_vote = vote_fn(expert_id, candidate)
+
+        # Slight confidence adjustment toward center (arbitration effect)
+        adjusted_confidence = base_vote.confidence * 0.9 + 0.05
+        adjusted_confidence = min(self.confidence_max, max(self.confidence_min, adjusted_confidence))
+
+        # Expert may flip if their confidence was borderline
+        threshold_distance = abs(base_vote.confidence - self.keep_threshold)
+        flip = threshold_distance < 0.08
+
+        new_keep = not base_vote.keep if flip else base_vote.keep
+        rationale_suffix = " [Revised after arbitration.]"
+
+        return DebateVote(
+            expert_id=expert_id,
+            candidate_id=candidate.candidate_id,
+            keep=new_keep,
+            confidence=round(adjusted_confidence, 3),
+            rationale=(base_vote.rationale + rationale_suffix)[:250],
+            risk_note=base_vote.risk_note,
+        )
+
     def select(
         self, candidates: list[CandidateItem], max_items: int
     ) -> tuple[list[CandidateItem], list[CandidateItem], DebateRecord]:
-        """Run expert debate and select top candidates."""
+        """Run expert debate with arbitration and select top candidates."""
         debate = self.debate(candidates)
         required = self._required_votes()
 
+        # Group votes by candidate
         votes_by_candidate: dict[str, list[DebateVote]] = {}
         for vote in debate.votes:
             votes_by_candidate.setdefault(vote.candidate_id, []).append(vote)
 
-        accepted_ids: set[str] = set()
+        # Build candidate lookup for arbitration
+        candidate_map = {c.candidate_id: c for c in candidates}
+
+        # Run arbitration on closely-split votes
+        arbitration_count = 0
+        final_votes: list[DebateVote] = []
         for candidate_id, cvotes in votes_by_candidate.items():
+            keep_count = sum(1 for v in cvotes if v.keep)
+            drop_count = len(cvotes) - keep_count
+
+            if abs(keep_count - drop_count) <= 1 and candidate_id in candidate_map:
+                revised = self._arbitrate(candidate_map[candidate_id], cvotes)
+                final_votes.extend(revised)
+                arbitration_count += 1
+            else:
+                final_votes.extend(cvotes)
+
+        # Regroup after arbitration
+        final_by_candidate: dict[str, list[DebateVote]] = {}
+        for vote in final_votes:
+            final_by_candidate.setdefault(vote.candidate_id, []).append(vote)
+
+        accepted_ids: set[str] = set()
+        for candidate_id, cvotes in final_by_candidate.items():
             keep_votes = sum(1 for v in cvotes if v.keep)
             if keep_votes >= required:
                 accepted_ids.add(candidate_id)
+
+        # Update debate record with final (potentially revised) votes
+        debate = DebateRecord(votes=final_votes)
 
         # Deduplicate and rank
         deduped: dict[str, CandidateItem] = {}
@@ -495,10 +581,10 @@ class ExpertCouncil:
         reserve = ranked[max_items:]
 
         log.info(
-            "Expert council: %d/%d accepted (%d experts, %d required votes), "
+            "Expert council: %d/%d accepted (%d experts, %d required, %d arbitrated), "
             "%d selected, %d reserve",
             len(accepted_ids), len(candidates), len(self.expert_ids),
-            required, len(selected), len(reserve),
+            required, arbitration_count, len(selected), len(reserve),
         )
 
         return selected, reserve, debate

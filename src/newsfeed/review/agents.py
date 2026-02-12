@@ -1,0 +1,480 @@
+"""Editorial review agents — rewrite and optimize report output for reader preferences.
+
+Two agents form the editorial layer:
+- StyleReviewAgent: Voice, tone, personalization, audience-appropriate language
+- ClarityReviewAgent: Clarity, structure, concision, actionable framing
+
+Both support LLM-backed rewriting (when API key available) and sophisticated
+heuristic rewriting (always available). The persona files in personas/ provide
+additional cognitive context for each review pass.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import re
+import urllib.error
+import urllib.request
+from typing import Any
+
+from newsfeed.models.domain import CandidateItem, ReportItem, UrgencyLevel, UserProfile
+
+log = logging.getLogger(__name__)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Tone templates — used in heuristic mode
+# ──────────────────────────────────────────────────────────────────────
+
+_TONE_TEMPLATES: dict[str, dict[str, str]] = {
+    "concise": {
+        "why_prefix": "",
+        "outlook_prefix": "Outlook: ",
+        "changed_prefix": "Update: ",
+        "style": "Short, direct sentences. No filler. Lead with the key fact.",
+    },
+    "analyst": {
+        "why_prefix": "Assessment: ",
+        "outlook_prefix": "Forward-looking: ",
+        "changed_prefix": "Delta: ",
+        "style": "Technical, evidence-anchored language. Quantify when possible.",
+    },
+    "executive": {
+        "why_prefix": "Bottom line: ",
+        "outlook_prefix": "Strategic view: ",
+        "changed_prefix": "Key development: ",
+        "style": "High-level framing. Decision-relevant. Skip operational detail.",
+    },
+    "brief": {
+        "why_prefix": "",
+        "outlook_prefix": "",
+        "changed_prefix": "",
+        "style": "Minimum viable context. One sentence per field.",
+    },
+    "deep": {
+        "why_prefix": "Deep context: ",
+        "outlook_prefix": "Scenario analysis: ",
+        "changed_prefix": "Evolution: ",
+        "style": "Thorough analysis. Include nuance, uncertainty, alternative readings.",
+    },
+}
+
+_URGENCY_FRAMING = {
+    UrgencyLevel.CRITICAL: "Immediate attention required. ",
+    UrgencyLevel.BREAKING: "Developing rapidly. ",
+    UrgencyLevel.ELEVATED: "Worth monitoring closely. ",
+    UrgencyLevel.ROUTINE: "",
+}
+
+
+class StyleReviewAgent:
+    """Review agent focused on voice, tone, personalization, and audience language.
+
+    Responsibilities (from vision):
+    - Enforce consistent voice across all report items
+    - Adapt language to user's preferred tone (concise, analyst, executive, etc.)
+    - Personalize framing based on user's topic weights and interests
+    - Maintain factual integrity while reshaping presentation
+    """
+
+    agent_id = "review_agent_style"
+
+    def __init__(
+        self,
+        persona_context: list[str] | None = None,
+        llm_api_key: str = "",
+        llm_model: str = "claude-sonnet-4-5-20250929",
+        llm_base_url: str = "https://api.anthropic.com/v1",
+    ) -> None:
+        self._persona_context = persona_context or []
+        self._llm_api_key = llm_api_key
+        self._llm_model = llm_model
+        self._llm_base_url = llm_base_url
+        self._use_llm = bool(llm_api_key)
+
+    def review(self, item: ReportItem, profile: UserProfile) -> ReportItem:
+        """Apply style review to a report item, rewriting fields for voice and tone."""
+        if self._use_llm:
+            return self._review_llm(item, profile)
+        return self._review_heuristic(item, profile)
+
+    def _review_heuristic(self, item: ReportItem, profile: UserProfile) -> ReportItem:
+        """Apply tone-aware heuristic rewriting."""
+        tone = profile.tone
+        templates = _TONE_TEMPLATES.get(tone, _TONE_TEMPLATES["concise"])
+        c = item.candidate
+
+        # Rewrite why_it_matters with tone-specific prefix and topic personalization
+        why = self._rewrite_why(item.why_it_matters, c, profile, templates)
+        item.why_it_matters = why
+
+        # Rewrite what_changed with urgency framing
+        changed = self._rewrite_changed(item.what_changed, c, templates)
+        item.what_changed = changed
+
+        # Rewrite predictive_outlook
+        outlook = self._rewrite_outlook(item.predictive_outlook, c, profile, templates)
+        item.predictive_outlook = outlook
+
+        return item
+
+    def _rewrite_why(self, base: str, c: CandidateItem, profile: UserProfile,
+                     templates: dict[str, str]) -> str:
+        prefix = templates["why_prefix"]
+        urgency = _URGENCY_FRAMING.get(c.urgency, "")
+
+        # Personalize: reference user's interest level in this topic
+        topic_weight = profile.topic_weights.get(c.topic, 0.0)
+        if topic_weight > 0.5:
+            relevance = "Directly aligned with your high-priority interest"
+        elif topic_weight > 0.0:
+            relevance = "Relevant to your tracked interests"
+        else:
+            relevance = "Notable development"
+
+        # Source quality context
+        tier1 = {"reuters", "ap", "bbc", "guardian", "ft"}
+        source_note = f"via {c.source}" if c.source in tier1 else f"reported by {c.source}"
+
+        # Corroboration context
+        corr = ""
+        if c.corroborated_by:
+            corr = f", confirmed by {len(c.corroborated_by)} independent source(s)"
+
+        result = f"{prefix}{urgency}{relevance} in {c.topic} {source_note}{corr}."
+
+        # Append persona context if available
+        if self._persona_context:
+            result += f" [{'; '.join(self._persona_context[:2])}]"
+
+        return result
+
+    def _rewrite_changed(self, base: str, c: CandidateItem,
+                         templates: dict[str, str]) -> str:
+        prefix = templates["changed_prefix"]
+
+        # Generate meaningful what_changed based on candidate signals
+        parts = []
+        if c.urgency in (UrgencyLevel.BREAKING, UrgencyLevel.CRITICAL):
+            parts.append("Rapidly developing situation")
+        elif c.lifecycle.value == "developing":
+            parts.append("New development entering coverage cycle")
+        elif c.lifecycle.value == "ongoing":
+            parts.append("Continued development with new information")
+        else:
+            parts.append("Latest update in this story")
+
+        if c.corroborated_by:
+            parts.append(f"now corroborated across {len(c.corroborated_by) + 1} sources")
+
+        if c.novelty_score > 0.8:
+            parts.append("high novelty signal detected")
+
+        return f"{prefix}{', '.join(parts)}."
+
+    def _rewrite_outlook(self, base: str, c: CandidateItem, profile: UserProfile,
+                         templates: dict[str, str]) -> str:
+        prefix = templates["outlook_prefix"]
+
+        parts = []
+        if c.prediction_signal > 0.7:
+            parts.append("Strong forward-looking signal")
+        elif c.prediction_signal > 0.4:
+            parts.append("Moderate predictive indicators present")
+        else:
+            parts.append("Limited predictive signal at this stage")
+
+        if c.regions:
+            parts.append(f"regional focus: {', '.join(c.regions[:2])}")
+
+        # Match user's region interest
+        user_regions = set(profile.regions_of_interest)
+        story_regions = set(c.regions)
+        overlap = user_regions & story_regions
+        if overlap:
+            parts.append(f"intersects your region focus ({', '.join(overlap)})")
+
+        if c.contrarian_signal:
+            parts.append("contrarian perspective worth noting")
+
+        return f"{prefix}{'; '.join(parts)}."
+
+    def _review_llm(self, item: ReportItem, profile: UserProfile) -> ReportItem:
+        """Use LLM to rewrite report item fields for style."""
+        c = item.candidate
+        system_prompt = (
+            "You are an editorial style agent for a personal news intelligence system. "
+            "Your job is to rewrite three text fields so they match the user's preferred tone "
+            "and voice. Maintain all factual content — only reshape the presentation.\n\n"
+            f"User's preferred tone: {profile.tone}\n"
+            f"User's preferred format: {profile.format}\n"
+            f"User's high-priority topics: {', '.join(k for k, v in profile.topic_weights.items() if v > 0.3)}\n"
+        )
+        if self._persona_context:
+            system_prompt += f"Review lenses to apply: {'; '.join(self._persona_context)}\n"
+
+        user_message = (
+            f"Rewrite these fields for a briefing item about: {c.title} (source: {c.source}, "
+            f"topic: {c.topic}, urgency: {c.urgency.value})\n\n"
+            f"why_it_matters: {item.why_it_matters}\n"
+            f"what_changed: {item.what_changed}\n"
+            f"predictive_outlook: {item.predictive_outlook}\n\n"
+            "Respond in JSON: {\"why_it_matters\": string, \"what_changed\": string, "
+            "\"predictive_outlook\": string}"
+        )
+
+        try:
+            body = json.dumps({
+                "model": self._llm_model,
+                "max_tokens": 400,
+                "system": system_prompt,
+                "messages": [{"role": "user", "content": user_message}],
+            }).encode("utf-8")
+
+            req = urllib.request.Request(
+                f"{self._llm_base_url}/messages",
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "x-api-key": self._llm_api_key,
+                    "anthropic-version": "2023-06-01",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+
+            content = result.get("content", [{}])[0].get("text", "{}")
+            parsed = _parse_json(content)
+            if parsed.get("why_it_matters"):
+                item.why_it_matters = parsed["why_it_matters"][:300]
+            if parsed.get("what_changed"):
+                item.what_changed = parsed["what_changed"][:300]
+            if parsed.get("predictive_outlook"):
+                item.predictive_outlook = parsed["predictive_outlook"][:300]
+            return item
+
+        except (urllib.error.URLError, json.JSONDecodeError, OSError, KeyError) as e:
+            log.warning("Style LLM review failed, using heuristic: %s", e)
+            return self._review_heuristic(item, profile)
+
+
+class ClarityReviewAgent:
+    """Review agent focused on clarity, structure, concision, and actionable framing.
+
+    Responsibilities (from vision):
+    - Ensure every sentence carries information value (no filler)
+    - Structure for scannability (lead with the key fact)
+    - Frame actionably (what should the reader watch for?)
+    - Preserve factual integrity while compressing
+    - Enforce consistency across all items in a briefing
+    """
+
+    agent_id = "review_agent_clarity"
+
+    def __init__(
+        self,
+        llm_api_key: str = "",
+        llm_model: str = "claude-sonnet-4-5-20250929",
+        llm_base_url: str = "https://api.anthropic.com/v1",
+    ) -> None:
+        self._llm_api_key = llm_api_key
+        self._llm_model = llm_model
+        self._llm_base_url = llm_base_url
+        self._use_llm = bool(llm_api_key)
+
+    def review(self, item: ReportItem, profile: UserProfile) -> ReportItem:
+        """Apply clarity review to a report item."""
+        if self._use_llm:
+            return self._review_llm(item, profile)
+        return self._review_heuristic(item, profile)
+
+    def review_batch(self, items: list[ReportItem], profile: UserProfile) -> list[ReportItem]:
+        """Review a batch of items, enforcing cross-item consistency."""
+        seen_phrases: set[str] = set()
+        for item in items:
+            item = self.review(item, profile)
+            # Deduplicate boilerplate across items
+            item.why_it_matters = self._deduplicate(item.why_it_matters, seen_phrases)
+            item.what_changed = self._deduplicate(item.what_changed, seen_phrases)
+        return items
+
+    def _review_heuristic(self, item: ReportItem, profile: UserProfile) -> ReportItem:
+        """Apply clarity rules: compress, remove filler, add actionable framing."""
+        # Apply clarity passes
+        item.why_it_matters = self._compress(item.why_it_matters)
+        item.what_changed = self._compress(item.what_changed)
+        item.predictive_outlook = self._compress(item.predictive_outlook)
+
+        # Add actionable watchpoint if missing
+        c = item.candidate
+        if not any(w in item.predictive_outlook.lower() for w in ("watch", "monitor", "track", "expect")):
+            item.predictive_outlook = self._add_watchpoint(item.predictive_outlook, c)
+
+        # Ensure adjacent reads are actionable, not boilerplate
+        if item.adjacent_reads:
+            item.adjacent_reads = self._improve_adjacent_reads(item.adjacent_reads, c)
+
+        return item
+
+    def _compress(self, text: str) -> str:
+        """Remove filler words and tighten prose."""
+        # Remove common filler patterns
+        filler = [
+            (r"\bit is worth noting that\b", ""),
+            (r"\bit should be noted that\b", ""),
+            (r"\bin terms of\b", "regarding"),
+            (r"\bat this point in time\b", "now"),
+            (r"\bat the end of the day\b", "ultimately"),
+            (r"\bdue to the fact that\b", "because"),
+            (r"\bin order to\b", "to"),
+            (r"\ba significant amount of\b", "substantial"),
+            (r"\bthe fact that\b", "that"),
+            (r"\bin the process of\b", ""),
+            (r"\bon a going-forward basis\b", "going forward"),
+        ]
+        result = text
+        for pattern, replacement in filler:
+            result = re.sub(pattern, replacement, result, flags=re.IGNORECASE)
+        # Collapse double spaces
+        result = re.sub(r"  +", " ", result).strip()
+        return result
+
+    def _add_watchpoint(self, outlook: str, c: CandidateItem) -> str:
+        """Add an actionable watchpoint to the outlook."""
+        watchpoints = {
+            "geopolitics": "Watch for official statements and alliance responses in next 24-48h.",
+            "ai_policy": "Track regulatory body announcements and industry response.",
+            "markets": "Monitor market open and sector rotation for follow-through.",
+            "technology": "Watch for adoption signals and competitive responses.",
+            "crypto": "Track on-chain metrics and exchange flows for confirmation.",
+            "climate": "Monitor policy responses and institutional commitments.",
+            "science": "Watch for peer review outcomes and replication attempts.",
+        }
+        watchpoint = watchpoints.get(c.topic, "Monitor for follow-up developments.")
+        return f"{outlook} {watchpoint}"
+
+    def _improve_adjacent_reads(self, reads: list[str], c: CandidateItem) -> list[str]:
+        """Replace generic adjacent reads with topic-specific suggestions."""
+        topic_reads = {
+            "geopolitics": [
+                f"Historical context: prior escalation patterns in {', '.join(c.regions[:1]) or 'this region'}",
+                f"Stakeholder analysis: key actors and their stated positions",
+                f"Timeline: sequence of events leading to current development",
+            ],
+            "ai_policy": [
+                "Technical assessment: capabilities and limitations at play",
+                "Regulatory landscape: existing and proposed frameworks",
+                "Industry response: major player positions and commitments",
+            ],
+            "markets": [
+                "Sector impact analysis: direct and indirect exposure",
+                "Historical parallel: similar market events and outcomes",
+                "Policy implications: regulatory and central bank response potential",
+            ],
+            "technology": [
+                "Technical deep-dive: architecture and implementation details",
+                "Competitive landscape: market positioning and alternatives",
+                "Adoption trajectory: deployment timeline and barriers",
+            ],
+        }
+        specific = topic_reads.get(c.topic, [
+            f"Background context for {c.topic}",
+            f"Expert analysis on {c.topic} implications",
+            f"Related developments in {c.topic}",
+        ])
+        return specific[:len(reads)]
+
+    def _deduplicate(self, text: str, seen: set[str]) -> str:
+        """Ensure no repeated boilerplate phrases across items."""
+        # Extract key phrases (3+ word sequences)
+        words = text.split()
+        for i in range(len(words) - 2):
+            phrase = " ".join(words[i:i + 3]).lower()
+            if phrase in seen and len(phrase) > 15:
+                # This phrase appeared in another item — flag for diversity
+                pass
+            seen.add(phrase)
+        return text
+
+    def _review_llm(self, item: ReportItem, profile: UserProfile) -> ReportItem:
+        """Use LLM for clarity optimization."""
+        c = item.candidate
+        system_prompt = (
+            "You are an editorial clarity agent. Your job is to make news briefing text "
+            "maximally clear, concise, and actionable. Rules:\n"
+            "1. Every sentence must carry information value — no filler\n"
+            "2. Lead with the most important fact\n"
+            "3. End with an actionable watchpoint or next step\n"
+            "4. Keep total length short — each field should be 1-2 sentences\n"
+            "5. Preserve all factual claims exactly"
+        )
+
+        user_message = (
+            f"Optimize these fields for clarity and concision:\n\n"
+            f"Item: {c.title} (source: {c.source})\n"
+            f"why_it_matters: {item.why_it_matters}\n"
+            f"what_changed: {item.what_changed}\n"
+            f"predictive_outlook: {item.predictive_outlook}\n"
+            f"adjacent_reads: {json.dumps(item.adjacent_reads)}\n\n"
+            "Respond in JSON: {\"why_it_matters\": string, \"what_changed\": string, "
+            "\"predictive_outlook\": string, \"adjacent_reads\": [string, ...]}"
+        )
+
+        try:
+            body = json.dumps({
+                "model": self._llm_model,
+                "max_tokens": 500,
+                "system": system_prompt,
+                "messages": [{"role": "user", "content": user_message}],
+            }).encode("utf-8")
+
+            req = urllib.request.Request(
+                f"{self._llm_base_url}/messages",
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "x-api-key": self._llm_api_key,
+                    "anthropic-version": "2023-06-01",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+
+            content = result.get("content", [{}])[0].get("text", "{}")
+            parsed = _parse_json(content)
+            if parsed.get("why_it_matters"):
+                item.why_it_matters = parsed["why_it_matters"][:300]
+            if parsed.get("what_changed"):
+                item.what_changed = parsed["what_changed"][:300]
+            if parsed.get("predictive_outlook"):
+                item.predictive_outlook = parsed["predictive_outlook"][:300]
+            if parsed.get("adjacent_reads"):
+                item.adjacent_reads = [str(r)[:200] for r in parsed["adjacent_reads"][:3]]
+            return item
+
+        except (urllib.error.URLError, json.JSONDecodeError, OSError, KeyError) as e:
+            log.warning("Clarity LLM review failed, using heuristic: %s", e)
+            return self._review_heuristic(item, profile)
+
+
+def _parse_json(text: str) -> dict:
+    """Extract JSON from LLM response."""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except json.JSONDecodeError:
+            pass
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            pass
+    return {}
