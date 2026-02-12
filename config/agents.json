@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "control_agents": [
+    {
+      "id": "orchestrator_agent",
+      "persona": "System planner and router",
+      "responsibilities": ["compile_weighted_brief", "route_messages", "enforce_stage_limits"]
+    },
+    {
+      "id": "communication_agent",
+      "persona": "Telegram communication interface",
+      "responsibilities": ["render_user_payload", "send_telegram_messages", "capture_user_feedback"]
+    },
+    {
+      "id": "system_optimization_agent",
+      "persona": "Global configuration and policy optimizer",
+      "responsibilities": ["tune_agent_weights", "apply_policy_updates", "monitor_pipeline_health"]
+    }
+  ],
+  "research_agents": [
+    {"id": "x_agent_1", "source": "x", "mandate": "trending geopolitics and macro"},
+    {"id": "x_agent_2", "source": "x", "mandate": "technology and AI policy"},
+    {"id": "x_agent_3", "source": "x", "mandate": "markets and global events"},
+    {"id": "reddit_agent_1", "source": "reddit", "mandate": "high-signal community discussions"},
+    {"id": "reddit_agent_2", "source": "reddit", "mandate": "niche vertical and domain discovery"},
+    {"id": "reddit_agent_3", "source": "reddit", "mandate": "consensus and dissent mapping"},
+    {"id": "news_agent_guardian", "source": "guardian", "mandate": "source-specific major developments"},
+    {"id": "news_agent_reuters", "source": "reuters", "mandate": "wire-level factual updates"},
+    {"id": "news_agent_ap", "source": "ap", "mandate": "nonpartisan coverage sweep"},
+    {"id": "news_agent_bbc_world", "source": "bbc", "mandate": "global context updates"},
+    {"id": "news_agent_ft_world", "source": "ft", "mandate": "economic and policy implications"},
+    {"id": "web_scraper_agent_1", "source": "web", "mandate": "broad open-web discovery"},
+    {"id": "web_scraper_agent_2", "source": "web", "mandate": "emerging topic expansion"},
+    {"id": "web_scraper_agent_3", "source": "web", "mandate": "verification and cross-reference search"}
+  ],
+  "expert_agents": [
+    {"id": "expert_quality_agent", "criteria": ["source_quality", "evidence_strength"]},
+    {"id": "expert_relevance_agent", "criteria": ["topic_relevance", "novelty_delta"]},
+    {"id": "expert_preference_fit_agent", "criteria": ["user_affinity_probability", "style_alignment"]}
+  ],
+  "review_agents": [
+    {"id": "review_agent_style", "focus": "voice, tone, and personalization"},
+    {"id": "review_agent_clarity", "focus": "clarity, structure, and concision"}
+  ]
+}

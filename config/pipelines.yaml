@@ -1,0 +1,58 @@
+version: 1
+
+limits:
+  default_max_items: 10
+  adjacent_reads_per_item:
+    min: 2
+    max: 3
+  top_discoveries_per_research_agent: 5
+
+signals:
+  prediction_market_weight: medium
+  prediction_market_cap: "non-dominant"
+
+stages:
+  - id: ingress
+    owner: communication_agent
+    outputs: [request]
+
+  - id: briefing
+    owner: orchestrator_agent
+    inputs: [request, user_profile, memory]
+    outputs: [weighted_brief]
+
+  - id: research
+    owner: orchestrator_agent
+    fanout: research_agents
+    inputs: [weighted_brief]
+    outputs: [agent_reports, agent_top5]
+
+  - id: expert_roundtable
+    owners: [expert_quality_agent, expert_relevance_agent, expert_preference_fit_agent]
+    inputs: [agent_top5, user_profile]
+    outputs: [ranked_candidates, selected_items, reserve_items]
+
+  - id: internal_report_drafting
+    owner: orchestrator_agent
+    inputs: [selected_items]
+    outputs: [internal_reports]
+
+  - id: editorial_review
+    owners: [review_agent_style, review_agent_clarity]
+    inputs: [internal_reports, user_style_profile]
+    outputs: [final_user_report]
+
+  - id: delivery
+    owner: communication_agent
+    inputs: [final_user_report]
+    outputs: [delivery_receipt]
+
+  - id: feedback_writeback
+    owner: orchestrator_agent
+    inputs: [delivery_receipt, user_feedback]
+    outputs: [memory_updates, cache_updates]
+
+cache_policy:
+  key_dimensions: [user_id, topic_cluster, recency_window, confidence_band]
+  serve_cache_before_rerun: true
+  stale_after_minutes: 180
