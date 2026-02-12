@@ -14,10 +14,13 @@ def main() -> None:
 
     stages = cfg.pipeline.get("stages", [])
     research_agents = cfg.agents.get("research_agents", [])
+    enabled_stages = cfg.pipeline.get("intelligence", {}).get("enabled_stages", [])
+    config_version = cfg.pipeline.get("version", "unknown")
 
-    print("NewsFeed v1 bootstrap")
+    print(f"NewsFeed bootstrap (config v{config_version})")
     print(f"Loaded stages: {len(stages)}")
     print(f"Loaded research agents: {len(research_agents)}")
+    print(f"Intelligence stages: {', '.join(enabled_stages) or 'all defaults'}")
 
     engine = NewsFeedEngine(config=cfg.agents, pipeline=cfg.pipeline, personas=cfg.personas, personas_dir=personas_dir)
     report = engine.handle_request(

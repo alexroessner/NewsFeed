@@ -109,6 +109,43 @@ class EngineTests(unittest.TestCase):
         self.assertIn("topic:geopolitics", updates)
         self.assertIn("topic:celebrity_news", updates)
 
+    def test_feedback_region_command(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        cfg = load_runtime_config(root / "config")
+        engine = NewsFeedEngine(cfg.agents, cfg.pipeline, cfg.personas, root / "personas")
+
+        updates = engine.apply_user_feedback("u-region", "region: europe")
+        self.assertEqual(updates.get("region"), "europe")
+        profile = engine.preferences.get_or_create("u-region")
+        self.assertIn("europe", profile.regions_of_interest)
+
+    def test_feedback_cadence_command(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        cfg = load_runtime_config(root / "config")
+        engine = NewsFeedEngine(cfg.agents, cfg.pipeline, cfg.personas, root / "personas")
+
+        updates = engine.apply_user_feedback("u-cad", "cadence: morning")
+        self.assertEqual(updates.get("cadence"), "morning")
+        profile = engine.preferences.get_or_create("u-cad")
+        self.assertEqual(profile.briefing_cadence, "morning")
+
+    def test_feedback_max_items_command(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        cfg = load_runtime_config(root / "config")
+        engine = NewsFeedEngine(cfg.agents, cfg.pipeline, cfg.personas, root / "personas")
+
+        updates = engine.apply_user_feedback("u-max", "max: 15")
+        self.assertEqual(updates.get("max_items"), "15")
+        profile = engine.preferences.get_or_create("u-max")
+        self.assertEqual(profile.max_items, 15)
+
+    def test_enabled_stages_from_config(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        cfg = load_runtime_config(root / "config")
+        engine = NewsFeedEngine(cfg.agents, cfg.pipeline, cfg.personas, root / "personas")
+        expected = set(cfg.pipeline["intelligence"]["enabled_stages"])
+        self.assertEqual(engine._enabled_stages, expected)
+
 
 if __name__ == "__main__":
     unittest.main()
