@@ -1,0 +1,14 @@
+{
+  "default_personas": [
+    "engineer",
+    "source_critic",
+    "audience",
+    "forecaster"
+  ],
+  "persona_notes": {
+    "engineer": "Ensure output is precise and system-aware.",
+    "source_critic": "Raise source quality and corroboration signal.",
+    "audience": "Keep writing concise and decision-relevant.",
+    "forecaster": "Surface plausible near-term outcomes with uncertainty."
+  }
+}
