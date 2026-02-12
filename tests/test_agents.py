@@ -48,6 +48,14 @@ class ExpertCouncilTests(unittest.TestCase):
         )
         self.assertEqual(council._required_votes(), 2)
 
+    def test_fixed_n_clamped_to_expert_count(self) -> None:
+        council = ExpertCouncil(
+            expert_ids=["e1", "e2"],
+            min_votes_to_accept="10",
+        )
+        # Should clamp to 2 (expert count), not 10
+        self.assertEqual(council._required_votes(), 2)
+
     def test_configurable_keep_threshold(self) -> None:
         high_bar = ExpertCouncil(keep_threshold=0.95)
         low_bar = ExpertCouncil(keep_threshold=0.3)
