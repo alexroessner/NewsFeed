@@ -24,6 +24,7 @@ Ship a single-user vertical slice with:
 - `docs/CONFLICT_PREVENTION.md`: branch/rebase workflow to avoid unmergeable PRs.
 - `tools/sync_main_and_validate.sh`: one-command branch sync + validation helper.
 - `tools/check_merge_readiness.sh`: detects behind/diverged/conflict state before opening PR.
+- `tools/open_clean_pr_branch.sh`: creates a fresh PR branch from latest `main` and validates before push.
 
 ## Quick start
 ```bash

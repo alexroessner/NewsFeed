@@ -66,3 +66,24 @@ Exit meanings:
 - `4`: merge conflicts detected.
 
 If conflict (`4`), resolve locally via rebase and re-run tests before pushing.
+
+
+## One-shot fix for stale draft PR conflicts
+If GitHub shows conflicts in files like:
+- `README.md`
+- `docs/SYSTEM_ARCHITECTURE.md`
+- `docs/V1_EXECUTION_PLAN.md`
+- `src/newsfeed/agents/simulated.py`
+- `src/newsfeed/models/config.py`
+- `src/newsfeed/models/domain.py`
+- `src/newsfeed/orchestration/bootstrap.py`
+- `src/newsfeed/orchestration/engine.py`
+- `tests/test_engine.py`
+
+Do **not** keep patching the stale draft branch. Instead, create a fresh PR branch from latest `main`:
+
+```bash
+tools/open_clean_pr_branch.sh main pr/refresh-newsfeed
+```
+
+Then open a new PR and close the stale draft PR.
