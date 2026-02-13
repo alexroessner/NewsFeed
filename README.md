@@ -1,44 +1,97 @@
 # NewsFeed
 
-NewsFeed is a configurable, Telegram-native news intelligence system powered by an agent swarm.
+Agentic Telegram news intelligence system powered by a multi-agent research swarm, expert council, and editorial review pipeline.
 
-## V1 Goal
-Ship a single-user vertical slice with:
-- orchestrated multi-source research,
-- expert roundtable ranking,
-- editorial polishing,
-- cache-backed "show me more",
-- natural-language preference updates,
-- persona-driven review lenses.
-- natural-language preference updates.
+## What it does
 
-## Project Structure
-- `config/agents.json`: declarative registry of agent roles and capabilities.
-- `config/pipelines.json`: stage-by-stage processing graph and limits.
-- `config/review_personas.json`: active editorial/review personas and notes.
-- `personas/*.md`: cognitive stance prompts inspired by persona-driven AI workflows.
-- `docs/V1_EXECUTION_PLAN.md`: build sequence, milestones, and acceptance criteria.
-- `docs/SYSTEM_ARCHITECTURE.md`: architecture blueprint for runtime components.
-- `docs/REPO_RECOVERY_AND_RELEASE.md`: git recovery and release steps for blocked PR scenarios.
-- `tools/git_health_check.sh`: local repo integrity checks before push.
-- `src/newsfeed/`: runtime scaffold for orchestration, memory, review, and delivery.
-- `docs/CONFLICT_PREVENTION.md`: branch/rebase workflow to avoid unmergeable PRs.
-- `tools/sync_main_and_validate.sh`: one-command branch sync + validation helper.
-- `tools/check_merge_readiness.sh`: detects behind/diverged/conflict state before opening PR.
-- `tools/open_clean_pr_branch.sh`: creates a fresh PR branch from latest `main` and validates before push.
-- `tools/repair_pr_branch.sh`: force-aligns a stale PR branch to `main` with backup tagging.
-- `tools/bootstrap_github_remote.sh`: configures `origin` from env secrets (`GH_TOKEN`/`GITHUB_TOKEN` + repo slug).
-- `docs/V1_EXECUTION_PLAN.md`: build sequence, milestones, and acceptance criteria.
-- `docs/SYSTEM_ARCHITECTURE.md`: architecture blueprint for runtime components.
-- `src/newsfeed/`: runtime scaffold for orchestration, memory, and delivery.
+NewsFeed monitors 18 sources (BBC, Reuters, AP, Guardian, FT, Al Jazeera, HackerNews, arXiv, GDELT, Reddit, X/Twitter, Google News), runs candidates through a 7-stage intelligence pipeline (credibility, corroboration, urgency, diversity, clustering, geo-risk, trends), filters via a 5-expert council with weighted debate, applies editorial review (tone/style + clarity), and delivers personalized briefings via Telegram.
 
-## Quick start
+## Install
+
 ```bash
-PYTHONPATH=src python -m newsfeed.orchestration.bootstrap
+pip install -e .                    # Core (stdlib only)
+pip install -e ".[all]"             # + LLM + Telegram support
+pip install -e ".[test]"            # + pytest
 ```
 
-## Tests
+## Quick start
+
 ```bash
-PYTHONPATH=src python -m unittest discover -s tests -p 'test_*.py'
-PYTHONPATH=src python -m compileall -q src tests
+# Demo mode (no API keys needed — uses simulated data)
+python -m newsfeed.orchestration.bootstrap
+
+# Telegram bot mode (set your bot token first)
+# Edit config/pipelines.json → api_keys.telegram_bot_token
+python -m newsfeed.orchestration.bootstrap
+```
+
+## API keys
+
+Copy `.env.example` to `.env` for reference. Keys go in `config/pipelines.json` under `api_keys`. All keys are optional — agents without keys fall back to simulated data. Free agents (BBC, HackerNews, Al Jazeera, arXiv, GDELT, Google News) work without any keys.
+
+## Tests
+
+```bash
+python -m pytest tests/ -v          # 303+ tests
+```
+
+## Architecture
+
+```
+User ← Telegram Bot ← Communication Agent
+                            ↓
+                     Orchestrator Agent
+                            ↓
+              ┌─────────────┼─────────────┐
+              ↓             ↓             ↓
+         18 Research    7 Intelligence   System
+           Agents         Stages       Optimizer
+              ↓             ↓
+         5 Expert Council (weighted debate)
+              ↓
+         2 Editorial Review Agents
+              ↓
+         Formatted Briefing → Delivery
+```
+
+**Layers:**
+- **Layer 0 — Communication:** Telegram bot + CommunicationAgent (message relay, commands, scheduling)
+- **Layer 1 — Orchestration:** OrchestratorAgent (brief compilation, lifecycle, routing)
+- **Layer 2 — Research:** 18 agents across 12 source types (async fan-out)
+- **Layer 3 — Intelligence:** Credibility, corroboration, urgency, diversity, clustering, geo-risk, trends
+- **Layer 4 — Expert Council:** 5 experts with heuristic + LLM voting, arbitration, DebateChair influence tracking
+- **Layer 5 — Editorial:** StyleReviewAgent (tone/voice) + ClarityReviewAgent (concision/actionability)
+- **Cross-cutting:** SystemOptimizationAgent (self-tuning), SystemConfigurator (plain-text config), AuditTrail (full decision tracking)
+
+## Plain-text configuration
+
+Users can modify any system parameter via natural language:
+
+```
+set evidence weight to 0.4       # Scoring weights
+make experts stricter             # Expert council tuning
+disable clustering                # Toggle pipeline stages
+prioritize reuters over reddit    # Source priority
+add persona forecaster            # Persona management
+show me 15 items                  # Delivery preferences
+```
+
+## Project structure
+
+```
+config/
+  agents.json              # 18 research + 5 expert + 3 control + 2 review agents
+  pipelines.json           # 12 stages, scoring, intelligence, editorial review, API keys
+  review_personas.json     # 4 editorial personas with cognitive stance notes
+personas/                  # Persona prompt files (engineer, source_critic, audience, forecaster)
+src/newsfeed/
+  agents/                  # Research agents (BBC, Reuters, Guardian, Reddit, X, arXiv, GDELT, etc.)
+  delivery/                # Telegram bot, formatter, scheduler
+  intelligence/            # Credibility, clustering, urgency, geo-risk, trends
+  memory/                  # Preferences, cache, state persistence, command parsing
+  models/                  # Domain models (CandidateItem, ReportItem, etc.) + config loading
+  orchestration/           # Engine, orchestrator, communication, optimizer, configurator, audit
+  review/                  # Style + clarity review agents, persona stack
+tests/                     # 303+ tests across all components
+docs/                      # Architecture docs, execution plan, vision
 ```
