@@ -86,38 +86,54 @@ class CredibilityTracker:
 
 
 def detect_cross_corroboration(candidates: list[CandidateItem]) -> list[CandidateItem]:
-    title_key_map: dict[str, list[CandidateItem]] = {}
+    """Detect cross-source corroboration using content similarity.
+
+    Two items corroborate each other when they cover the SAME story from
+    DIFFERENT sources.  We measure this via keyword overlap (Jaccard
+    similarity) between title+summary text, requiring a threshold of shared
+    significant words.  Topic-level matching alone is NOT sufficient — simply
+    covering the same broad topic (e.g. geopolitics) is not corroboration.
+    """
+    word_sets: list[tuple[CandidateItem, set[str]]] = []
     for c in candidates:
-        key = _normalize_title(c.title)
-        title_key_map.setdefault(key, []).append(c)
+        # Simulated placeholders have synthetic text — skip them to avoid
+        # false corroboration between "Simulated placeholder — reddit agent..."
+        # and "Simulated placeholder — reuters agent..." (Jaccard ~0.75).
+        if "example.com" in (c.url or ""):
+            word_sets.append((c, set()))
+            continue
+        words = _extract_significant_words(f"{c.title} {c.summary}")
+        word_sets.append((c, words))
 
-    topic_source_map: dict[str, dict[str, list[CandidateItem]]] = {}
-    for c in candidates:
-        topic_source_map.setdefault(c.topic, {}).setdefault(c.source, []).append(c)
-
-    for key, group in title_key_map.items():
-        sources_in_group = {c.source for c in group}
-        if len(sources_in_group) >= 2:
-            source_list = sorted(sources_in_group)
-            for c in group:
-                c.corroborated_by = [s for s in source_list if s != c.source]
-
-    for topic, by_source in topic_source_map.items():
-        if len(by_source) >= 3:
-            all_sources = sorted(by_source.keys())
-            for source, items in by_source.items():
-                others = [s for s in all_sources if s != source]
-                for c in items:
-                    if not c.corroborated_by:
-                        c.corroborated_by = others[:2]
+    # Compare every pair; only mark if from different sources and similar enough
+    for i, (ci, wi) in enumerate(word_sets):
+        corr_sources: set[str] = set()
+        for j, (cj, wj) in enumerate(word_sets):
+            if i >= j:
+                continue
+            if ci.source == cj.source:
+                continue
+            similarity = _jaccard(wi, wj)
+            if similarity >= 0.25:
+                corr_sources.add(cj.source)
+                # Also mark the other direction
+                if ci.source not in (cj.corroborated_by or []):
+                    cj.corroborated_by = list(set(cj.corroborated_by or []) | {ci.source})
+        if corr_sources:
+            ci.corroborated_by = list(set(ci.corroborated_by or []) | corr_sources)
 
     return candidates
 
 
 def enforce_source_diversity(candidates: list[CandidateItem], max_per_source: int = 3) -> list[CandidateItem]:
+    """Keep at most max_per_source items per source, dropping the rest.
+
+    Items are sorted by composite score first, so the best items from each
+    source survive.  Overflow items are discarded entirely — they previously
+    were appended back, defeating the purpose of the filter.
+    """
     source_counts: dict[str, int] = {}
     diverse: list[CandidateItem] = []
-    overflow: list[CandidateItem] = []
 
     sorted_candidates = sorted(candidates, key=lambda c: c.composite_score(), reverse=True)
     for c in sorted_candidates:
@@ -125,13 +141,32 @@ def enforce_source_diversity(candidates: list[CandidateItem], max_per_source: in
         if count < max_per_source:
             diverse.append(c)
             source_counts[c.source] = count + 1
-        else:
-            overflow.append(c)
 
-    return diverse + overflow
+    return diverse
 
 
-def _normalize_title(title: str) -> str:
-    words = title.lower().split()
-    filtered = [w for w in words if len(w) > 3]
-    return hashlib.md5(" ".join(filtered[:6]).encode()).hexdigest()[:12]
+_STOP_WORDS = frozenset({
+    "the", "and", "for", "are", "but", "not", "you", "all", "can", "has", "her",
+    "was", "one", "our", "out", "his", "its", "from", "they", "been", "have",
+    "this", "that", "with", "will", "each", "make", "like", "into", "over",
+    "such", "than", "them", "some", "what", "when", "who", "how", "about",
+    "more", "also", "after", "says", "said", "new", "could", "would", "been",
+    "most", "just", "being", "other", "very", "still", "should", "here",
+    "simulated", "signal", "candidate", "insight", "generated", "placeholder",
+})
+
+
+def _extract_significant_words(text: str) -> set[str]:
+    """Extract significant content words from text for similarity matching."""
+    import re
+    words = re.findall(r"[a-z]{3,}", text.lower())
+    return {w for w in words if w not in _STOP_WORDS}
+
+
+def _jaccard(a: set[str], b: set[str]) -> float:
+    """Jaccard similarity between two word sets."""
+    if not a or not b:
+        return 0.0
+    intersection = len(a & b)
+    union = len(a | b)
+    return intersection / union if union else 0.0

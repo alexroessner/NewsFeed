@@ -74,9 +74,9 @@
     "contrarian_evidence_threshold": 0.6,
     "source_tiers": {
       "tier_1": {"sources": ["reuters", "ap", "bbc", "guardian", "ft"], "base_reliability": 0.85},
-      "tier_1b": {"sources": ["aljazeera"], "base_reliability": 0.78},
-      "tier_2": {"sources": ["x", "reddit", "web", "hackernews", "gdelt"], "base_reliability": 0.55},
-      "tier_academic": {"sources": ["arxiv"], "base_reliability": 0.72},
+      "tier_1b": {"sources": ["aljazeera", "npr", "cnbc", "france24"], "base_reliability": 0.78},
+      "tier_2": {"sources": ["x", "reddit", "web", "hackernews", "gdelt", "techcrunch"], "base_reliability": 0.55},
+      "tier_academic": {"sources": ["arxiv", "nature"], "base_reliability": 0.72},
       "unknown_base_reliability": 0.50
     },
     "bias_profiles": {
@@ -86,6 +86,11 @@
       "guardian": "left-leaning",
       "ft": "center-right",
       "aljazeera": "global-south-perspective",
+      "npr": "center-left",
+      "cnbc": "center-right",
+      "france24": "european-continental",
+      "techcrunch": "tech-industry",
+      "nature": "academic-empirical",
       "x": "variable",
       "reddit": "community-driven",
       "web": "unverified",
@@ -162,20 +167,20 @@
     "tone_templates": {
       "concise": {
         "why_prefix": "",
-        "outlook_prefix": "Outlook: ",
-        "changed_prefix": "Update: ",
+        "outlook_prefix": "",
+        "changed_prefix": "",
         "style": "Short, direct sentences. No filler. Lead with the key fact."
       },
       "analyst": {
-        "why_prefix": "Assessment: ",
-        "outlook_prefix": "Forward-looking: ",
-        "changed_prefix": "Delta: ",
+        "why_prefix": "",
+        "outlook_prefix": "",
+        "changed_prefix": "",
         "style": "Technical, evidence-anchored language. Quantify when possible."
       },
       "executive": {
-        "why_prefix": "Bottom line: ",
-        "outlook_prefix": "Strategic view: ",
-        "changed_prefix": "Key development: ",
+        "why_prefix": "",
+        "outlook_prefix": "",
+        "changed_prefix": "",
         "style": "High-level framing. Decision-relevant. Skip operational detail."
       },
       "brief": {
@@ -185,9 +190,9 @@
         "style": "Minimum viable context. One sentence per field."
       },
       "deep": {
-        "why_prefix": "Deep context: ",
-        "outlook_prefix": "Scenario analysis: ",
-        "changed_prefix": "Evolution: ",
+        "why_prefix": "",
+        "outlook_prefix": "",
+        "changed_prefix": "",
         "style": "Thorough analysis. Include nuance, uncertainty, alternative readings."
       }
     },
@@ -277,7 +282,7 @@
     "state_dir": "state"
   },
   "api_keys": {
-    "_comment": "Add your API keys here. Agents without keys fall back to simulated data. Free agents (BBC, HN, Al Jazeera, arXiv, GDELT, Google News) work without any keys.",
+    "_comment": "Add your API keys here. Agents without keys fall back to simulated data. Free agents (BBC, HN, Al Jazeera, arXiv, GDELT, Google News, NPR, CNBC, France 24, TechCrunch, Nature) work without any keys.",
     "guardian": "",
     "newsapi": "",
     "reddit_client_id": "",
