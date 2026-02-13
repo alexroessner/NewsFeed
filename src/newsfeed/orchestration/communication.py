@@ -52,6 +52,8 @@ class CommunicationAgent:
         self._shown_ids: dict[str, set[str]] = {}
         # Track last briefing topic per user
         self._last_topic: dict[str, str] = {}
+        # Track last briefing items per user for per-item feedback
+        self._last_items: dict[str, list[dict]] = {}  # user_id -> [{topic, source}, ...]
 
     def handle_update(self, update: dict) -> dict[str, Any] | None:
         """Process a single Telegram update end-to-end.
@@ -87,6 +89,9 @@ class CommunicationAgent:
             if cmd_type == "mute":
                 return self._handle_mute(chat_id, user_id, args)
 
+            if cmd_type == "rate":
+                return self._handle_rate(chat_id, user_id, command)
+
         except Exception:
             log.exception("Error handling update for user=%s", user_id)
             self._bot.send_message(chat_id, "Something went wrong. Please try again.")
@@ -97,6 +102,9 @@ class CommunicationAgent:
     def _handle_command(self, chat_id: int | str, user_id: str,
                         command: str, args: str) -> dict[str, Any]:
         """Route a slash command to the appropriate handler."""
+
+        if command == "start":
+            return self._onboard(chat_id, user_id)
 
         if command == "briefing":
             return self._run_briefing(chat_id, user_id, args)
@@ -134,9 +142,32 @@ class CommunicationAgent:
         if command == "deep_dive":
             return self._run_briefing(chat_id, user_id, args, deep=True)
 
+        if command == "reset":
+            self._engine.preferences.reset(user_id)
+            self._bot.send_message(chat_id, "All preferences reset to defaults.")
+            return {"action": "reset", "user_id": user_id}
+
         # Unknown command
         self._bot.send_message(chat_id, f"Unknown command: /{command}. Try /help")
         return {"action": "unknown_command", "user_id": user_id, "command": command}
+
+    def _onboard(self, chat_id: int | str, user_id: str) -> dict[str, Any]:
+        """Welcome a new user and create their default profile."""
+        self._engine.preferences.get_or_create(user_id)
+        self._bot.send_message(
+            chat_id,
+            "<b>Welcome to NewsFeed Intelligence</b>\n\n"
+            "I deliver personalized news briefings from 23+ sources "
+            "across geopolitics, AI, technology, markets, and more.\n\n"
+            "<b>Quick start:</b>\n"
+            "\u2022 /briefing — Get your first briefing\n"
+            "\u2022 /topics — See available topics and weights\n"
+            "\u2022 /feedback more AI, less crypto — Customize topics\n"
+            "\u2022 /schedule morning 08:00 — Set daily delivery\n"
+            "\u2022 /help — Full command list\n\n"
+            "Just send any text to give feedback (e.g. \"more geopolitics\")."
+        )
+        return {"action": "onboard", "user_id": user_id}
 
     def _run_briefing(self, chat_id: int | str, user_id: str,
                       topic_hint: str = "", deep: bool = False) -> dict[str, Any]:
@@ -167,23 +198,37 @@ class CommunicationAgent:
         dominant_topic = max(topics, key=topics.get, default="general")
         self._last_topic[user_id] = dominant_topic
 
-        # Deliver via bot
-        self._bot.send_briefing(chat_id, formatted)
+        # Store per-item info for per-item feedback buttons
+        self._last_items[user_id] = self._engine.last_briefing_items(user_id)
+
+        # Deliver via bot with per-item rating buttons
+        self._bot.send_briefing(chat_id, formatted, item_count=len(self._last_items.get(user_id, [])))
 
         log.info("Briefing delivered to user=%s chat=%s", user_id, chat_id)
         return {"action": "briefing", "user_id": user_id, "topic": dominant_topic}
 
     def _show_more(self, chat_id: int | str, user_id: str,
                    topic_hint: str = "") -> dict[str, Any]:
-        """Show more items from cache, or run a new focused cycle."""
+        """Show more items from cache with HTML formatting, or run a fresh cycle."""
+        import html as html_mod
         topic = topic_hint.strip().lower().replace(" ", "_") if topic_hint else self._last_topic.get(user_id, "general")
         seen = self._shown_ids.get(user_id, set())
 
         more = self._engine.show_more(user_id, topic, seen, limit=5)
 
         if more:
-            text = f"More on {topic}:\n\n" + "\n".join(f"- {item}" for item in more)
-            self._bot.send_message(chat_id, text)
+            lines = [f"<b>More on {html_mod.escape(topic)}:</b>", ""]
+            for c in more:
+                title_esc = html_mod.escape(c.title)
+                if c.url and not c.url.startswith("https://example.com"):
+                    lines.append(f'\u2022 <a href="{html_mod.escape(c.url)}">{title_esc}</a> [{html_mod.escape(c.source)}]')
+                else:
+                    lines.append(f"\u2022 {title_esc} [{html_mod.escape(c.source)}]")
+                if c.summary:
+                    lines.append(f"  <i>{html_mod.escape(c.summary[:120])}</i>")
+                # Track as seen
+                self._shown_ids.setdefault(user_id, set()).add(c.candidate_id)
+            self._bot.send_message(chat_id, "\n".join(lines))
             return {"action": "show_more", "user_id": user_id, "count": len(more)}
 
         # Cache empty — run a fresh mini-cycle
@@ -212,37 +257,114 @@ class CommunicationAgent:
 
     def _handle_preference(self, chat_id: int | str, user_id: str,
                            pref_command: str) -> dict[str, Any]:
-        """Handle inline keyboard preference callbacks."""
+        """Handle inline keyboard preference callbacks.
+
+        Uses the actual topics from the last briefing's items rather
+        than just the dominant request topic.
+        """
+        briefing_topics = self._engine.last_briefing_topics(user_id)
+        # Fallback to tracked dominant topic if engine has nothing
+        if not briefing_topics:
+            fallback = self._last_topic.get(user_id, "general")
+            briefing_topics = [fallback]
+
         if pref_command == "more_similar":
-            # Boost the dominant topic from last briefing
-            topic = self._last_topic.get(user_id, "general")
-            results = self._engine.apply_user_feedback(user_id, f"more {topic}")
-            self._bot.send_message(chat_id, f"Got it — boosting {topic} in future briefings.")
-            return {"action": "pref_more", "user_id": user_id, "topic": topic}
+            # Boost ALL topics that appeared in the last briefing
+            adjustments = []
+            for topic in briefing_topics:
+                self._engine.apply_user_feedback(user_id, f"more {topic}")
+                adjustments.append(topic)
+            topic_list = ", ".join(adjustments)
+            self._bot.send_message(chat_id, f"Got it — boosting {topic_list} in future briefings.")
+            return {"action": "pref_more", "user_id": user_id, "topics": adjustments}
 
         if pref_command == "less_similar":
-            topic = self._last_topic.get(user_id, "general")
-            results = self._engine.apply_user_feedback(user_id, f"less {topic}")
-            self._bot.send_message(chat_id, f"Understood — reducing {topic} weight.")
-            return {"action": "pref_less", "user_id": user_id, "topic": topic}
+            # Reduce ALL topics from the last briefing
+            adjustments = []
+            for topic in briefing_topics:
+                self._engine.apply_user_feedback(user_id, f"less {topic}")
+                adjustments.append(topic)
+            topic_list = ", ".join(adjustments)
+            self._bot.send_message(chat_id, f"Understood — reducing {topic_list} weight.")
+            return {"action": "pref_less", "user_id": user_id, "topics": adjustments}
 
         return {"action": "pref_unknown", "user_id": user_id, "command": pref_command}
 
     def _handle_mute(self, chat_id: int | str, user_id: str,
                      duration: str) -> dict[str, Any]:
         """Handle mute requests from breaking alert keyboard."""
-        self._bot.send_message(chat_id, f"Breaking alerts muted for {duration} minutes.")
-        return {"action": "mute", "user_id": user_id, "duration": duration}
+        minutes = 60  # default
+        try:
+            minutes = int(duration)
+        except (ValueError, TypeError):
+            pass
+
+        if self._scheduler:
+            msg = self._scheduler.mute(user_id, minutes)
+            self._bot.send_message(chat_id, msg)
+        else:
+            self._bot.send_message(chat_id, f"Alerts muted for {minutes} minutes.")
+
+        return {"action": "mute", "user_id": user_id, "duration": str(minutes)}
+
+    def _handle_rate(self, chat_id: int | str, user_id: str,
+                     rate_data: str) -> dict[str, Any]:
+        """Handle per-item thumbs up/down from inline keyboard.
+
+        rate_data format: "rate:N:up" or "rate:N:down"
+        """
+        parts = rate_data.split(":")
+        if len(parts) != 3:
+            return {"action": "rate_error", "user_id": user_id}
+
+        try:
+            item_num = int(parts[1])
+        except ValueError:
+            return {"action": "rate_error", "user_id": user_id}
+
+        direction = parts[2]
+        items = self._last_items.get(user_id, [])
+
+        if item_num < 1 or item_num > len(items):
+            self._bot.send_message(chat_id, "That item is no longer available.")
+            return {"action": "rate_expired", "user_id": user_id}
+
+        item = items[item_num - 1]
+        topic = item["topic"]
+
+        if direction == "up":
+            self._engine.apply_user_feedback(user_id, f"more {topic}")
+            if item.get("source"):
+                self._engine.preferences.apply_source_weight(user_id, item["source"], 0.3)
+            self._bot.send_message(chat_id, f"\U0001f44d Boosted {topic} (story #{item_num})")
+        elif direction == "down":
+            self._engine.apply_user_feedback(user_id, f"less {topic}")
+            if item.get("source"):
+                self._engine.preferences.apply_source_weight(user_id, item["source"], -0.3)
+            self._bot.send_message(chat_id, f"\U0001f44e Reduced {topic} (story #{item_num})")
+        else:
+            return {"action": "rate_error", "user_id": user_id}
+
+        return {"action": "rate", "user_id": user_id, "item": item_num, "direction": direction}
 
     def _show_settings(self, chat_id: int | str, user_id: str) -> dict[str, Any]:
-        """Display user settings."""
+        """Display user settings including schedule info."""
         profile = self._engine.preferences.get_or_create(user_id)
+        schedule_info = ""
+        if self._scheduler:
+            sched = self._scheduler._schedules.get(user_id)
+            if sched:
+                schedule_info = f"{sched['type']}" + (f" at {sched['time']} UTC" if sched.get("time") else "")
+            else:
+                schedule_info = "not set"
         profile_dict = {
             "tone": profile.tone,
             "format": profile.format,
             "max_items": profile.max_items,
             "cadence": profile.briefing_cadence,
+            "schedule": schedule_info,
             "topic_weights": dict(profile.topic_weights),
+            "source_weights": dict(profile.source_weights),
             "regions": list(profile.regions_of_interest),
         }
         self._bot.send_message(chat_id, self._bot.format_settings(profile_dict))
@@ -255,20 +377,39 @@ class CommunicationAgent:
         return {"action": "status", "user_id": user_id}
 
     def _show_topics(self, chat_id: int | str, user_id: str) -> dict[str, Any]:
-        """Display available topics and user's current weights."""
+        """Display available topics with effective weights (defaults + user overrides)."""
         profile = self._engine.preferences.get_or_create(user_id)
-        all_topics = sorted(set(
-            list(profile.topic_weights.keys()) + list(self._default_topics.keys())
-        ))
 
-        lines = ["<b>Available Topics & Your Weights</b>", ""]
+        # Build effective weights: start from defaults, overlay user's customizations
+        effective = dict(self._default_topics)
+        for topic, weight in profile.topic_weights.items():
+            effective[topic] = weight
+
+        all_topics = sorted(effective.keys(), key=lambda t: effective.get(t, 0), reverse=True)
+
+        lines = ["<b>Available Topics &amp; Effective Weights</b>", ""]
         for topic in all_topics:
-            weight = profile.topic_weights.get(topic, 0.0)
-            bar = "█" * max(1, int(abs(weight) * 10))
+            weight = effective[topic]
+            is_custom = topic in profile.topic_weights
+            bar = "\u2588" * max(1, int(abs(weight) * 10))
             sign = "+" if weight > 0 else "" if weight == 0 else ""
-            lines.append(f"  {topic}: {sign}{weight:.1f} {bar}")
+            custom_tag = " (custom)" if is_custom else " (default)"
+            lines.append(f"  {topic}: {sign}{weight:.1f} {bar}{custom_tag}")
 
-        lines.extend(["", "Adjust with: /feedback more [topic] or less [topic]"])
+        # Show source weights if any
+        if profile.source_weights:
+            lines.append("")
+            lines.append("<b>Source Preferences:</b>")
+            for src, sw in sorted(profile.source_weights.items(), key=lambda x: -x[1]):
+                label = "boosted" if sw > 0 else "demoted"
+                lines.append(f"  {src}: {label} ({sw:+.1f})")
+
+        lines.extend([
+            "",
+            "Adjust with: /feedback more [topic] or less [topic]",
+            "Sources: /feedback prefer [source] or demote [source]",
+            "Reset: /feedback reset preferences",
+        ])
         self._bot.send_message(chat_id, "\n".join(lines))
         return {"action": "topics", "user_id": user_id}
 

@@ -1158,8 +1158,10 @@ class BriefingSchedulerTests(unittest.TestCase):
         scheduler = BriefingScheduler()
         scheduler.set_schedule("u1", "morning")
         snap = scheduler.snapshot()
-        self.assertIn("u1", snap)
-        self.assertEqual(snap["u1"]["type"], "morning")
+        self.assertIn("schedules", snap)
+        self.assertIn("u1", snap["schedules"])
+        self.assertEqual(snap["schedules"]["u1"]["type"], "morning")
+        self.assertIn("muted", snap)
 
 
 def urllib_error():
@@ -1412,9 +1414,23 @@ class CommunicationAgentTests(unittest.TestCase):
             user_id="u1", topic_weights={"geopolitics": 0.8}, max_items=10,
         )
         self.mock_engine.handle_request.return_value = "Briefing text here"
-        self.mock_engine.show_more.return_value = ["Story 1 (reuters)", "Story 2 (bbc)"]
+        self.mock_engine.show_more.return_value = [
+            CandidateItem(candidate_id="c1", title="Story 1", source="reuters",
+                          url="https://reuters.com/1", summary="Summary 1", topic="geopolitics",
+                          evidence_score=0.8, novelty_score=0.7, preference_fit=0.6,
+                          prediction_signal=0.5, discovered_by="news_agent_reuters"),
+            CandidateItem(candidate_id="c2", title="Story 2", source="bbc",
+                          url="https://bbc.co.uk/2", summary="Summary 2", topic="technology",
+                          evidence_score=0.7, novelty_score=0.6, preference_fit=0.5,
+                          prediction_signal=0.4, discovered_by="news_agent_bbc"),
+        ]
         self.mock_engine.apply_user_feedback.return_value = {"topic:geopolitics": "1.0"}
         self.mock_engine.engine_status.return_value = {"agent_count": 18}
+        self.mock_engine.last_briefing_topics.return_value = ["geopolitics", "technology"]
+        self.mock_engine.last_briefing_items.return_value = [
+            {"topic": "geopolitics", "source": "reuters"},
+            {"topic": "technology", "source": "bbc"},
+        ]
 
         self.mock_bot = MagicMock()
         self.mock_bot.parse_command.return_value = None
@@ -1461,7 +1477,8 @@ class CommunicationAgentTests(unittest.TestCase):
         }
         result = self.agent.handle_update({})
         self.assertEqual(result["action"], "pref_more")
-        self.assertIn("technology", result["topic"])
+        self.assertIn("geopolitics", result["topics"])
+        self.assertIn("technology", result["topics"])
 
     def test_handle_preference_less_similar(self) -> None:
         self.agent._last_topic["u1"] = "markets"
@@ -1471,6 +1488,7 @@ class CommunicationAgentTests(unittest.TestCase):
         }
         result = self.agent.handle_update({})
         self.assertEqual(result["action"], "pref_less")
+        self.assertIn("geopolitics", result["topics"])
 
     def test_handle_help_command(self) -> None:
         self.mock_bot.parse_command.return_value = {
