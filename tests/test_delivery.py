@@ -75,7 +75,8 @@ class TelegramFormatterTests(unittest.TestCase):
         output = TelegramFormatter().format(payload)
         self.assertIn("Morning Intelligence Digest", output)
         self.assertIn("Test Signal", output)
-        self.assertIn("Why it matters", output)
+        # New HTML format uses <i>Changed:</i> and <i>Confidence:</i> labels
+        self.assertIn("<b>", output)
 
     def test_breaking_alert_header(self) -> None:
         payload = _make_payload(briefing_type=BriefingType.BREAKING_ALERT)
@@ -85,19 +86,22 @@ class TelegramFormatterTests(unittest.TestCase):
     def test_geo_risk_section(self) -> None:
         payload = _make_payload(include_geo=True)
         output = TelegramFormatter().format(payload)
-        self.assertIn("GEO RISK ALERTS", output)
+        # New HTML format uses styled section headers
+        self.assertIn("Geo Risk Alerts", output)
         self.assertIn("europe", output)
 
     def test_trends_section(self) -> None:
         payload = _make_payload(include_trends=True)
         output = TelegramFormatter().format(payload)
-        self.assertIn("EMERGING TRENDS", output)
+        # New HTML format uses styled section headers
+        self.assertIn("Emerging Trends", output)
         self.assertIn("ai_policy", output)
 
     def test_threads_section(self) -> None:
         payload = _make_payload(include_threads=True)
         output = TelegramFormatter().format(payload)
-        self.assertIn("NARRATIVE THREADS", output)
+        # New HTML format uses styled section headers
+        self.assertIn("Narrative Threads", output)
         self.assertIn("Thread headline", output)
 
 

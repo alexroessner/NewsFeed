@@ -85,22 +85,33 @@ class CredibilityTests(unittest.TestCase):
             tracker.score_candidate(c_unreliable),
         )
 
-    def test_cross_corroboration_detects_shared_topic(self) -> None:
+    def test_cross_corroboration_detects_similar_stories(self) -> None:
+        # Corroboration now uses content similarity, not topic-level matching.
+        # Items need similar titles/summaries AND real URLs (not example.com).
         items = [
-            _make_candidate(cid="c1", source="reuters", topic="ai_policy"),
-            _make_candidate(cid="c2", source="bbc", topic="ai_policy"),
-            _make_candidate(cid="c3", source="guardian", topic="ai_policy"),
+            _make_candidate(cid="c1", source="reuters", topic="ai_policy",
+                            title="Trump signs new AI regulation executive order"),
+            _make_candidate(cid="c2", source="bbc", topic="ai_policy",
+                            title="Trump executive order targets AI regulation"),
+            _make_candidate(cid="c3", source="guardian", topic="markets",
+                            title="Stock markets rally on earnings report"),
         ]
+        # Give real URLs so they're not skipped
+        for item in items:
+            item.url = f"https://real-source.com/{item.candidate_id}"
         result = detect_cross_corroboration(items)
-        corroborated = [c for c in result if c.corroborated_by]
-        self.assertGreaterEqual(len(corroborated), 2)
+        # reuters and bbc should corroborate (similar titles), guardian should not
+        self.assertTrue(result[0].corroborated_by)  # reuters
+        self.assertTrue(result[1].corroborated_by)  # bbc
+        self.assertFalse(result[2].corroborated_by)  # guardian (different story)
 
     def test_source_diversity_caps_per_source(self) -> None:
         items = [_make_candidate(cid=f"c{i}", source="reuters") for i in range(10)]
         diverse = enforce_source_diversity(items, max_per_source=3)
-        reuters_first_3 = [c for c in diverse[:3] if c.source == "reuters"]
-        self.assertEqual(len(reuters_first_3), 3)
-        self.assertEqual(len(diverse), 10)
+        reuters_count = [c for c in diverse if c.source == "reuters"]
+        self.assertEqual(len(reuters_count), 3)
+        # Overflow items are now dropped, so only the diverse items remain
+        self.assertEqual(len(diverse), 3)
 
 
 class ClusteringTests(unittest.TestCase):
@@ -337,8 +348,9 @@ class EdgeCaseTests(unittest.TestCase):
     def test_diversity_all_same_source(self) -> None:
         items = [_make_candidate(cid=f"c{i}", source="reuters") for i in range(10)]
         diverse = enforce_source_diversity(items, max_per_source=2)
-        self.assertEqual(len(diverse), 10)
-        # First 2 should be reuters (highest-scoring), rest are overflow
+        # Overflow items are now dropped entirely
+        self.assertEqual(len(diverse), 2)
+        # Both should be reuters (highest-scoring kept)
         self.assertEqual(diverse[0].source, "reuters")
 
     def test_corroboration_single_item(self) -> None:

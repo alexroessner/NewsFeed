@@ -62,10 +62,18 @@ class BreakingDetector:
         return candidates
 
     def _compute_velocity(self, candidates: list[CandidateItem], now: datetime) -> dict[str, float]:
+        """Compute topic velocity — fraction of items that appeared recently.
+
+        Items with example.com URLs (simulated placeholders) are excluded from
+        velocity calculation since their timestamps are synthetic.
+        """
         topic_recent: dict[str, int] = defaultdict(int)
         topic_total: dict[str, int] = defaultdict(int)
 
         for c in candidates:
+            # Skip simulated items — they have default timestamps that inflate velocity
+            if "example.com" in (c.url or ""):
+                continue
             topic_total[c.topic] += 1
             if now - c.created_at <= self.velocity_window:
                 topic_recent[c.topic] += 1
@@ -99,10 +107,16 @@ class BreakingDetector:
         return UrgencyLevel.ROUTINE
 
     def _source_count_urgency(self, item: CandidateItem, all_candidates: list[CandidateItem]) -> UrgencyLevel:
-        topic_sources = {c.source for c in all_candidates if c.topic == item.topic}
-        if len(topic_sources) >= self.breaking_source_threshold + 2:
+        """Check how many independent sources corroborate THIS specific story.
+
+        Uses the corroborated_by field (set by detect_cross_corroboration which
+        runs before urgency in the pipeline) rather than counting all sources
+        covering the same broad topic.
+        """
+        corroborating = len(item.corroborated_by) if item.corroborated_by else 0
+        if corroborating >= self.breaking_source_threshold + 1:
             return UrgencyLevel.BREAKING
-        if len(topic_sources) >= self.breaking_source_threshold:
+        if corroborating >= self.breaking_source_threshold:
             return UrgencyLevel.ELEVATED
         return UrgencyLevel.ROUTINE
 
