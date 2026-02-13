@@ -18,8 +18,12 @@ _FORMAT_RE = re.compile(r"\bformat\s*[:=]?\s*(bullet|sections|narrative)\b", re.
 _REGION_RE = re.compile(r"\bregion\s*[:=]?\s*(\w[\w\s]*?)(?=\b(?:tone|format|more|less|cadence)\b|[.,;]|$)", re.IGNORECASE)
 _CADENCE_RE = re.compile(r"\bcadence\s*[:=]?\s*(on_demand|morning|evening|realtime)\b", re.IGNORECASE)
 _MAX_ITEMS_RE = re.compile(r"\bmax\s*[:=]?\s*(\d+)\b", re.IGNORECASE)
-_SOURCE_PREFER_RE = re.compile(r"\b(?:prefer|trust|boost)\s+(\w+?)(?:\s+source)?(?=\b|[.,;]|$)", re.IGNORECASE)
-_SOURCE_DEMOTE_RE = re.compile(r"\b(?:demote|distrust|penalize)\s+(\w+?)(?:\s+source)?(?=\b|[.,;]|$)", re.IGNORECASE)
+_SOURCE_PREFER_RE = re.compile(r"\b(?:prefer|trust|boost)\s+(\w{2,}?)(?:\s+source)?(?=\b|[.,;]|$)", re.IGNORECASE)
+_SOURCE_DEMOTE_RE = re.compile(r"\b(?:demote|distrust|penalize)\s+(\w{2,}?)(?:\s+source)?(?=\b|[.,;]|$)", re.IGNORECASE)
+# Common English words that should NOT be treated as source names
+_SOURCE_NOISE = {"your", "my", "the", "this", "that", "it", "its", "our", "all",
+                 "any", "more", "less", "a", "an", "in", "on", "is", "performance",
+                 "judgment", "judgement"}
 _REMOVE_REGION_RE = re.compile(r"\b(?:remove|drop)\s+region\s*[:=]?\s*(\w[\w\s]*?)(?=\b|[.,;]|$)", re.IGNORECASE)
 _RESET_RE = re.compile(r"\breset\s+(?:all\s+)?preferences?\b", re.IGNORECASE)
 
@@ -54,9 +58,14 @@ def parse_preference_commands(text: str, deltas: dict[str, float] | None = None)
     if fmt:
         commands.append(PreferenceCommand(action="format", value=fmt.group(1).lower()))
 
-    region = _REGION_RE.search(text)
-    if region:
-        commands.append(PreferenceCommand(action="region", value=_clean_topic(region.group(1))))
+    # Check remove/drop region FIRST so we can skip _REGION_RE if it matched
+    rm_region = _REMOVE_REGION_RE.search(text)
+    if rm_region:
+        commands.append(PreferenceCommand(action="remove_region", value=_clean_topic(rm_region.group(1))))
+    else:
+        region = _REGION_RE.search(text)
+        if region:
+            commands.append(PreferenceCommand(action="region", value=_clean_topic(region.group(1))))
 
     cadence = _CADENCE_RE.search(text)
     if cadence:
@@ -68,15 +77,13 @@ def parse_preference_commands(text: str, deltas: dict[str, float] | None = None)
 
     for m in _SOURCE_PREFER_RE.finditer(text):
         src = m.group(1).lower()
-        commands.append(PreferenceCommand(action="source_boost", topic=src, value="+1.0"))
+        if src not in _SOURCE_NOISE:
+            commands.append(PreferenceCommand(action="source_boost", topic=src, value="+1.0"))
 
     for m in _SOURCE_DEMOTE_RE.finditer(text):
         src = m.group(1).lower()
-        commands.append(PreferenceCommand(action="source_demote", topic=src, value="-1.0"))
-
-    rm_region = _REMOVE_REGION_RE.search(text)
-    if rm_region:
-        commands.append(PreferenceCommand(action="remove_region", value=_clean_topic(rm_region.group(1))))
+        if src not in _SOURCE_NOISE:
+            commands.append(PreferenceCommand(action="source_demote", topic=src, value="-1.0"))
 
     if _RESET_RE.search(text):
         commands.append(PreferenceCommand(action="reset"))
