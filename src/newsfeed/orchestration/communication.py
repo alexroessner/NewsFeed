@@ -16,8 +16,8 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-# Default topic weights for new users or unweighted requests
-_DEFAULT_TOPICS = {
+# Fallback topic weights — prefer engine's pipeline config default_topics
+_FALLBACK_TOPICS = {
     "geopolitics": 0.8,
     "ai_policy": 0.7,
     "technology": 0.6,
@@ -42,10 +42,12 @@ class CommunicationAgent:
     agent_id = "communication_agent"
 
     def __init__(self, engine: NewsFeedEngine, bot: TelegramBot,
-                 scheduler: BriefingScheduler | None = None) -> None:
+                 scheduler: BriefingScheduler | None = None,
+                 default_topics: dict[str, float] | None = None) -> None:
         self._engine = engine
         self._bot = bot
         self._scheduler = scheduler
+        self._default_topics = default_topics or _FALLBACK_TOPICS
         # Track items shown per user for "show more" dedup
         self._shown_ids: dict[str, set[str]] = {}
         # Track last briefing topic per user
@@ -142,7 +144,7 @@ class CommunicationAgent:
         profile = self._engine.preferences.get_or_create(user_id)
 
         # Build topic weights from profile, with optional topic hint boost
-        topics = dict(profile.topic_weights) if profile.topic_weights else dict(_DEFAULT_TOPICS)
+        topics = dict(profile.topic_weights) if profile.topic_weights else dict(self._default_topics)
         if topic_hint:
             topic_key = topic_hint.strip().lower().replace(" ", "_")
             topics[topic_key] = min(1.0, topics.get(topic_key, 0.5) + 0.3)
@@ -256,7 +258,7 @@ class CommunicationAgent:
         """Display available topics and user's current weights."""
         profile = self._engine.preferences.get_or_create(user_id)
         all_topics = sorted(set(
-            list(profile.topic_weights.keys()) + list(_DEFAULT_TOPICS.keys())
+            list(profile.topic_weights.keys()) + list(self._default_topics.keys())
         ))
 
         lines = ["<b>Available Topics & Your Weights</b>", ""]

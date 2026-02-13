@@ -35,7 +35,11 @@ class EngineTests(unittest.TestCase):
             "Expected a briefing header in output",
         )
         self.assertIn("Why it matters", output)
-        self.assertIn("Review lenses", output)
+        # Persona context is now embedded by the style reviewer as [note1; note2]
+        self.assertTrue(
+            "Ensure output is precise" in output or "Review lenses" in output,
+            "Expected persona context in output",
+        )
 
         # Intelligence enrichment outputs
         self.assertIn("Confidence:", output)

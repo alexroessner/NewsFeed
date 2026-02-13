@@ -26,7 +26,8 @@ log = logging.getLogger(__name__)
 # Tone templates — used in heuristic mode
 # ──────────────────────────────────────────────────────────────────────
 
-_TONE_TEMPLATES: dict[str, dict[str, str]] = {
+# Default tone templates — overridden by editorial_review.tone_templates in config
+_DEFAULT_TONE_TEMPLATES: dict[str, dict[str, str]] = {
     "concise": {
         "why_prefix": "",
         "outlook_prefix": "Outlook: ",
@@ -59,12 +60,36 @@ _TONE_TEMPLATES: dict[str, dict[str, str]] = {
     },
 }
 
-_URGENCY_FRAMING = {
-    UrgencyLevel.CRITICAL: "Immediate attention required. ",
-    UrgencyLevel.BREAKING: "Developing rapidly. ",
-    UrgencyLevel.ELEVATED: "Worth monitoring closely. ",
-    UrgencyLevel.ROUTINE: "",
+_DEFAULT_URGENCY_FRAMING: dict[str, str] = {
+    "critical": "Immediate attention required. ",
+    "breaking": "Developing rapidly. ",
+    "elevated": "Worth monitoring closely. ",
+    "routine": "",
 }
+
+_DEFAULT_WATCHPOINTS: dict[str, str] = {
+    "geopolitics": "Watch for official statements and alliance responses in next 24-48h.",
+    "ai_policy": "Track regulatory body announcements and industry response.",
+    "markets": "Monitor market open and sector rotation for follow-through.",
+    "technology": "Watch for adoption signals and competitive responses.",
+    "crypto": "Track on-chain metrics and exchange flows for confirmation.",
+    "climate": "Monitor policy responses and institutional commitments.",
+    "science": "Watch for peer review outcomes and replication attempts.",
+}
+
+_DEFAULT_FILLER_PATTERNS: list[tuple[str, str]] = [
+    (r"\bit is worth noting that\b", ""),
+    (r"\bit should be noted that\b", ""),
+    (r"\bin terms of\b", "regarding"),
+    (r"\bat this point in time\b", "now"),
+    (r"\bat the end of the day\b", "ultimately"),
+    (r"\bdue to the fact that\b", "because"),
+    (r"\bin order to\b", "to"),
+    (r"\ba significant amount of\b", "substantial"),
+    (r"\bthe fact that\b", "that"),
+    (r"\bin the process of\b", ""),
+    (r"\bon a going-forward basis\b", "going forward"),
+]
 
 
 class StyleReviewAgent:
@@ -85,12 +110,24 @@ class StyleReviewAgent:
         llm_api_key: str = "",
         llm_model: str = "claude-sonnet-4-5-20250929",
         llm_base_url: str = "https://api.anthropic.com/v1",
+        editorial_cfg: dict | None = None,
     ) -> None:
         self._persona_context = persona_context or []
         self._llm_api_key = llm_api_key
         self._llm_model = llm_model
         self._llm_base_url = llm_base_url
         self._use_llm = bool(llm_api_key)
+
+        cfg = editorial_cfg or {}
+        self._tone_templates = cfg.get("tone_templates", _DEFAULT_TONE_TEMPLATES)
+        # Build urgency framing from config (string keys) → UrgencyLevel keys
+        raw_uf = cfg.get("urgency_framing", _DEFAULT_URGENCY_FRAMING)
+        self._urgency_framing = {
+            UrgencyLevel.CRITICAL: raw_uf.get("critical", "Immediate attention required. "),
+            UrgencyLevel.BREAKING: raw_uf.get("breaking", "Developing rapidly. "),
+            UrgencyLevel.ELEVATED: raw_uf.get("elevated", "Worth monitoring closely. "),
+            UrgencyLevel.ROUTINE: raw_uf.get("routine", ""),
+        }
 
     def review(self, item: ReportItem, profile: UserProfile) -> ReportItem:
         """Apply style review to a report item, rewriting fields for voice and tone."""
@@ -101,7 +138,7 @@ class StyleReviewAgent:
     def _review_heuristic(self, item: ReportItem, profile: UserProfile) -> ReportItem:
         """Apply tone-aware heuristic rewriting."""
         tone = profile.tone
-        templates = _TONE_TEMPLATES.get(tone, _TONE_TEMPLATES["concise"])
+        templates = self._tone_templates.get(tone, self._tone_templates.get("concise", _DEFAULT_TONE_TEMPLATES["concise"]))
         c = item.candidate
 
         # Rewrite why_it_matters with tone-specific prefix and topic personalization
@@ -121,7 +158,7 @@ class StyleReviewAgent:
     def _rewrite_why(self, base: str, c: CandidateItem, profile: UserProfile,
                      templates: dict[str, str]) -> str:
         prefix = templates["why_prefix"]
-        urgency = _URGENCY_FRAMING.get(c.urgency, "")
+        urgency = self._urgency_framing.get(c.urgency, "")
 
         # Personalize: reference user's interest level in this topic
         topic_weight = profile.topic_weights.get(c.topic, 0.0)
@@ -277,11 +314,20 @@ class ClarityReviewAgent:
         llm_api_key: str = "",
         llm_model: str = "claude-sonnet-4-5-20250929",
         llm_base_url: str = "https://api.anthropic.com/v1",
+        editorial_cfg: dict | None = None,
     ) -> None:
         self._llm_api_key = llm_api_key
         self._llm_model = llm_model
         self._llm_base_url = llm_base_url
         self._use_llm = bool(llm_api_key)
+
+        cfg = editorial_cfg or {}
+        self._watchpoints = cfg.get("watchpoints", _DEFAULT_WATCHPOINTS)
+        self._filler_patterns = [
+            (p, r) for p, r in cfg.get("filler_patterns", _DEFAULT_FILLER_PATTERNS)
+        ]
+        self._topic_adjacent_reads = cfg.get("topic_adjacent_reads", {})
+        self._default_adjacent_reads = cfg.get("default_adjacent_reads", [])
 
     def review(self, item: ReportItem, profile: UserProfile) -> ReportItem:
         """Apply clarity review to a report item."""
@@ -319,22 +365,8 @@ class ClarityReviewAgent:
 
     def _compress(self, text: str) -> str:
         """Remove filler words and tighten prose."""
-        # Remove common filler patterns
-        filler = [
-            (r"\bit is worth noting that\b", ""),
-            (r"\bit should be noted that\b", ""),
-            (r"\bin terms of\b", "regarding"),
-            (r"\bat this point in time\b", "now"),
-            (r"\bat the end of the day\b", "ultimately"),
-            (r"\bdue to the fact that\b", "because"),
-            (r"\bin order to\b", "to"),
-            (r"\ba significant amount of\b", "substantial"),
-            (r"\bthe fact that\b", "that"),
-            (r"\bin the process of\b", ""),
-            (r"\bon a going-forward basis\b", "going forward"),
-        ]
         result = text
-        for pattern, replacement in filler:
+        for pattern, replacement in self._filler_patterns:
             result = re.sub(pattern, replacement, result, flags=re.IGNORECASE)
         # Collapse double spaces
         result = re.sub(r"  +", " ", result).strip()
@@ -342,47 +374,47 @@ class ClarityReviewAgent:
 
     def _add_watchpoint(self, outlook: str, c: CandidateItem) -> str:
         """Add an actionable watchpoint to the outlook."""
-        watchpoints = {
-            "geopolitics": "Watch for official statements and alliance responses in next 24-48h.",
-            "ai_policy": "Track regulatory body announcements and industry response.",
-            "markets": "Monitor market open and sector rotation for follow-through.",
-            "technology": "Watch for adoption signals and competitive responses.",
-            "crypto": "Track on-chain metrics and exchange flows for confirmation.",
-            "climate": "Monitor policy responses and institutional commitments.",
-            "science": "Watch for peer review outcomes and replication attempts.",
-        }
-        watchpoint = watchpoints.get(c.topic, "Monitor for follow-up developments.")
+        watchpoint = self._watchpoints.get(c.topic, "Monitor for follow-up developments.")
         return f"{outlook} {watchpoint}"
 
     def _improve_adjacent_reads(self, reads: list[str], c: CandidateItem) -> list[str]:
         """Replace generic adjacent reads with topic-specific suggestions."""
-        topic_reads = {
-            "geopolitics": [
-                f"Historical context: prior escalation patterns in {', '.join(c.regions[:1]) or 'this region'}",
-                f"Stakeholder analysis: key actors and their stated positions",
-                f"Timeline: sequence of events leading to current development",
-            ],
-            "ai_policy": [
-                "Technical assessment: capabilities and limitations at play",
-                "Regulatory landscape: existing and proposed frameworks",
-                "Industry response: major player positions and commitments",
-            ],
-            "markets": [
-                "Sector impact analysis: direct and indirect exposure",
-                "Historical parallel: similar market events and outcomes",
-                "Policy implications: regulatory and central bank response potential",
-            ],
-            "technology": [
-                "Technical deep-dive: architecture and implementation details",
-                "Competitive landscape: market positioning and alternatives",
-                "Adoption trajectory: deployment timeline and barriers",
-            ],
-        }
-        specific = topic_reads.get(c.topic, [
-            f"Background context for {c.topic}",
-            f"Expert analysis on {c.topic} implications",
-            f"Related developments in {c.topic}",
-        ])
+        region = ", ".join(c.regions[:1]) or "this region"
+
+        if self._topic_adjacent_reads and c.topic in self._topic_adjacent_reads:
+            templates = self._topic_adjacent_reads[c.topic]
+            specific = [t.format(region=region, topic=c.topic) for t in templates]
+        elif self._default_adjacent_reads:
+            specific = [t.format(region=region, topic=c.topic) for t in self._default_adjacent_reads]
+        else:
+            # Hardcoded fallback for backward compatibility
+            _fallback_reads = {
+                "geopolitics": [
+                    f"Historical context: prior escalation patterns in {region}",
+                    "Stakeholder analysis: key actors and their stated positions",
+                    "Timeline: sequence of events leading to current development",
+                ],
+                "ai_policy": [
+                    "Technical assessment: capabilities and limitations at play",
+                    "Regulatory landscape: existing and proposed frameworks",
+                    "Industry response: major player positions and commitments",
+                ],
+                "markets": [
+                    "Sector impact analysis: direct and indirect exposure",
+                    "Historical parallel: similar market events and outcomes",
+                    "Policy implications: regulatory and central bank response potential",
+                ],
+                "technology": [
+                    "Technical deep-dive: architecture and implementation details",
+                    "Competitive landscape: market positioning and alternatives",
+                    "Adoption trajectory: deployment timeline and barriers",
+                ],
+            }
+            specific = _fallback_reads.get(c.topic, [
+                f"Background context for {c.topic}",
+                f"Expert analysis on {c.topic} implications",
+                f"Related developments in {c.topic}",
+            ])
         return specific[:len(reads)]
 
     def _deduplicate(self, text: str, seen: set[str]) -> str:
