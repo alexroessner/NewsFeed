@@ -184,7 +184,7 @@ class GenericRSSAgent(ResearchAgent):
                 candidate_id=f"{self.agent_id}-{cid}",
                 title=title,
                 source=self.source,
-                summary=summary[:300],
+                summary=summary[:600],
                 url=link,
                 topic=topic,
                 evidence_score=self._evidence_baseline,
@@ -193,6 +193,7 @@ class GenericRSSAgent(ResearchAgent):
                 prediction_signal=round(min(1.0, self._prediction_baseline + pred_boost), 3),
                 discovered_by=self.agent_id,
                 created_at=created_at,
+                regions=self.detect_locations(title, summary),
             ))
 
         return candidates

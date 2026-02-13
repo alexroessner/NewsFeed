@@ -243,17 +243,25 @@ class CommunicationAgent:
         header = formatter.format_header(payload, ticker_bar)
         self._bot.send_message(chat_id, header)
 
-        # Messages 2..N: Individual story cards (one per message)
+        # Messages 2..N: Individual story cards with per-story thumbs up/down
         for idx, item in enumerate(payload.items, start=1):
             card = formatter.format_story_card(item, idx)
-            is_last = (idx == len(payload.items))
-            self._bot.send_story_card(chat_id, card, is_last=is_last)
+            self._bot.send_story_card(chat_id, card, story_index=idx)
 
         if not payload.items:
             self._bot.send_message(
                 chat_id,
                 "No stories matched your current filters. Try /feedback to adjust."
             )
+
+        # Closing message: weightings + action buttons
+        if payload.items:
+            closing = formatter.format_closing(
+                payload,
+                topic_weights=dict(profile.topic_weights) if profile.topic_weights else dict(topics),
+                source_weights=dict(profile.source_weights) if profile.source_weights else None,
+            )
+            self._bot.send_closing(chat_id, closing)
 
         log.info(
             "Multi-message briefing: user=%s chat=%s (%d cards)",

@@ -158,7 +158,7 @@ class BBCAgent(ResearchAgent):
                 candidate_id=f"{self.agent_id}-{cid}",
                 title=title,
                 source="bbc",
-                summary=summary[:300],
+                summary=summary[:600],
                 url=link,
                 topic=topic,
                 evidence_score=0.82,
@@ -167,6 +167,7 @@ class BBCAgent(ResearchAgent):
                 prediction_signal=round(min(1.0, 0.45 + pred_boost), 3),
                 discovered_by=self.agent_id,
                 created_at=created_at,
+                regions=self.detect_locations(title, summary),
             ))
 
         return candidates

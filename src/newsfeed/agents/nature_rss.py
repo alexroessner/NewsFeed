@@ -125,7 +125,7 @@ class NatureAgent(GenericRSSAgent):
                 candidate_id=f"{self.agent_id}-{cid}",
                 title=title,
                 source="nature",
-                summary=summary[:300],
+                summary=summary[:600],
                 url=link,
                 topic=topic,
                 evidence_score=self._evidence_baseline,
@@ -134,6 +134,7 @@ class NatureAgent(GenericRSSAgent):
                 prediction_signal=self._prediction_baseline,
                 discovered_by=self.agent_id,
                 created_at=created_at,
+                regions=self.detect_locations(title, summary),
             ))
 
         return candidates
