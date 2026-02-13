@@ -82,7 +82,7 @@ class GuardianAgent(ResearchAgent):
                 candidate_id=f"{self.agent_id}-{cid}",
                 title=title,
                 source="guardian",
-                summary=summary[:300],
+                summary=summary[:600],
                 url=web_url,
                 topic=self._map_section_to_topic(section),
                 evidence_score=0.80,
@@ -91,6 +91,7 @@ class GuardianAgent(ResearchAgent):
                 prediction_signal=round(min(1.0, 0.50 + pred_boost), 3),
                 discovered_by=self.agent_id,
                 created_at=created_at,
+                regions=self.detect_locations(title, summary),
             ))
 
         candidates.sort(key=lambda c: c.composite_score(), reverse=True)

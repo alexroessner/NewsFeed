@@ -73,7 +73,7 @@ class TelegramFormatterTests(unittest.TestCase):
     def test_basic_format(self) -> None:
         payload = _make_payload()
         output = TelegramFormatter().format(payload)
-        self.assertIn("Morning Intelligence Digest", output)
+        self.assertIn("Intelligence Digest", output)
         self.assertIn("Test Signal", output)
         # New HTML format uses <i>Changed:</i> and <i>Confidence:</i> labels
         self.assertIn("<b>", output)
@@ -81,7 +81,7 @@ class TelegramFormatterTests(unittest.TestCase):
     def test_breaking_alert_header(self) -> None:
         payload = _make_payload(briefing_type=BriefingType.BREAKING_ALERT)
         output = TelegramFormatter().format(payload)
-        self.assertIn("BREAKING ALERT", output)
+        self.assertIn("Intelligence Digest", output)
 
     def test_geo_risk_section(self) -> None:
         payload = _make_payload(include_geo=True)

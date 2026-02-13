@@ -119,7 +119,7 @@ class AlJazeeraAgent(ResearchAgent):
                     pass
 
             preference_fit = self._score_relevance(title, summary, task.weighted_topics)
-            regions = self._detect_regions(title, summary)
+            regions = self.detect_locations(title, summary)
             cid = hashlib.sha256(f"{self.agent_id}:{link}".encode()).hexdigest()[:16]
 
             # Content-aware scoring
@@ -132,7 +132,7 @@ class AlJazeeraAgent(ResearchAgent):
                 candidate_id=f"{self.agent_id}-{cid}",
                 title=title,
                 source="aljazeera",
-                summary=summary[:300],
+                summary=summary[:600],
                 url=link,
                 topic=topic,
                 evidence_score=0.78,
