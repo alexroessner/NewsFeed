@@ -1,20 +1,22 @@
 """Persistent analytics database — captures ALL user data, interactions, and pipeline events.
 
-SQLite-backed storage that records every touchpoint:
-- User registration and profile snapshots
-- Every command, message, and callback from every user
-- Full pipeline execution traces (candidates, votes, selections)
-- Briefing deliveries with all items
-- Feedback, ratings, and preference changes
-- Intelligence snapshots (geo-risk, trends, credibility, expert influence)
-- Agent performance per request
+Dual-mode storage:
+  - LOCAL: SQLite file (dev, testing, or when D1 is not configured)
+  - CLOUD: Cloudflare D1 via REST API (production — persists across GH Actions runs)
 
-All data is keyed by user_id and timestamped for full historical analysis.
+The mode is selected automatically based on environment variables:
+  - If CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_API_TOKEN + D1_DATABASE_ID are set → D1
+  - Otherwise → local SQLite at the specified path
+
+All SQL is identical for both backends (D1 runs native SQLite).
+All write methods are fire-and-forget — errors are logged but never
+propagate to the caller, so analytics can never break the pipeline.
 """
 from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -33,7 +35,7 @@ _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS users (
     user_id         TEXT PRIMARY KEY,
     chat_id         TEXT,
-    first_seen_at   REAL NOT NULL,          -- epoch
+    first_seen_at   REAL NOT NULL,
     last_active_at  REAL NOT NULL,
     total_requests  INTEGER DEFAULT 0,
     total_briefings INTEGER DEFAULT 0,
@@ -46,15 +48,15 @@ CREATE TABLE IF NOT EXISTS users (
 -- ============================================================
 CREATE TABLE IF NOT EXISTS interactions (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts              REAL NOT NULL,           -- epoch
+    ts              REAL NOT NULL,
     user_id         TEXT NOT NULL,
     chat_id         TEXT,
-    interaction_type TEXT NOT NULL,           -- command, preference, feedback, rate, mute, unknown
-    command         TEXT,                     -- /briefing, /more, etc.
-    args            TEXT,                     -- command arguments
-    raw_text        TEXT,                     -- full message text
-    result_action   TEXT,                     -- action returned by handler
-    result_data     TEXT                      -- JSON of full result dict
+    interaction_type TEXT NOT NULL,
+    command         TEXT,
+    args            TEXT,
+    raw_text        TEXT,
+    result_action   TEXT,
+    result_data     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_interactions_user ON interactions(user_id);
 CREATE INDEX IF NOT EXISTS idx_interactions_ts ON interactions(ts);
@@ -66,7 +68,7 @@ CREATE TABLE IF NOT EXISTS requests (
     request_id      TEXT PRIMARY KEY,
     user_id         TEXT NOT NULL,
     prompt          TEXT,
-    weighted_topics TEXT,                     -- JSON
+    weighted_topics TEXT,
     max_items       INTEGER,
     started_at      REAL NOT NULL,
     completed_at    REAL,
@@ -74,7 +76,7 @@ CREATE TABLE IF NOT EXISTS requests (
     candidate_count INTEGER DEFAULT 0,
     selected_count  INTEGER DEFAULT 0,
     briefing_type   TEXT,
-    status          TEXT DEFAULT 'running'    -- running, completed, failed
+    status          TEXT DEFAULT 'running'
 );
 CREATE INDEX IF NOT EXISTS idx_requests_user ON requests(user_id);
 CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(started_at);
@@ -99,10 +101,10 @@ CREATE TABLE IF NOT EXISTS candidates (
     discovered_by   TEXT,
     urgency         TEXT,
     lifecycle       TEXT,
-    regions         TEXT,                     -- JSON array
-    corroborated_by TEXT,                     -- JSON array
+    regions         TEXT,
+    corroborated_by TEXT,
     contrarian_signal TEXT,
-    created_at      TEXT,                     -- ISO timestamp
+    created_at      TEXT,
     was_selected    INTEGER DEFAULT 0,
     selection_reason TEXT
 );
@@ -118,7 +120,7 @@ CREATE TABLE IF NOT EXISTS expert_votes (
     request_id      TEXT NOT NULL,
     expert_id       TEXT NOT NULL,
     candidate_id    TEXT NOT NULL,
-    keep            INTEGER NOT NULL,         -- 0 or 1
+    keep            INTEGER NOT NULL,
     confidence      REAL,
     rationale       TEXT,
     risk_note       TEXT,
@@ -140,7 +142,7 @@ CREATE TABLE IF NOT EXISTS briefings (
     thread_count    INTEGER,
     geo_risk_count  INTEGER,
     emerging_trends INTEGER,
-    metadata        TEXT                      -- JSON of full metadata dict
+    metadata        TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_briefings_user ON briefings(user_id);
 CREATE INDEX IF NOT EXISTS idx_briefings_ts ON briefings(delivered_at);
@@ -183,7 +185,7 @@ CREATE TABLE IF NOT EXISTS feedback (
     ts              REAL NOT NULL,
     user_id         TEXT NOT NULL,
     feedback_text   TEXT,
-    changes_applied TEXT                      -- JSON of {key: value} changes
+    changes_applied TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_feedback_user ON feedback(user_id);
 
@@ -195,7 +197,7 @@ CREATE TABLE IF NOT EXISTS ratings (
     ts              REAL NOT NULL,
     user_id         TEXT NOT NULL,
     item_index      INTEGER,
-    direction       TEXT,                     -- up / down
+    direction       TEXT,
     topic           TEXT,
     source          TEXT,
     title           TEXT
@@ -209,11 +211,11 @@ CREATE TABLE IF NOT EXISTS preference_changes (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     ts              REAL NOT NULL,
     user_id         TEXT NOT NULL,
-    change_type     TEXT,                     -- topic_delta, tone, format, region, cadence, etc.
-    field           TEXT,                     -- specific field changed
+    change_type     TEXT,
+    field           TEXT,
     old_value       TEXT,
     new_value       TEXT,
-    source          TEXT                      -- command, feedback, rate, preference_callback
+    source          TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_prefchanges_user ON preference_changes(user_id);
 
@@ -224,7 +226,7 @@ CREATE TABLE IF NOT EXISTS profile_snapshots (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     ts              REAL NOT NULL,
     user_id         TEXT NOT NULL,
-    profile_data    TEXT NOT NULL             -- JSON of full profile
+    profile_data    TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_snapshots_user ON profile_snapshots(user_id);
 
@@ -239,7 +241,7 @@ CREATE TABLE IF NOT EXISTS georisk_snapshots (
     risk_level      REAL,
     previous_level  REAL,
     escalation_delta REAL,
-    drivers         TEXT                      -- JSON array
+    drivers         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_georisk_ts ON georisk_snapshots(ts);
 
@@ -310,22 +312,69 @@ CREATE TABLE IF NOT EXISTS schema_version (
 """
 
 
+def create_analytics_db(local_path: str | Path | None = None) -> AnalyticsDB:
+    """Factory: create AnalyticsDB with the best available backend.
+
+    Checks env vars for Cloudflare D1 credentials first.
+    Falls back to local SQLite at `local_path`.
+    """
+    account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
+    api_token = os.environ.get("CLOUDFLARE_API_TOKEN", "")
+    database_id = os.environ.get("D1_DATABASE_ID", "")
+
+    if account_id and api_token and database_id:
+        return AnalyticsDB.from_d1(account_id, database_id, api_token)
+
+    if local_path:
+        return AnalyticsDB(local_path)
+
+    # Default fallback
+    Path("state").mkdir(parents=True, exist_ok=True)
+    return AnalyticsDB(Path("state") / "analytics.db")
+
+
 class AnalyticsDB:
-    """Thread-safe SQLite analytics database.
+    """Dual-mode analytics database: local SQLite or Cloudflare D1.
 
     All write methods are fire-and-forget — errors are logged but never
     propagate to the caller, so analytics can never break the pipeline.
     """
 
     def __init__(self, db_path: str | Path) -> None:
+        """Initialize with local SQLite backend."""
         self._db_path = str(db_path)
+        self._d1 = None
         self._local = threading.local()
         self._init_lock = threading.Lock()
         self._initialized = False
+        self._backend = "sqlite"
         self._ensure_schema()
 
+    @classmethod
+    def from_d1(cls, account_id: str, database_id: str, api_token: str) -> AnalyticsDB:
+        """Initialize with Cloudflare D1 backend."""
+        from newsfeed.db.d1_client import D1Client
+
+        instance = object.__new__(cls)
+        instance._db_path = f"d1://{database_id}"
+        instance._d1 = D1Client(account_id, database_id, api_token)
+        instance._local = threading.local()
+        instance._init_lock = threading.Lock()
+        instance._initialized = False
+        instance._backend = "d1"
+        instance._ensure_schema()
+        return instance
+
+    @property
+    def backend(self) -> str:
+        return self._backend
+
+    # ──────────────────────────────────────────────────────────────
+    # TRANSPORT LAYER — all backend-specific code lives here
+    # ──────────────────────────────────────────────────────────────
+
     def _conn(self) -> sqlite3.Connection:
-        """Get thread-local connection."""
+        """Get thread-local SQLite connection (local mode only)."""
         conn = getattr(self._local, "conn", None)
         if conn is None:
             conn = sqlite3.connect(self._db_path, timeout=10)
@@ -339,33 +388,68 @@ class AnalyticsDB:
         with self._init_lock:
             if self._initialized:
                 return
-            conn = self._conn()
-            conn.executescript(_SCHEMA_SQL)
-            # Check/set version
-            row = conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
-            if row is None:
-                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (_SCHEMA_VERSION,))
-            conn.commit()
+            try:
+                if self._d1:
+                    self._d1.execute_script(_SCHEMA_SQL)
+                    rows = self._d1.query("SELECT version FROM schema_version LIMIT 1")
+                    if not rows:
+                        self._d1.execute(
+                            "INSERT INTO schema_version (version) VALUES (?)",
+                            (_SCHEMA_VERSION,),
+                        )
+                    log.info("Analytics DB initialized on Cloudflare D1 (schema v%d)", _SCHEMA_VERSION)
+                else:
+                    conn = self._conn()
+                    conn.executescript(_SCHEMA_SQL)
+                    row = conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
+                    if row is None:
+                        conn.execute("INSERT INTO schema_version (version) VALUES (?)", (_SCHEMA_VERSION,))
+                    conn.commit()
+                    log.info("Analytics DB initialized at %s (schema v%d)", self._db_path, _SCHEMA_VERSION)
+            except Exception:
+                log.exception("Failed to initialize analytics schema on %s", self._backend)
             self._initialized = True
-            log.info("Analytics DB initialized at %s (schema v%d)", self._db_path, _SCHEMA_VERSION)
 
     def _safe_exec(self, sql: str, params: tuple = ()) -> None:
         """Execute SQL with error isolation — never raises."""
         try:
-            conn = self._conn()
-            conn.execute(sql, params)
-            conn.commit()
+            if self._d1:
+                self._d1.execute(sql, params)
+            else:
+                conn = self._conn()
+                conn.execute(sql, params)
+                conn.commit()
         except Exception:
-            log.exception("Analytics DB write failed: %s", sql[:100])
+            log.exception("Analytics DB write failed (%s): %s", self._backend, sql[:100])
 
     def _safe_exec_many(self, sql: str, params_list: list[tuple]) -> None:
         """Execute many SQL statements with error isolation."""
+        if not params_list:
+            return
         try:
-            conn = self._conn()
-            conn.executemany(sql, params_list)
-            conn.commit()
+            if self._d1:
+                self._d1.execute_many(sql, params_list)
+            else:
+                conn = self._conn()
+                conn.executemany(sql, params_list)
+                conn.commit()
         except Exception:
-            log.exception("Analytics DB batch write failed: %s", sql[:100])
+            log.exception("Analytics DB batch write failed (%s): %s", self._backend, sql[:100])
+
+    def _query(self, sql: str, params: tuple = ()) -> list[dict]:
+        """Run a read query and return list of dicts."""
+        try:
+            if self._d1:
+                return self._d1.query(sql, params)
+            else:
+                conn = self._conn()
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(sql, params).fetchall()
+                conn.row_factory = None
+                return [dict(r) for r in rows]
+        except Exception:
+            log.exception("Analytics query failed (%s): %s", self._backend, sql[:100])
+            return []
 
     # ──────────────────────────────────────────────────────────────
     # USER TRACKING
@@ -691,18 +775,6 @@ class AnalyticsDB:
     # ──────────────────────────────────────────────────────────────
     # ADMIN QUERIES
     # ──────────────────────────────────────────────────────────────
-
-    def _query(self, sql: str, params: tuple = ()) -> list[dict]:
-        """Run a read query and return list of dicts."""
-        try:
-            conn = self._conn()
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(sql, params).fetchall()
-            conn.row_factory = None
-            return [dict(r) for r in rows]
-        except Exception:
-            log.exception("Analytics query failed: %s", sql[:100])
-            return []
 
     def get_all_users(self) -> list[dict]:
         return self._query(
