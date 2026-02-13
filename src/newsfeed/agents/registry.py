@@ -4,7 +4,8 @@ Routes each configured agent to its real implementation when API keys are availa
 and falls back to SimulatedResearchAgent when they are not.
 
 Free agents (no API key needed): BBC RSS, HackerNews, Al Jazeera RSS, arXiv, GDELT,
-                                  Google News RSS (web search).
+                                  Google News RSS (web search), NPR RSS, CNBC RSS,
+                                  France 24 RSS, TechCrunch RSS, Nature RSS.
 Keyed agents: Guardian, Reddit, NewsAPI (Reuters/AP/FT), X/Twitter.
 """
 from __future__ import annotations
@@ -48,6 +49,26 @@ def create_agent(agent_cfg: dict, api_keys: dict) -> ResearchAgent:
     if source == "gdelt":
         from newsfeed.agents.gdelt import GDELTAgent
         return GDELTAgent(agent_id=agent_id, mandate=mandate)
+
+    if source == "npr":
+        from newsfeed.agents.npr import NPRAgent
+        return NPRAgent(agent_id=agent_id, mandate=mandate)
+
+    if source == "cnbc":
+        from newsfeed.agents.cnbc import CNBCAgent
+        return CNBCAgent(agent_id=agent_id, mandate=mandate)
+
+    if source == "france24":
+        from newsfeed.agents.france24 import France24Agent
+        return France24Agent(agent_id=agent_id, mandate=mandate)
+
+    if source == "techcrunch":
+        from newsfeed.agents.techcrunch import TechCrunchAgent
+        return TechCrunchAgent(agent_id=agent_id, mandate=mandate)
+
+    if source == "nature":
+        from newsfeed.agents.nature_rss import NatureAgent
+        return NatureAgent(agent_id=agent_id, mandate=mandate)
 
     # ── Keyed agents ─────────────────────────────────────────────
 
