@@ -29,6 +29,36 @@ def setup_logging() -> None:
     root.addHandler(handler)
 
 
+def _send_error_to_chat(update: dict, token: str, error_msg: str) -> None:
+    """Best-effort: notify user that processing failed."""
+    import traceback
+    import urllib.request
+    chat_id = None
+    try:
+        msg = update.get("message") or update.get("callback_query", {}).get("message")
+        if msg:
+            chat_id = msg.get("chat", {}).get("id")
+    except Exception:
+        pass
+    if not chat_id or not token:
+        return
+    try:
+        safe_msg = error_msg[:300].replace("<", "&lt;").replace(">", "&gt;")
+        payload = json.dumps({
+            "chat_id": chat_id,
+            "text": f"Something went wrong processing your message.\n\n<code>{safe_msg}</code>",
+            "parse_mode": "HTML",
+        }).encode()
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=10)
+    except Exception:
+        pass  # Best effort
+
+
 def main() -> None:
     setup_logging()
     log = logging.getLogger("newsfeed.run_command")
@@ -44,11 +74,15 @@ def main() -> None:
         log.error("No update provided. Pass as argument or TELEGRAM_UPDATE env var.")
         sys.exit(1)
 
+    log.info("TELEGRAM_UPDATE length=%d, first 200 chars: %s", len(raw), raw[:200])
+
     try:
         update = json.loads(raw)
     except json.JSONDecodeError as e:
         log.error("Invalid JSON: %s", e)
         sys.exit(1)
+
+    log.info("Parsed update keys: %s", list(update.keys()) if isinstance(update, dict) else type(update))
 
     # Locate config — works both locally and in GH Actions checkout
     root = Path(__file__).resolve().parents[2]
@@ -60,25 +94,53 @@ def main() -> None:
     # Override secrets from environment variables (GH Actions secrets)
     _inject_env_secrets(config_dir)
 
+    # Log which secrets were injected (names only, not values)
+    secrets_path = config_dir / "secrets.json"
+    if secrets_path.exists():
+        try:
+            sdata = json.loads(secrets_path.read_text())
+            log.info("Secrets available: %s", [k for k, v in sdata.items() if v])
+        except Exception:
+            pass
+
     try:
         cfg = load_runtime_config(config_dir)
     except ConfigError as e:
         log.error("Configuration error: %s", e)
         sys.exit(1)
 
-    personas_dir = root / "config" / "personas"
-    engine = NewsFeedEngine(
-        config=cfg.agents,
-        pipeline=cfg.pipeline,
-        personas=cfg.personas,
-        personas_dir=personas_dir,
-    )
+    log.info("Config loaded. api_keys present: %s",
+             [k for k in cfg.pipeline.get("api_keys", {}) if cfg.pipeline["api_keys"][k]])
+
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+
+    try:
+        personas_dir = root / "config" / "personas"
+        engine = NewsFeedEngine(
+            config=cfg.agents,
+            pipeline=cfg.pipeline,
+            personas=cfg.personas,
+            personas_dir=personas_dir,
+        )
+    except Exception as e:
+        log.exception("Engine initialization failed")
+        _send_error_to_chat(update, token, f"Engine init: {e}")
+        sys.exit(1)
 
     if engine._comm_agent is None:
         log.error("No Telegram bot token configured — cannot process update")
+        log.error("api_keys.telegram_bot_token = %r",
+                  cfg.pipeline.get("api_keys", {}).get("telegram_bot_token", "")[:10] + "...")
+        _send_error_to_chat(update, token, "Bot token not found in config")
         sys.exit(1)
 
-    result = engine._comm_agent.handle_update(update)
+    try:
+        result = engine._comm_agent.handle_update(update)
+    except Exception as e:
+        log.exception("handle_update failed")
+        _send_error_to_chat(update, token, f"handle_update: {e}")
+        sys.exit(1)
+
     if result:
         log.info("Handled: %s", result)
     else:
@@ -91,8 +153,10 @@ def _inject_env_secrets(config_dir: Path) -> None:
     In GitHub Actions, secrets are passed as env vars. This bridges them
     into the config system that expects secrets.json.
     """
+    log = logging.getLogger("newsfeed.run_command")
     secrets_path = config_dir / "secrets.json"
     if secrets_path.exists():
+        log.info("Local secrets.json exists, skipping env injection")
         return  # Local secrets file takes priority
 
     env_map = {
@@ -108,9 +172,15 @@ def _inject_env_secrets(config_dir: Path) -> None:
         val = os.environ.get(env_key, "")
         if val:
             secrets[config_key] = val
+            log.info("Env secret found: %s -> %s (%d chars)", env_key, config_key, len(val))
+        else:
+            log.warning("Env secret MISSING: %s", env_key)
 
     if secrets:
         secrets_path.write_text(json.dumps(secrets, indent=2))
+        log.info("Wrote secrets.json with %d keys", len(secrets))
+    else:
+        log.error("No secrets found in environment — bot will not work")
 
 
 if __name__ == "__main__":
