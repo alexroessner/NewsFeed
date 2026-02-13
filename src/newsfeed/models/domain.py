@@ -86,6 +86,10 @@ class UserProfile:
     max_items: int = 10
     briefing_cadence: str = "on_demand"
     regions_of_interest: list[str] = field(default_factory=list)
+    watchlist_crypto: list[str] = field(default_factory=list)
+    watchlist_stocks: list[str] = field(default_factory=list)
+    timezone: str = "UTC"
+    muted_topics: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)

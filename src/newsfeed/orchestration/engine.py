@@ -282,6 +282,11 @@ class NewsFeedEngine:
                     # Apply as additive adjustment to preference_fit, clamped to [0, 1]
                     c.preference_fit = round(max(0.0, min(1.0, c.preference_fit + sw * 0.15)), 3)
 
+        # Filter out muted topics
+        if profile.muted_topics:
+            muted_set = set(profile.muted_topics)
+            all_candidates = [c for c in all_candidates if c.topic not in muted_set]
+
         # Stage 2: Intelligence enrichment (conditionally enabled, with error isolation)
         t0 = time.monotonic()
         all_candidates = self._run_intelligence(all_candidates)
@@ -385,7 +390,7 @@ class NewsFeedEngine:
         )
         # Track per-item info for per-item rating buttons
         self._last_briefing_items[user_id] = [
-            {"topic": item.candidate.topic, "source": item.candidate.source}
+            {"topic": item.candidate.topic, "source": item.candidate.source, "title": item.candidate.title}
             for item in report_items
         ]
 
@@ -579,6 +584,12 @@ class NewsFeedEngine:
                 f"feedback-{user_id}", user_id,
                 "multi_update", "; ".join(f"{k}={v}" for k, v in results.items()),
             )
+            # Persist immediately so feedback survives restarts
+            if self._persistence:
+                try:
+                    self._persistence.save("preferences", self.preferences.snapshot())
+                except Exception:
+                    log.exception("Failed to persist preferences after feedback")
 
         log.info("Applied %d updates for user=%s", len(results), user_id)
         return results
@@ -658,6 +669,14 @@ class NewsFeedEngine:
                     profile.briefing_cadence = pdata["cadence"]
                 if isinstance(pdata.get("regions"), list):
                     profile.regions_of_interest = list(pdata["regions"])
+                if isinstance(pdata.get("watchlist_crypto"), list):
+                    profile.watchlist_crypto = list(pdata["watchlist_crypto"])
+                if isinstance(pdata.get("watchlist_stocks"), list):
+                    profile.watchlist_stocks = list(pdata["watchlist_stocks"])
+                if pdata.get("timezone"):
+                    profile.timezone = pdata["timezone"]
+                if isinstance(pdata.get("muted_topics"), list):
+                    profile.muted_topics = list(pdata["muted_topics"])
             log.info("Restored preferences for %d users from disk", len(prefs_data))
 
         log.info("State loaded from %s", self._persistence.state_dir)

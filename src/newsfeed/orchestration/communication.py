@@ -14,6 +14,8 @@ if TYPE_CHECKING:
     from newsfeed.delivery.bot import TelegramBot, BriefingScheduler
     from newsfeed.orchestration.engine import NewsFeedEngine
 
+from newsfeed.delivery.market import MarketTicker
+
 log = logging.getLogger(__name__)
 
 # Fallback topic weights — prefer engine's pipeline config default_topics
@@ -48,6 +50,7 @@ class CommunicationAgent:
         self._bot = bot
         self._scheduler = scheduler
         self._default_topics = default_topics or _FALLBACK_TOPICS
+        self._market = MarketTicker()
         # Track items shown per user for "show more" dedup
         self._shown_ids: dict[str, set[str]] = {}
         # Track last briefing topic per user
@@ -142,8 +145,27 @@ class CommunicationAgent:
         if command == "deep_dive":
             return self._run_briefing(chat_id, user_id, args, deep=True)
 
+        if command == "watchlist":
+            return self._set_watchlist(chat_id, user_id, args)
+
+        if command == "timezone":
+            return self._set_timezone(chat_id, user_id, args)
+
+        if command == "mute":
+            return self._mute_topic(chat_id, user_id, args)
+
+        if command == "unmute":
+            return self._unmute_topic(chat_id, user_id, args)
+
+        if command == "rate_prompt":
+            return self._send_rate_prompt(chat_id, user_id)
+
         if command == "reset":
             self._engine.preferences.reset(user_id)
+            self._engine.apply_user_feedback(user_id, "reset preferences")
+            self._shown_ids.pop(user_id, None)
+            self._last_items.pop(user_id, None)
+            self._last_topic.pop(user_id, None)
             self._bot.send_message(chat_id, "All preferences reset to defaults.")
             return {"action": "reset", "user_id": user_id}
 
@@ -156,16 +178,17 @@ class CommunicationAgent:
         self._engine.preferences.get_or_create(user_id)
         self._bot.send_message(
             chat_id,
-            "<b>Welcome to NewsFeed Intelligence</b>\n\n"
-            "I deliver personalized news briefings from 23+ sources "
+            "<b>\U0001f4e1 Welcome to NewsFeed Intelligence</b>\n\n"
+            "Personalized news briefings from 23+ sources "
             "across geopolitics, AI, technology, markets, and more.\n\n"
             "<b>Quick start:</b>\n"
-            "\u2022 /briefing — Get your first briefing\n"
-            "\u2022 /topics — See available topics and weights\n"
-            "\u2022 /feedback more AI, less crypto — Customize topics\n"
-            "\u2022 /schedule morning 08:00 — Set daily delivery\n"
-            "\u2022 /help — Full command list\n\n"
-            "Just send any text to give feedback (e.g. \"more geopolitics\")."
+            "\u2022 /briefing \u2014 Get your first briefing\n"
+            "\u2022 /topics \u2014 See topics and weights\n"
+            "\u2022 /watchlist crypto BTC ETH \u2014 Set market tickers\n"
+            "\u2022 /feedback more AI, less crypto \u2014 Customize\n"
+            "\u2022 /schedule morning 08:00 \u2014 Set daily delivery\n"
+            "\u2022 /help \u2014 Full command list\n\n"
+            "Send any text to give feedback (e.g. \"more geopolitics\")."
         )
         return {"action": "onboard", "user_id": user_id}
 
@@ -193,6 +216,19 @@ class CommunicationAgent:
             max_items=max_items,
         )
 
+        # Prepend market ticker bar
+        try:
+            crypto_ids = profile.watchlist_crypto or None
+            stock_tickers = profile.watchlist_stocks or None
+            market_data = self._market.fetch_all(crypto_ids, stock_tickers)
+            all_quotes = market_data.get("crypto", []) + market_data.get("stocks", [])
+            if all_quotes:
+                ticker_bar = MarketTicker.format_ticker_bar(all_quotes)
+                if ticker_bar:
+                    formatted = ticker_bar + "\n\n" + formatted
+        except Exception:
+            log.debug("Market ticker fetch skipped", exc_info=True)
+
         # Track shown items for "more" dedup
         self._shown_ids.setdefault(user_id, set())
         dominant_topic = max(topics, key=topics.get, default="general")
@@ -201,8 +237,8 @@ class CommunicationAgent:
         # Store per-item info for per-item feedback buttons
         self._last_items[user_id] = self._engine.last_briefing_items(user_id)
 
-        # Deliver via bot with per-item rating buttons
-        self._bot.send_briefing(chat_id, formatted, item_count=len(self._last_items.get(user_id, [])))
+        # Deliver via bot with clean action buttons
+        self._bot.send_briefing(chat_id, formatted)
 
         log.info("Briefing delivered to user=%s chat=%s", user_id, chat_id)
         return {"action": "briefing", "user_id": user_id, "topic": dominant_topic}
@@ -322,7 +358,7 @@ class CommunicationAgent:
         except ValueError:
             return {"action": "rate_error", "user_id": user_id}
 
-        direction = parts[2]
+        direction = parts[2].lower()
         items = self._last_items.get(user_id, [])
 
         if item_num < 1 or item_num > len(items):
@@ -366,6 +402,10 @@ class CommunicationAgent:
             "topic_weights": dict(profile.topic_weights),
             "source_weights": dict(profile.source_weights),
             "regions": list(profile.regions_of_interest),
+            "timezone": profile.timezone,
+            "watchlist_crypto": list(profile.watchlist_crypto),
+            "watchlist_stocks": list(profile.watchlist_stocks),
+            "muted_topics": list(profile.muted_topics),
         }
         self._bot.send_message(chat_id, self._bot.format_settings(profile_dict))
         return {"action": "settings", "user_id": user_id}
@@ -456,3 +496,133 @@ class CommunicationAgent:
                 log.exception("Failed to deliver scheduled briefing to user=%s", user_id)
 
         return sent
+
+    def _persist_prefs(self) -> None:
+        """Persist preferences immediately."""
+        if self._engine._persistence:
+            try:
+                self._engine._persistence.save("preferences", self._engine.preferences.snapshot())
+            except Exception:
+                log.exception("Failed to persist preferences")
+
+    def _set_watchlist(self, chat_id: int | str, user_id: str,
+                       args: str) -> dict[str, Any]:
+        """Set crypto or stock watchlist."""
+        import html as html_mod
+        if not args.strip():
+            profile = self._engine.preferences.get_or_create(user_id)
+            crypto = ", ".join(c.upper() for c in profile.watchlist_crypto) or "default (BTC, ETH, SOL)"
+            stocks = ", ".join(profile.watchlist_stocks) or "default (SPY, QQQ)"
+            self._bot.send_message(
+                chat_id,
+                f"<b>Your Market Watchlist</b>\n\n"
+                f"Crypto: {html_mod.escape(crypto)}\n"
+                f"Stocks: {html_mod.escape(stocks)}\n\n"
+                f"<b>Set with:</b>\n"
+                f"/watchlist crypto bitcoin ethereum solana\n"
+                f"/watchlist stocks AAPL MSFT SPY"
+            )
+            return {"action": "watchlist_show", "user_id": user_id}
+
+        parts = args.strip().split(maxsplit=1)
+        category = parts[0].lower()
+        tickers = parts[1].split() if len(parts) > 1 else []
+
+        if category == "crypto" and tickers:
+            cleaned = [t.lower() for t in tickers]
+            self._engine.preferences.set_watchlist(user_id, crypto=cleaned)
+            self._persist_prefs()
+            self._bot.send_message(chat_id, f"Crypto watchlist: {', '.join(t.upper() for t in cleaned)}")
+            return {"action": "watchlist_crypto", "user_id": user_id}
+
+        if category == "stocks" and tickers:
+            cleaned = [t.upper() for t in tickers]
+            self._engine.preferences.set_watchlist(user_id, stocks=cleaned)
+            self._persist_prefs()
+            self._bot.send_message(chat_id, f"Stock watchlist: {', '.join(cleaned)}")
+            return {"action": "watchlist_stocks", "user_id": user_id}
+
+        self._bot.send_message(
+            chat_id,
+            "Usage:\n/watchlist crypto bitcoin ethereum solana\n/watchlist stocks AAPL MSFT SPY"
+        )
+        return {"action": "watchlist_help", "user_id": user_id}
+
+    def _set_timezone(self, chat_id: int | str, user_id: str,
+                      args: str) -> dict[str, Any]:
+        """Set user timezone."""
+        tz = args.strip()
+        if not tz:
+            profile = self._engine.preferences.get_or_create(user_id)
+            self._bot.send_message(
+                chat_id,
+                f"Current timezone: <code>{profile.timezone}</code>\n"
+                f"Set with: /timezone US/Eastern"
+            )
+            return {"action": "timezone_show", "user_id": user_id}
+
+        self._engine.preferences.set_timezone(user_id, tz)
+        self._persist_prefs()
+        self._bot.send_message(chat_id, f"Timezone set to <code>{tz}</code>")
+        return {"action": "timezone", "user_id": user_id, "tz": tz}
+
+    def _mute_topic(self, chat_id: int | str, user_id: str,
+                    args: str) -> dict[str, Any]:
+        """Mute a topic from future briefings."""
+        topic = args.strip().lower().replace(" ", "_")
+        if not topic:
+            profile = self._engine.preferences.get_or_create(user_id)
+            muted = ", ".join(profile.muted_topics) or "none"
+            self._bot.send_message(
+                chat_id,
+                f"Muted topics: <code>{muted}</code>\n"
+                f"Mute with: /mute crypto"
+            )
+            return {"action": "mute_show", "user_id": user_id}
+
+        self._engine.preferences.mute_topic(user_id, topic)
+        self._persist_prefs()
+        self._bot.send_message(chat_id, f"Topic <code>{topic}</code> muted. /unmute {topic} to reverse.")
+        return {"action": "mute_topic", "user_id": user_id, "topic": topic}
+
+    def _unmute_topic(self, chat_id: int | str, user_id: str,
+                      args: str) -> dict[str, Any]:
+        """Unmute a previously muted topic."""
+        topic = args.strip().lower().replace(" ", "_")
+        if not topic:
+            self._bot.send_message(chat_id, "Usage: /unmute [topic]")
+            return {"action": "unmute_help", "user_id": user_id}
+
+        self._engine.preferences.unmute_topic(user_id, topic)
+        self._persist_prefs()
+        self._bot.send_message(chat_id, f"Topic <code>{topic}</code> unmuted.")
+        return {"action": "unmute_topic", "user_id": user_id, "topic": topic}
+
+    def _send_rate_prompt(self, chat_id: int | str, user_id: str) -> dict[str, Any]:
+        """Send a compact per-item rating prompt on demand."""
+        import html as html_mod
+        items = self._last_items.get(user_id, [])
+        if not items:
+            self._bot.send_message(chat_id, "No recent briefing to rate. Run /briefing first.")
+            return {"action": "rate_no_items", "user_id": user_id}
+
+        lines = ["\u2b50 <b>Rate Your Stories</b>", ""]
+        for i, item in enumerate(items, 1):
+            title = html_mod.escape(item.get("title", item.get("topic", f"Story {i}")))
+            lines.append(f"  {i}. {title}")
+        lines.append("")
+        lines.append("Tap \U0001f44d to boost or \U0001f44e to reduce similar stories:")
+
+        # Compact layout: two stories per row of buttons
+        rows: list[list[dict]] = []
+        for i in range(0, len(items), 2):
+            row: list[dict] = []
+            for j in range(i, min(i + 2, len(items))):
+                num = j + 1
+                row.append({"text": f"\U0001f44d{num}", "callback_data": f"rate:{num}:up"})
+                row.append({"text": f"\U0001f44e{num}", "callback_data": f"rate:{num}:down"})
+            rows.append(row)
+
+        keyboard = {"inline_keyboard": rows}
+        self._bot.send_message(chat_id, "\n".join(lines), reply_markup=keyboard)
+        return {"action": "rate_prompt", "user_id": user_id}
