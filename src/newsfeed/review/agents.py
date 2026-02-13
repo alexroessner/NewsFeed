@@ -159,27 +159,16 @@ class StyleReviewAgent:
 
     def _rewrite_why(self, base: str, c: CandidateItem, profile: UserProfile,
                      templates: dict[str, str]) -> str:
-        prefix = templates["why_prefix"]
-        urgency = self._urgency_framing.get(c.urgency, "")
+        # Use the full summary as the basis — it's the actual story content
+        summary = c.summary.strip()
+        if not summary:
+            summary = c.title.strip()
 
-        # Use the summary to explain why, not just category labels
-        summary_hint = c.summary[:120].rstrip(".")
-        if summary_hint:
-            context = f"{summary_hint}."
-        else:
-            context = f"Notable development in {c.topic.replace('_', ' ')}."
-
-        # Source quality and corroboration
-        tier1 = {"reuters", "ap", "bbc", "guardian", "ft"}
-        source_note = f"via {c.source}" if c.source in tier1 else f"({c.source})"
-
-        corr = ""
+        # Corroboration adds genuine editorial value
         if c.corroborated_by:
-            corr = f" Confirmed by {', '.join(c.corroborated_by[:2])}."
+            summary += f" Confirmed by {', '.join(c.corroborated_by[:2])}."
 
-        result = f"{prefix}{urgency}{context} {source_note}{corr}"
-
-        return result
+        return summary
 
     def _rewrite_changed(self, base: str, c: CandidateItem,
                          templates: dict[str, str]) -> str:

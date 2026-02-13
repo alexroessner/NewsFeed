@@ -88,7 +88,7 @@ class TelegramFormatterTests(unittest.TestCase):
         output = TelegramFormatter().format(payload)
         # New HTML format uses styled section headers
         self.assertIn("Geo Risk Alerts", output)
-        self.assertIn("europe", output)
+        self.assertIn("Europe", output)
 
     def test_trends_section(self) -> None:
         payload = _make_payload(include_trends=True)
