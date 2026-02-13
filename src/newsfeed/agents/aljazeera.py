@@ -7,6 +7,7 @@ Western-centric feeds.
 from __future__ import annotations
 
 import hashlib
+import html
 import logging
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -104,8 +105,9 @@ class AlJazeeraAgent(ResearchAgent):
             if not title:
                 continue
 
-            # Strip HTML tags from description
-            summary = self._strip_html(summary)
+            # Decode HTML entities and strip tags
+            title = html.unescape(title)
+            summary = html.unescape(self._strip_html(summary))
 
             created_at = datetime.now(timezone.utc)
             if pub_date_el is not None and pub_date_el.text:

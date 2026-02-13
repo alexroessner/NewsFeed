@@ -162,20 +162,20 @@
     "tone_templates": {
       "concise": {
         "why_prefix": "",
-        "outlook_prefix": "Outlook: ",
-        "changed_prefix": "Update: ",
+        "outlook_prefix": "",
+        "changed_prefix": "",
         "style": "Short, direct sentences. No filler. Lead with the key fact."
       },
       "analyst": {
-        "why_prefix": "Assessment: ",
-        "outlook_prefix": "Forward-looking: ",
-        "changed_prefix": "Delta: ",
+        "why_prefix": "",
+        "outlook_prefix": "",
+        "changed_prefix": "",
         "style": "Technical, evidence-anchored language. Quantify when possible."
       },
       "executive": {
-        "why_prefix": "Bottom line: ",
-        "outlook_prefix": "Strategic view: ",
-        "changed_prefix": "Key development: ",
+        "why_prefix": "",
+        "outlook_prefix": "",
+        "changed_prefix": "",
         "style": "High-level framing. Decision-relevant. Skip operational detail."
       },
       "brief": {
@@ -185,9 +185,9 @@
         "style": "Minimum viable context. One sentence per field."
       },
       "deep": {
-        "why_prefix": "Deep context: ",
-        "outlook_prefix": "Scenario analysis: ",
-        "changed_prefix": "Evolution: ",
+        "why_prefix": "",
+        "outlook_prefix": "",
+        "changed_prefix": "",
         "style": "Thorough analysis. Include nuance, uncertainty, alternative readings."
       }
     },

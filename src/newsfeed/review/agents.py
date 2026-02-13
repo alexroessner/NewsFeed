@@ -27,23 +27,25 @@ log = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────────────
 
 # Default tone templates — overridden by editorial_review.tone_templates in config
+# Tone templates — prefixes are empty because the formatter already adds field labels
+# ("Why it matters:", "Changed:", "Outlook:").  Templates control content style only.
 _DEFAULT_TONE_TEMPLATES: dict[str, dict[str, str]] = {
     "concise": {
         "why_prefix": "",
-        "outlook_prefix": "Outlook: ",
-        "changed_prefix": "Update: ",
+        "outlook_prefix": "",
+        "changed_prefix": "",
         "style": "Short, direct sentences. No filler. Lead with the key fact.",
     },
     "analyst": {
-        "why_prefix": "Assessment: ",
-        "outlook_prefix": "Forward-looking: ",
-        "changed_prefix": "Delta: ",
+        "why_prefix": "",
+        "outlook_prefix": "",
+        "changed_prefix": "",
         "style": "Technical, evidence-anchored language. Quantify when possible.",
     },
     "executive": {
-        "why_prefix": "Bottom line: ",
-        "outlook_prefix": "Strategic view: ",
-        "changed_prefix": "Key development: ",
+        "why_prefix": "",
+        "outlook_prefix": "",
+        "changed_prefix": "",
         "style": "High-level framing. Decision-relevant. Skip operational detail.",
     },
     "brief": {
@@ -53,9 +55,9 @@ _DEFAULT_TONE_TEMPLATES: dict[str, dict[str, str]] = {
         "style": "Minimum viable context. One sentence per field.",
     },
     "deep": {
-        "why_prefix": "Deep context: ",
-        "outlook_prefix": "Scenario analysis: ",
-        "changed_prefix": "Evolution: ",
+        "why_prefix": "",
+        "outlook_prefix": "",
+        "changed_prefix": "",
         "style": "Thorough analysis. Include nuance, uncertainty, alternative readings.",
     },
 }
@@ -160,29 +162,22 @@ class StyleReviewAgent:
         prefix = templates["why_prefix"]
         urgency = self._urgency_framing.get(c.urgency, "")
 
-        # Personalize: reference user's interest level in this topic
-        topic_weight = profile.topic_weights.get(c.topic, 0.0)
-        if topic_weight > 0.5:
-            relevance = "Directly aligned with your high-priority interest"
-        elif topic_weight > 0.0:
-            relevance = "Relevant to your tracked interests"
+        # Use the summary to explain why, not just category labels
+        summary_hint = c.summary[:120].rstrip(".")
+        if summary_hint:
+            context = f"{summary_hint}."
         else:
-            relevance = "Notable development"
+            context = f"Notable development in {c.topic.replace('_', ' ')}."
 
-        # Source quality context
+        # Source quality and corroboration
         tier1 = {"reuters", "ap", "bbc", "guardian", "ft"}
-        source_note = f"via {c.source}" if c.source in tier1 else f"reported by {c.source}"
+        source_note = f"via {c.source}" if c.source in tier1 else f"({c.source})"
 
-        # Corroboration context
         corr = ""
         if c.corroborated_by:
-            corr = f", confirmed by {len(c.corroborated_by)} independent source(s)"
+            corr = f" Confirmed by {', '.join(c.corroborated_by[:2])}."
 
-        result = f"{prefix}{urgency}{relevance} in {c.topic} {source_note}{corr}."
-
-        # Append persona context if available
-        if self._persona_context:
-            result += f" [{'; '.join(self._persona_context[:2])}]"
+        result = f"{prefix}{urgency}{context} {source_note}{corr}"
 
         return result
 
@@ -190,24 +185,22 @@ class StyleReviewAgent:
                          templates: dict[str, str]) -> str:
         prefix = templates["changed_prefix"]
 
-        # Generate meaningful what_changed based on candidate signals
+        # Ground the "what changed" in actual story content, not generic labels.
+        # Use the first key phrase from the title as context.
+        title_hint = c.title[:80].rstrip(".")
         parts = []
+
         if c.urgency in (UrgencyLevel.BREAKING, UrgencyLevel.CRITICAL):
-            parts.append("Rapidly developing situation")
+            parts.append(f"{title_hint} — developing now")
         elif c.lifecycle.value == "developing":
-            parts.append("New development entering coverage cycle")
-        elif c.lifecycle.value == "ongoing":
-            parts.append("Continued development with new information")
+            parts.append(f"{title_hint} — new development")
         else:
-            parts.append("Latest update in this story")
+            parts.append(title_hint)
 
         if c.corroborated_by:
-            parts.append(f"now corroborated across {len(c.corroborated_by) + 1} sources")
+            parts.append(f"confirmed by {', '.join(c.corroborated_by[:2])}")
 
-        if c.novelty_score > 0.8:
-            parts.append("high novelty signal detected")
-
-        return f"{prefix}{', '.join(parts)}."
+        return f"{prefix}{'; '.join(parts)}."
 
     def _rewrite_outlook(self, base: str, c: CandidateItem, profile: UserProfile,
                          templates: dict[str, str]) -> str:

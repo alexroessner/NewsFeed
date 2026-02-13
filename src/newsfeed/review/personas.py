@@ -40,12 +40,10 @@ class PersonaReviewStack:
         return context
 
     def refine_why(self, base: str) -> str:
-        notes = self.active_context()
-        if not notes:
-            return base
-        return f"{base} [Review lenses: {'; '.join(notes)}]"
+        # Persona notes are internal guidance for LLM review agents —
+        # they must NOT be appended to user-visible text.
+        return base
 
     def refine_outlook(self, base: str) -> str:
-        if "forecaster" in self.active_personas:
-            return f"{base} Include confidence bands and key assumption tracking."
+        # Same: confidence band instructions are internal, not output text.
         return base

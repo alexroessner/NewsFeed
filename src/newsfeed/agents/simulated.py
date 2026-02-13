@@ -23,16 +23,18 @@ class SimulatedResearchAgent:
             seed = f"{self.agent_id}:{task.request_id}:{base_topic}:{rank}".encode("utf-8")
             digest = hashlib.sha256(seed).hexdigest()
             scale = int(digest[:8], 16) / 0xFFFFFFFF
-            evidence = 0.55 + (scale * 0.45)
-            novelty = 0.45 + ((1 - scale) * 0.50)
-            preference = min(1.0, task.weighted_topics.get(base_topic, 0.2) + 0.25 + rank * 0.03)
-            pred = 0.40 + (scale * 0.45)
+            # Simulated scores are intentionally LOW — this is synthetic fallback
+            # data that should never outrank real agent output (real agents: 0.55-0.73).
+            evidence = 0.30 + (scale * 0.20)       # 0.30-0.50 (was 0.55-1.0)
+            novelty = 0.30 + ((1 - scale) * 0.25)  # 0.30-0.55 (was 0.45-0.95)
+            preference = min(0.45, task.weighted_topics.get(base_topic, 0.2) * 0.35 + 0.15)
+            pred = 0.20 + (scale * 0.20)            # 0.20-0.40 (was 0.40-0.85)
             candidates.append(
                 CandidateItem(
                     candidate_id=f"{self.agent_id}-{rank}",
-                    title=f"{base_topic.title()} signal #{rank + 1} from {self.source}",
+                    title=f"[Simulated] {base_topic.replace('_', ' ').title()} #{rank + 1} ({self.source})",
                     source=self.source,
-                    summary=f"{self.mandate}: candidate insight generated for {base_topic}.",
+                    summary=f"Simulated placeholder — {self.source} agent requires API credentials for real data.",
                     url=f"https://example.com/{self.source}/{base_topic}/{rank}",
                     topic=base_topic,
                     evidence_score=round(evidence, 3),

@@ -154,13 +154,13 @@ class BaseAgentTests(unittest.TestCase):
             "Temperature forecast for tomorrow",
             {"geopolitics": 0.9},
         )
-        # Should be baseline 0.2 with no keyword matches
-        self.assertEqual(score, 0.2)
+        # Should be baseline 0.15 with no keyword matches
+        self.assertEqual(score, 0.15)
 
     def test_score_relevance_empty_topics(self) -> None:
         agent = BBCAgent("a1", "mandate")
         score = agent._score_relevance("Some title", "Some text", {})
-        self.assertEqual(score, 0.2)
+        self.assertEqual(score, 0.15)
 
 
 class RegistryTests(unittest.TestCase):
@@ -975,28 +975,37 @@ class StyleReviewAgentTests(unittest.TestCase):
         result = agent.review(item, profile)
         # Should have rewritten why_it_matters (not the original base text)
         self.assertNotEqual(result.why_it_matters, "Base why text.")
-        self.assertIn("geopolitics", result.why_it_matters.lower())
+        # New rewrite uses summary content instead of topic labels
+        self.assertIn("summary", result.why_it_matters.lower())
 
     def test_analyst_tone_rewrite(self) -> None:
         agent = StyleReviewAgent()
         item = _make_report_item()
         profile = UserProfile(user_id="u1", tone="analyst")
         result = agent.review(item, profile)
-        self.assertIn("Assessment:", result.why_it_matters)
+        # Tone prefixes are now empty (formatter handles labels);
+        # verify rewrite happened and uses summary content
+        self.assertNotEqual(result.why_it_matters, "Base why text.")
+        self.assertIn("reuters", result.why_it_matters.lower())
 
     def test_executive_tone_rewrite(self) -> None:
         agent = StyleReviewAgent()
         item = _make_report_item()
         profile = UserProfile(user_id="u1", tone="executive")
         result = agent.review(item, profile)
-        self.assertIn("Bottom line:", result.why_it_matters)
+        # Tone prefixes are now empty (formatter handles labels);
+        # verify rewrite happened and uses summary content
+        self.assertNotEqual(result.why_it_matters, "Base why text.")
+        self.assertIn("summary", result.why_it_matters.lower())
 
     def test_high_priority_topic_personalization(self) -> None:
         agent = StyleReviewAgent()
         item = _make_report_item(topic="ai_policy")
         profile = UserProfile(user_id="u1", topic_weights={"ai_policy": 0.9})
         result = agent.review(item, profile)
-        self.assertIn("high-priority", result.why_it_matters.lower())
+        # _rewrite_why now uses summary content instead of "high-priority" template text
+        self.assertNotEqual(result.why_it_matters, "Base why text.")
+        self.assertIn("summary", result.why_it_matters.lower())
 
     def test_urgency_framing(self) -> None:
         agent = StyleReviewAgent()
@@ -1011,7 +1020,8 @@ class StyleReviewAgentTests(unittest.TestCase):
         item.candidate.corroborated_by = ["ap", "bbc"]
         profile = UserProfile(user_id="u1")
         result = agent.review(item, profile)
-        self.assertIn("corroborated", result.what_changed.lower())
+        # _rewrite_changed now uses "confirmed by" instead of "corroborated"
+        self.assertIn("confirmed by", result.what_changed.lower())
 
     def test_outlook_with_regions(self) -> None:
         agent = StyleReviewAgent()
@@ -1026,7 +1036,10 @@ class StyleReviewAgentTests(unittest.TestCase):
         item = _make_report_item()
         profile = UserProfile(user_id="u1")
         result = agent.review(item, profile)
-        self.assertIn("source-quality focus", result.why_it_matters)
+        # Persona context is no longer appended to visible output;
+        # verify the review still rewrites the text using summary content
+        self.assertNotEqual(result.why_it_matters, "Base why text.")
+        self.assertIn("reuters", result.why_it_matters.lower())
 
 
 class ClarityReviewAgentTests(unittest.TestCase):
