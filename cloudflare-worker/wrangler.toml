@@ -1,0 +1,7 @@
+name = "newsfeed-telegram-webhook"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+# Set these via: npx wrangler secret put WEBHOOK_SECRET
+#                npx wrangler secret put GITHUB_TOKEN
+#                npx wrangler secret put GITHUB_REPO

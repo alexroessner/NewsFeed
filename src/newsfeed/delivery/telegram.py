@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import re
 
 from newsfeed.models.domain import (
     BriefingType,
@@ -19,15 +20,15 @@ _URGENCY_ICON = {
 }
 
 _BRIEFING_HEADER = {
-    BriefingType.MORNING_DIGEST: "Morning Intelligence Digest",
-    BriefingType.BREAKING_ALERT: "BREAKING ALERT",
+    BriefingType.MORNING_DIGEST: "Intelligence Digest",
+    BriefingType.BREAKING_ALERT: "Intelligence Digest",
     BriefingType.EVENING_SUMMARY: "Evening Summary",
     BriefingType.DEEP_DIVE: "Deep Dive Analysis",
 }
 
 _BRIEFING_ICON = {
     BriefingType.MORNING_DIGEST: "\U0001f4cb",
-    BriefingType.BREAKING_ALERT: "\U0001f6a8",
+    BriefingType.BREAKING_ALERT: "\U0001f4cb",
     BriefingType.EVENING_SUMMARY: "\U0001f319",
     BriefingType.DEEP_DIVE: "\U0001f50d",
 }
@@ -51,6 +52,42 @@ def _section(title: str) -> str:
     pad = max(0, 28 - len(title) - 4)
     trail = "\u2500" * pad
     return f"<b>\u2500\u2500\u2500 {title} {trail}</b>"
+
+
+def _clean_summary(text: str) -> str:
+    """Clean up RSS summary artifacts (Google News multi-headline concatenations, etc.)."""
+    # Normalize non-breaking spaces (\xa0) to regular spaces first
+    normalized = text.replace("\xa0", " ")
+    # Google News RSS concatenates headlines: "Story  SourceOther story  Source2..."
+    # Split on double-space followed by a capitalized word (source name boundary)
+    parts = re.split(r"  +(?=[A-Z])", normalized, maxsplit=1)
+    cleaned = parts[0].strip()
+    # Also remove "via SourceName: " prefix from web aggregator summaries
+    cleaned = re.sub(r"^via\s+[^:]+:\s*", "", cleaned, flags=re.IGNORECASE)
+    # Cap at a readable length — enough to not need to click the link
+    if len(cleaned) > 500:
+        # Cut at last sentence boundary before 500
+        cut = cleaned[:500].rfind(".")
+        if cut > 200:
+            cleaned = cleaned[:cut + 1]
+        else:
+            cleaned = cleaned[:497] + "..."
+    return cleaned
+
+
+def _format_region(name: str) -> str:
+    """Format a region name for display.
+
+    Handles both legacy underscore-style ('middle_east') and new
+    pre-formatted strings ('Beijing, China').
+    """
+    if "_" in name:
+        return name.replace("_", " ").title()
+    # Already formatted (contains comma or uppercase) — pass through
+    if "," in name or (name and name[0].isupper()):
+        return name
+    # Single lowercase word like 'europe' — title-case it
+    return name.title()
 
 
 class TelegramFormatter:
@@ -79,7 +116,7 @@ class TelegramFormatter:
                 for risk in escalating[:4]:
                     arrow = "\u2191" if risk.escalation_delta > 0 else "\u2193"
                     lines.append(
-                        f"  \u2022 <b>{_esc(risk.region)}</b>: {risk.risk_level:.0%} "
+                        f"  \u2022 <b>{_esc(_format_region(risk.region))}</b>: {risk.risk_level:.0%} "
                         f"({arrow}{abs(risk.escalation_delta):.0%})"
                     )
 
@@ -100,18 +137,13 @@ class TelegramFormatter:
             lines.append("")
             lines.append(_section("Narrative Threads"))
             for thread in payload.threads[:5]:
-                urgency_icon = _URGENCY_ICON.get(thread.urgency, "")
-                prefix = f"{urgency_icon} " if urgency_icon else "  "
                 source_note = (
                     f" ({thread.source_count} sources)"
                     if thread.source_count > 1
                     else ""
                 )
-                conf = ""
-                if thread.confidence:
-                    conf = f" \u00b7 {thread.confidence.label()}"
                 lines.append(
-                    f"{prefix}<b>{_esc(thread.headline)}</b>{source_note}{conf}"
+                    f"  \u2022 <b>{_esc(thread.headline)}</b>{source_note}"
                 )
 
         # Intelligence brief (main stories)
@@ -122,43 +154,25 @@ class TelegramFormatter:
 
         for idx, item in enumerate(payload.items, start=1):
             c = item.candidate
-            urgency_icon = _URGENCY_ICON.get(c.urgency, "")
-            prefix = f"{urgency_icon} " if urgency_icon else ""
 
-            # Title as clickable link
+            # Title as clickable link — no urgency icons
             title_esc = _esc(c.title)
             if c.url and not c.url.startswith("https://example.com"):
                 title_line = (
-                    f'<b>{idx}. {prefix}'
+                    f'<b>{idx}. '
                     f'<a href="{_esc(c.url)}">{title_esc}</a></b>'
                 )
             else:
-                title_line = f"<b>{idx}. {prefix}{title_esc}</b>"
+                title_line = f"<b>{idx}. {title_esc}</b>"
 
             source_tag = f"<i>[{_esc(c.source)}]</i>"
             lines.append(f"{title_line} {source_tag}")
 
-            # Why it matters
-            lines.append(f"   {_esc(item.why_it_matters)}")
-
-            # What changed
-            if item.what_changed:
-                lines.append(
-                    f"   \u25b8 <i>Changed:</i> {_esc(item.what_changed)}"
-                )
-
-            # Outlook
-            if item.predictive_outlook:
-                lines.append(
-                    f"   \u25b8 <i>Outlook:</i> {_esc(item.predictive_outlook)}"
-                )
-
-            # Confidence
-            if item.confidence:
-                lines.append(
-                    f"   \u25b8 <i>Confidence:</i> {item.confidence.label()} "
-                    f"({item.confidence.low:.0%}\u2013{item.confidence.high:.0%})"
-                )
+            # Story content
+            body = c.summary.strip() if c.summary else ""
+            if body:
+                body = _clean_summary(body)
+                lines.append(f"   {_esc(body)}")
 
             # Corroboration
             if c.corroborated_by:
@@ -170,6 +184,12 @@ class TelegramFormatter:
             if item.contrarian_note:
                 lines.append(
                     f"   \u26a1 <i>{_esc(item.contrarian_note)}</i>"
+                )
+
+            # Location tags
+            if c.regions:
+                lines.append(
+                    f"   \U0001f4cd <i>{', '.join(_format_region(r) for r in c.regions[:4])}</i>"
                 )
 
             lines.append("")
@@ -218,7 +238,7 @@ class TelegramFormatter:
                 for risk in escalating[:4]:
                     arrow = "\u2191" if risk.escalation_delta > 0 else "\u2193"
                     lines.append(
-                        f"  \u2022 <b>{_esc(risk.region)}</b>: {risk.risk_level:.0%} "
+                        f"  \u2022 <b>{_esc(_format_region(risk.region))}</b>: {risk.risk_level:.0%} "
                         f"({arrow}{abs(risk.escalation_delta):.0%})"
                     )
 
@@ -237,18 +257,13 @@ class TelegramFormatter:
             lines.append("")
             lines.append(_section("Narrative Threads"))
             for thread in payload.threads[:5]:
-                urgency_icon = _URGENCY_ICON.get(thread.urgency, "")
-                prefix = f"{urgency_icon} " if urgency_icon else "  "
                 source_note = (
                     f" ({thread.source_count} sources)"
                     if thread.source_count > 1
                     else ""
                 )
-                conf = ""
-                if thread.confidence:
-                    conf = f" \u00b7 {thread.confidence.label()}"
                 lines.append(
-                    f"{prefix}<b>{_esc(thread.headline)}</b>{source_note}{conf}"
+                    f"  \u2022 <b>{_esc(thread.headline)}</b>{source_note}"
                 )
 
         if payload.items:
@@ -258,46 +273,49 @@ class TelegramFormatter:
         return "\n".join(lines).strip()
 
     def format_story_card(self, item: ReportItem, index: int) -> str:
-        """Format a single story as a standalone message card."""
+        """Format a single story as a clean, readable news card."""
         lines: list[str] = []
         c = item.candidate
-        urgency_icon = _URGENCY_ICON.get(c.urgency, "")
-        prefix = f"{urgency_icon} " if urgency_icon else ""
 
+        # Title as clickable link + source — no urgency icons/buzzwords
         title_esc = _esc(c.title)
         if c.url and not c.url.startswith("https://example.com"):
             title_line = (
-                f'<b>{index}. {prefix}'
+                f'<b>{index}. '
                 f'<a href="{_esc(c.url)}">{title_esc}</a></b>'
             )
         else:
-            title_line = f"<b>{index}. {prefix}{title_esc}</b>"
+            title_line = f"<b>{index}. {title_esc}</b>"
 
         source_tag = f"<i>[{_esc(c.source)}]</i>"
         lines.append(f"{title_line} {source_tag}")
-        lines.append(f"   {_esc(item.why_it_matters)}")
 
-        if item.what_changed:
-            lines.append(
-                f"   \u25b8 <i>Changed:</i> {_esc(item.what_changed)}"
-            )
-        if item.predictive_outlook:
-            lines.append(
-                f"   \u25b8 <i>Outlook:</i> {_esc(item.predictive_outlook)}"
-            )
-        if item.confidence:
-            lines.append(
-                f"   \u25b8 <i>Confidence:</i> {item.confidence.label()} "
-                f"({item.confidence.low:.0%}\u2013{item.confidence.high:.0%})"
+        # Main body: the actual story content — long enough to not need to click
+        body = c.summary.strip() if c.summary else ""
+        if body:
+            body = _clean_summary(body)
+            lines.append("")
+            lines.append(_esc(body))
+
+        # Contrarian signal — genuinely interesting when present
+        if item.contrarian_note:
+            lines.append("")
+            lines.append(f"\u26a1 {_esc(item.contrarian_note)}")
+
+        # Compact metadata footer: locations + corroboration
+        meta_parts: list[str] = []
+        if c.regions:
+            meta_parts.append(
+                f"\U0001f4cd {', '.join(_format_region(r) for r in c.regions[:4])}"
             )
         if c.corroborated_by:
-            lines.append(
-                f"   \u25b8 <i>Verified by:</i> {', '.join(c.corroborated_by)}"
+            meta_parts.append(
+                f"\u2713 {', '.join(c.corroborated_by[:3])}"
             )
-        if item.contrarian_note:
-            lines.append(
-                f"   \u26a1 <i>{_esc(item.contrarian_note)}</i>"
-            )
+        if meta_parts:
+            lines.append("")
+            dot_sep = " \u00b7 "
+            lines.append(f"<i>{dot_sep.join(meta_parts)}</i>")
 
         return "\n".join(lines).strip()
 
@@ -310,8 +328,6 @@ class TelegramFormatter:
             parts: list[str] = []
             if "selected_count" in meta:
                 parts.append(f"{meta['selected_count']} items")
-            if "debate_vote_count" in meta:
-                parts.append(f"{meta['debate_vote_count']} votes")
             if "thread_count" in meta:
                 parts.append(f"{meta['thread_count']} threads")
             if meta.get("emerging_trends", 0) > 0:
@@ -319,4 +335,35 @@ class TelegramFormatter:
             if parts:
                 sep = " \u2502 "
                 lines.append(f"<i>{sep.join(parts)}</i>")
+        return "\n".join(lines).strip()
+
+    def format_closing(self, payload: DeliveryPayload,
+                       topic_weights: dict[str, float] | None = None,
+                       source_weights: dict[str, float] | None = None) -> str:
+        """Format the closing message with user weightings and options."""
+        lines: list[str] = []
+        lines.append(f"<b>{_SECTION_LINE}</b>")
+
+        # Show current topic weightings
+        if topic_weights:
+            lines.append("")
+            lines.append("<b>Your Topic Weights</b>")
+            sorted_topics = sorted(topic_weights.items(), key=lambda x: x[1], reverse=True)
+            for topic, weight in sorted_topics:
+                bar_len = max(1, int(abs(weight) * 8))
+                bar = "\u2588" * bar_len
+                sign = "+" if weight > 0 else ""
+                lines.append(f"  {topic}: {sign}{weight:.1f} {bar}")
+
+        if source_weights:
+            lines.append("")
+            lines.append("<b>Source Preferences</b>")
+            for src, sw in sorted(source_weights.items(), key=lambda x: -x[1]):
+                label = "\u2191" if sw > 0 else "\u2193"
+                lines.append(f"  {src}: {label} {sw:+.1f}")
+
+        lines.append("")
+        lines.append("<i>Adjust: /feedback more [topic] or less [topic]</i>")
+        lines.append("<i>Sources: /feedback prefer [source] or demote [source]</i>")
+
         return "\n".join(lines).strip()

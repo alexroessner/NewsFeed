@@ -31,7 +31,7 @@ class EngineTests(unittest.TestCase):
 
         # Briefing type is dynamic based on urgency detection
         self.assertTrue(
-            "Morning Intelligence Digest" in output or "BREAKING ALERT" in output,
+            "Intelligence Digest" in output or "Evening Summary" in output or "Deep Dive" in output,
             "Expected a briefing header in output",
         )
 
