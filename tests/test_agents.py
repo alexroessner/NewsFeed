@@ -1413,6 +1413,11 @@ class CommunicationAgentTests(unittest.TestCase):
         self.mock_engine.preferences.get_or_create.return_value = UserProfile(
             user_id="u1", topic_weights={"geopolitics": 0.8}, max_items=10,
         )
+        # Multi-message flow: handle_request_payload returns a payload object
+        mock_payload = MagicMock()
+        mock_payload.items = []  # empty briefing for default test
+        self.mock_engine.handle_request_payload.return_value = mock_payload
+        self.mock_engine.formatter.format_header.return_value = "Header text"
         self.mock_engine.handle_request.return_value = "Briefing text here"
         self.mock_engine.show_more.return_value = [
             CandidateItem(candidate_id="c1", title="Story 1", source="reuters",
@@ -1448,8 +1453,8 @@ class CommunicationAgentTests(unittest.TestCase):
         update = {"message": {"text": "/briefing"}}
         result = self.agent.handle_update(update)
         self.assertEqual(result["action"], "briefing")
-        self.mock_engine.handle_request.assert_called_once()
-        self.mock_bot.send_briefing.assert_called_once()
+        self.mock_engine.handle_request_payload.assert_called_once()
+        self.mock_bot.send_message.assert_called()  # header + no-items message
 
     def test_handle_more_command(self) -> None:
         self.mock_bot.parse_command.return_value = {
