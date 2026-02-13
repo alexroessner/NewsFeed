@@ -185,12 +185,18 @@ class NewsFeedEngine:
         # Disabled agents (populated by optimizer or configurator)
         self._disabled_agents: set[str] = set()
 
-        # State persistence
+        # Track last briefing item topics per user (for "More/Less like this")
+        self._last_briefing_topics: dict[str, list[str]] = {}
+        # Track per-item info per user (for per-item thumbs up/down)
+        self._last_briefing_items: dict[str, list[dict]] = {}  # [{topic, source}, ...]
+
+        # State persistence — save and restore preferences, credibility, etc.
         persist_cfg = pipeline.get("persistence", {})
         self._persistence: StatePersistence | None = None
         if persist_cfg.get("enabled", False):
             state_dir = Path(persist_cfg.get("state_dir", "state"))
             self._persistence = StatePersistence(state_dir)
+            self._load_state()
 
         log.info(
             "Engine ready: %d agents, %d experts, stages=%s",
@@ -267,6 +273,14 @@ class NewsFeedEngine:
             else:
                 valid_candidates.append(c)
         all_candidates = valid_candidates
+
+        # Apply user source weights — boost/penalize preference_fit for preferred/demoted sources
+        if profile.source_weights:
+            for c in all_candidates:
+                sw = profile.source_weights.get(c.source, 0.0)
+                if sw != 0.0:
+                    # Apply as additive adjustment to preference_fit, clamped to [0, 1]
+                    c.preference_fit = round(max(0.0, min(1.0, c.preference_fit + sw * 0.15)), 3)
 
         # Stage 2: Intelligence enrichment (conditionally enabled, with error isolation)
         t0 = time.monotonic()
@@ -364,6 +378,16 @@ class NewsFeedEngine:
             geo_risks=geo_risks,
             trends=trend_snapshots,
         )
+
+        # Track which topics were actually shown (for "More/Less like this" feedback)
+        self._last_briefing_topics[user_id] = list(
+            dict.fromkeys(item.candidate.topic for item in report_items)
+        )
+        # Track per-item info for per-item rating buttons
+        self._last_briefing_items[user_id] = [
+            {"topic": item.candidate.topic, "source": item.candidate.source}
+            for item in report_items
+        ]
 
         # Persist state if enabled
         if self._persistence:
@@ -490,9 +514,17 @@ class NewsFeedEngine:
 
         return report_items
 
-    def show_more(self, user_id: str, topic: str, already_seen_ids: set[str], limit: int = 5) -> list[str]:
-        more = self.cache.get_more(user_id=user_id, topic=topic, already_seen_ids=already_seen_ids, limit=limit)
-        return [f"{c.title} ({c.source})" for c in more]
+    def last_briefing_topics(self, user_id: str) -> list[str]:
+        """Return the topics from the user's last briefing (in item order)."""
+        return self._last_briefing_topics.get(user_id, [])
+
+    def last_briefing_items(self, user_id: str) -> list[dict]:
+        """Return per-item info [{topic, source}, ...] from the user's last briefing."""
+        return self._last_briefing_items.get(user_id, [])
+
+    def show_more(self, user_id: str, topic: str, already_seen_ids: set[str], limit: int = 5) -> list[CandidateItem]:
+        """Return cached candidates the user hasn't seen yet."""
+        return self.cache.get_more(user_id=user_id, topic=topic, already_seen_ids=already_seen_ids, limit=limit)
 
     def apply_user_feedback(self, user_id: str, feedback_text: str) -> dict[str, str]:
         log.info("Feedback from user=%s: %r", user_id, feedback_text[:80])
@@ -529,6 +561,18 @@ class NewsFeedEngine:
             elif cmd.action == "max_items" and cmd.value:
                 self.preferences.apply_max_items(user_id, int(cmd.value))
                 results["max_items"] = cmd.value
+            elif cmd.action == "source_boost" and cmd.topic:
+                self.preferences.apply_source_weight(user_id, cmd.topic, 1.0)
+                results[f"source:{cmd.topic}"] = "boosted"
+            elif cmd.action == "source_demote" and cmd.topic:
+                self.preferences.apply_source_weight(user_id, cmd.topic, -1.0)
+                results[f"source:{cmd.topic}"] = "demoted"
+            elif cmd.action == "remove_region" and cmd.value:
+                self.preferences.remove_region(user_id, cmd.value)
+                results["remove_region"] = cmd.value
+            elif cmd.action == "reset":
+                self.preferences.reset(user_id)
+                results["reset"] = "all preferences reset to defaults"
 
         if results:
             self.audit.record_preference(
@@ -589,3 +633,31 @@ class NewsFeedEngine:
         self._persistence.save("trends", self.trends.snapshot())
         self._persistence.save("optimizer", self.optimizer.snapshot())
         self._persistence.save("debate_chair", self.experts.chair.snapshot())
+
+    def _load_state(self) -> None:
+        """Restore persisted state from disk on startup."""
+        if not self._persistence:
+            return
+
+        # Restore user preferences
+        prefs_data = self._persistence.load("preferences")
+        if prefs_data and isinstance(prefs_data, dict):
+            for uid, pdata in prefs_data.items():
+                profile = self.preferences.get_or_create(uid)
+                if isinstance(pdata.get("topic_weights"), dict):
+                    profile.topic_weights.update(pdata["topic_weights"])
+                if isinstance(pdata.get("source_weights"), dict):
+                    profile.source_weights.update(pdata["source_weights"])
+                if pdata.get("tone"):
+                    profile.tone = pdata["tone"]
+                if pdata.get("format"):
+                    profile.format = pdata["format"]
+                if pdata.get("max_items"):
+                    profile.max_items = int(pdata["max_items"])
+                if pdata.get("cadence"):
+                    profile.briefing_cadence = pdata["cadence"]
+                if isinstance(pdata.get("regions"), list):
+                    profile.regions_of_interest = list(pdata["regions"])
+            log.info("Restored preferences for %d users from disk", len(prefs_data))
+
+        log.info("State loaded from %s", self._persistence.state_dir)

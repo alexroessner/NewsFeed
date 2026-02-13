@@ -278,7 +278,7 @@
     "stale_after_minutes": 180
   },
   "persistence": {
-    "enabled": false,
+    "enabled": true,
     "state_dir": "state"
   },
   "api_keys": {

@@ -18,6 +18,10 @@ _FORMAT_RE = re.compile(r"\bformat\s*[:=]?\s*(bullet|sections|narrative)\b", re.
 _REGION_RE = re.compile(r"\bregion\s*[:=]?\s*(\w[\w\s]*?)(?=\b(?:tone|format|more|less|cadence)\b|[.,;]|$)", re.IGNORECASE)
 _CADENCE_RE = re.compile(r"\bcadence\s*[:=]?\s*(on_demand|morning|evening|realtime)\b", re.IGNORECASE)
 _MAX_ITEMS_RE = re.compile(r"\bmax\s*[:=]?\s*(\d+)\b", re.IGNORECASE)
+_SOURCE_PREFER_RE = re.compile(r"\b(?:prefer|trust|boost)\s+(\w+?)(?:\s+source)?(?=\b|[.,;]|$)", re.IGNORECASE)
+_SOURCE_DEMOTE_RE = re.compile(r"\b(?:demote|distrust|penalize)\s+(\w+?)(?:\s+source)?(?=\b|[.,;]|$)", re.IGNORECASE)
+_REMOVE_REGION_RE = re.compile(r"\b(?:remove|drop)\s+region\s*[:=]?\s*(\w[\w\s]*?)(?=\b|[.,;]|$)", re.IGNORECASE)
+_RESET_RE = re.compile(r"\breset\s+(?:all\s+)?preferences?\b", re.IGNORECASE)
 
 
 def _clean_topic(raw: str) -> str:
@@ -61,5 +65,20 @@ def parse_preference_commands(text: str, deltas: dict[str, float] | None = None)
     max_items = _MAX_ITEMS_RE.search(text)
     if max_items:
         commands.append(PreferenceCommand(action="max_items", value=max_items.group(1)))
+
+    for m in _SOURCE_PREFER_RE.finditer(text):
+        src = m.group(1).lower()
+        commands.append(PreferenceCommand(action="source_boost", topic=src, value="+1.0"))
+
+    for m in _SOURCE_DEMOTE_RE.finditer(text):
+        src = m.group(1).lower()
+        commands.append(PreferenceCommand(action="source_demote", topic=src, value="-1.0"))
+
+    rm_region = _REMOVE_REGION_RE.search(text)
+    if rm_region:
+        commands.append(PreferenceCommand(action="remove_region", value=_clean_topic(rm_region.group(1))))
+
+    if _RESET_RE.search(text):
+        commands.append(PreferenceCommand(action="reset"))
 
     return commands

@@ -47,6 +47,30 @@ class PreferenceStore:
         profile.max_items = max(1, min(max_items, 50))
         return profile
 
+    def apply_source_weight(self, user_id: str, source: str, delta: float) -> UserProfile:
+        profile = self.get_or_create(user_id)
+        current = profile.source_weights.get(source, 0.0)
+        profile.source_weights[source] = round(max(min(current + delta, 2.0), -2.0), 3)
+        return profile
+
+    def remove_region(self, user_id: str, region: str) -> UserProfile:
+        profile = self.get_or_create(user_id)
+        if region in profile.regions_of_interest:
+            profile.regions_of_interest.remove(region)
+        return profile
+
+    def reset(self, user_id: str) -> UserProfile:
+        """Reset all user preferences to defaults."""
+        profile = self.get_or_create(user_id)
+        profile.topic_weights.clear()
+        profile.source_weights.clear()
+        profile.regions_of_interest.clear()
+        profile.tone = "concise"
+        profile.format = "bullet"
+        profile.max_items = 10
+        profile.briefing_cadence = "on_demand"
+        return profile
+
     def snapshot(self) -> dict[str, dict]:
         result = {}
         for uid, p in self._profiles.items():

@@ -30,13 +30,16 @@ _MAX_MESSAGE_LENGTH = 4096
 
 # Command definitions for BotFather
 BOT_COMMANDS = [
+    {"command": "start", "description": "Welcome message and quick-start guide"},
     {"command": "briefing", "description": "Get your personalized intelligence briefing"},
+    {"command": "deep_dive", "description": "Extended briefing with more items (e.g. /deep_dive AI)"},
     {"command": "more", "description": "Show more stories on a topic (e.g. /more geopolitics)"},
     {"command": "feedback", "description": "Adjust preferences (e.g. /feedback more AI, less crypto)"},
     {"command": "settings", "description": "View and update your profile settings"},
-    {"command": "status", "description": "System status and last briefing info"},
     {"command": "topics", "description": "List available topics and your current weights"},
     {"command": "schedule", "description": "Set briefing schedule (e.g. /schedule morning 08:00)"},
+    {"command": "status", "description": "System status and last briefing info"},
+    {"command": "reset", "description": "Reset all preferences to defaults"},
     {"command": "help", "description": "Show available commands and usage"},
 ]
 
@@ -143,23 +146,38 @@ class TelegramBot:
             last_result = self._api_call("sendMessage", data=payload)
         return last_result
 
-    def send_briefing(self, chat_id: int | str, formatted_text: str) -> dict:
-        """Send a formatted briefing with feedback buttons."""
-        keyboard = {
-            "inline_keyboard": [
-                [
-                    {"text": "More stories", "callback_data": "cmd:more"},
-                    {"text": "Deeper analysis", "callback_data": "cmd:deep_dive"},
-                ],
-                [
-                    {"text": "More like this", "callback_data": "pref:more_similar"},
-                    {"text": "Less like this", "callback_data": "pref:less_similar"},
-                ],
-                [
-                    {"text": "Settings", "callback_data": "cmd:settings"},
-                ],
-            ]
-        }
+    def send_briefing(self, chat_id: int | str, formatted_text: str,
+                      item_count: int = 0) -> dict:
+        """Send a formatted briefing with feedback buttons.
+
+        If item_count > 0, adds per-item thumbs up/down rating rows.
+        """
+        rows: list[list[dict]] = []
+
+        # Per-item rating buttons (compact rows of up to 5 per row)
+        if item_count > 0:
+            up_row: list[dict] = []
+            down_row: list[dict] = []
+            for i in range(1, min(item_count + 1, 9)):  # Telegram max 8 buttons/row
+                up_row.append({"text": f"\U0001f44d{i}", "callback_data": f"rate:{i}:up"})
+                down_row.append({"text": f"\U0001f44e{i}", "callback_data": f"rate:{i}:down"})
+            rows.append(up_row)
+            rows.append(down_row)
+
+        rows.extend([
+            [
+                {"text": "More stories", "callback_data": "cmd:more"},
+                {"text": "Deeper analysis", "callback_data": "cmd:deep_dive"},
+            ],
+            [
+                {"text": "More like this", "callback_data": "pref:more_similar"},
+                {"text": "Less like this", "callback_data": "pref:less_similar"},
+            ],
+            [
+                {"text": "Settings", "callback_data": "cmd:settings"},
+            ],
+        ])
+        keyboard = {"inline_keyboard": rows}
         return self.send_message(chat_id, formatted_text, reply_markup=keyboard)
 
     def send_breaking_alert(self, chat_id: int | str, formatted_text: str) -> dict:
@@ -239,6 +257,15 @@ class TelegramBot:
                     "args": data[5:],
                     "text": "",
                 }
+            if data.startswith("rate:"):
+                return {
+                    "type": "rate",
+                    "chat_id": chat_id,
+                    "user_id": user_id,
+                    "command": data,  # "rate:N:up" or "rate:N:down"
+                    "args": "",
+                    "text": "",
+                }
             return None
 
         # Handle text messages
@@ -286,14 +313,26 @@ class TelegramBot:
         lines.append(f"Max items: <code>{profile.get('max_items', 10)}</code>")
         lines.append(f"Cadence: <code>{profile.get('cadence', 'on_demand')}</code>")
 
+        schedule = profile.get("schedule")
+        if schedule:
+            lines.append(f"Schedule: <code>{schedule}</code>")
+
         topics = profile.get("topic_weights", {})
         if topics:
             lines.append("")
             lines.append("<b>Topic Weights:</b>")
             for topic, weight in sorted(topics.items(), key=lambda x: x[1], reverse=True):
-                bar = "█" * int(abs(weight) * 10)
+                bar = "\u2588" * max(1, int(abs(weight) * 10))
                 sign = "+" if weight > 0 else ""
                 lines.append(f"  {topic}: {sign}{weight:.1f} {bar}")
+
+        source_weights = profile.get("source_weights", {})
+        if source_weights:
+            lines.append("")
+            lines.append("<b>Source Preferences:</b>")
+            for src, sw in sorted(source_weights.items(), key=lambda x: -x[1]):
+                label = "boosted" if sw > 0 else "demoted"
+                lines.append(f"  {src}: {label} ({sw:+.1f})")
 
         regions = profile.get("regions", [])
         if regions:
@@ -321,8 +360,12 @@ class TelegramBot:
             "• <code>tone: analyst</code> — Switch to analyst tone",
             "• <code>format: sections</code> — Switch to sections format",
             "• <code>region: middle_east</code> — Add region of interest",
+            "• <code>remove region: middle_east</code> — Remove a region",
             "• <code>cadence: morning</code> — Set daily morning briefing",
             "• <code>max: 15</code> — Set max items per briefing",
+            "• <code>prefer reuters</code> — Boost a source",
+            "• <code>demote reddit</code> — Penalize a source",
+            "• <code>reset preferences</code> — Reset all to defaults",
         ])
 
         return "\n".join(lines)
@@ -367,12 +410,13 @@ class BriefingScheduler:
     """Manages scheduled briefing delivery.
 
     Tracks per-user schedules and triggers briefing generation
-    at configured times.
+    at configured times. Also handles mute suppression.
     """
 
     def __init__(self) -> None:
         self._schedules: dict[str, dict[str, Any]] = {}
         self._last_sent: dict[str, float] = {}
+        self._muted_until: dict[str, float] = {}  # user_id -> timestamp when mute expires
 
     def set_schedule(self, user_id: str, schedule_type: str, time_str: str = "") -> str:
         """Set a briefing schedule for a user.
@@ -404,6 +448,9 @@ class BriefingScheduler:
         due: list[str] = []
 
         for user_id, schedule in self._schedules.items():
+            if self.is_muted(user_id):
+                continue  # Muted — skip
+
             if schedule["type"] == "realtime":
                 continue  # Realtime users get breaking alerts only
 
@@ -416,12 +463,32 @@ class BriefingScheduler:
 
         return due
 
+    def mute(self, user_id: str, minutes: int) -> str:
+        """Mute all alerts for a user for the given number of minutes."""
+        minutes = max(1, min(minutes, 1440))  # clamp 1 min to 24 hours
+        self._muted_until[user_id] = time.time() + (minutes * 60)
+        return f"Alerts muted for {minutes} minutes."
+
+    def is_muted(self, user_id: str) -> bool:
+        """Check if a user is currently muted."""
+        until = self._muted_until.get(user_id, 0)
+        if until and time.time() < until:
+            return True
+        # Expired — clean up
+        self._muted_until.pop(user_id, None)
+        return False
+
     def should_send_breaking(self, user_id: str) -> bool:
         """Check if a user should receive breaking alerts."""
+        if self.is_muted(user_id):
+            return False
         schedule = self._schedules.get(user_id)
         if not schedule:
             return True  # Default: send breaking alerts
         return schedule["type"] in ("realtime", "morning", "evening")
 
     def snapshot(self) -> dict:
-        return dict(self._schedules)
+        return {
+            "schedules": dict(self._schedules),
+            "muted": {uid: until for uid, until in self._muted_until.items() if time.time() < until},
+        }
