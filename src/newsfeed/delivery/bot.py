@@ -57,8 +57,8 @@ class TelegramBot:
     """
 
     def __init__(self, bot_token: str, timeout: int = 10) -> None:
-        self._token = bot_token
-        self._base_url = _API_BASE.format(token=bot_token)
+        self._token = bot_token.strip()
+        self._base_url = _API_BASE.format(token=self._token)
         self._timeout = timeout
         self._offset: int = 0  # For long polling
 
@@ -94,7 +94,7 @@ class TelegramBot:
 
             return result.get("result", {})
 
-        except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, OSError) as e:
+        except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, OSError, ValueError) as e:
             log.error("Telegram API call %s failed: %s", method, e)
             return {}
 
