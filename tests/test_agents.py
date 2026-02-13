@@ -4,6 +4,7 @@ import json
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
+from urllib.error import URLError
 
 from newsfeed.agents.aljazeera import AlJazeeraAgent
 from newsfeed.agents.arxiv import ArXivAgent
@@ -713,6 +714,233 @@ class RegistryNewAgentsTests(unittest.TestCase):
         cfg = {"id": "x1", "source": "x", "mandate": "Track social"}
         agent = create_agent(cfg, {})
         self.assertIsInstance(agent, SimulatedResearchAgent)
+
+    def test_npr_always_real(self) -> None:
+        from newsfeed.agents.npr import NPRAgent
+        cfg = {"id": "npr1", "source": "npr", "mandate": "Track US news"}
+        agent = create_agent(cfg, {})
+        self.assertIsInstance(agent, NPRAgent)
+
+    def test_cnbc_always_real(self) -> None:
+        from newsfeed.agents.cnbc import CNBCAgent
+        cfg = {"id": "cnbc1", "source": "cnbc", "mandate": "Track markets"}
+        agent = create_agent(cfg, {})
+        self.assertIsInstance(agent, CNBCAgent)
+
+    def test_france24_always_real(self) -> None:
+        from newsfeed.agents.france24 import France24Agent
+        cfg = {"id": "f241", "source": "france24", "mandate": "Track EU"}
+        agent = create_agent(cfg, {})
+        self.assertIsInstance(agent, France24Agent)
+
+    def test_techcrunch_always_real(self) -> None:
+        from newsfeed.agents.techcrunch import TechCrunchAgent
+        cfg = {"id": "tc1", "source": "techcrunch", "mandate": "Track startups"}
+        agent = create_agent(cfg, {})
+        self.assertIsInstance(agent, TechCrunchAgent)
+
+    def test_nature_always_real(self) -> None:
+        from newsfeed.agents.nature_rss import NatureAgent
+        cfg = {"id": "nat1", "source": "nature", "mandate": "Track science"}
+        agent = create_agent(cfg, {})
+        self.assertIsInstance(agent, NatureAgent)
+
+
+class GenericRSSAgentTests(unittest.TestCase):
+    """Tests for the GenericRSSAgent base class and all RSS-based agents."""
+
+    _RSS_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0">
+        <channel>
+            <title>Test Feed</title>
+            <item>
+                <title>NATO Summit Reaches Agreement</title>
+                <description>NATO leaders agreed on new defense spending targets.</description>
+                <link>https://example-source.com/nato</link>
+                <pubDate>Wed, 12 Feb 2026 10:00:00 GMT</pubDate>
+            </item>
+            <item>
+                <title>Tech Startup Raises $100M</title>
+                <description>An AI startup raised Series B funding.</description>
+                <link>https://example-source.com/startup</link>
+                <pubDate>Wed, 12 Feb 2026 09:00:00 GMT</pubDate>
+            </item>
+            <item>
+                <title>Market Rally Continues</title>
+                <description>Stocks advanced on earnings beat expectations.</description>
+                <link>https://example-source.com/markets</link>
+                <pubDate>Wed, 12 Feb 2026 08:00:00 GMT</pubDate>
+            </item>
+        </channel>
+    </rss>"""
+
+    def _mock_urlopen(self, mock_urlopen):
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = self._RSS_TEMPLATE.encode("utf-8")
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_resp
+
+    def setUp(self) -> None:
+        self.task = ResearchTask(
+            request_id="r1", user_id="u1", prompt="test",
+            weighted_topics={"geopolitics": 0.8, "technology": 0.5, "markets": 0.4},
+        )
+
+    @patch("newsfeed.agents.rss_generic.urlopen")
+    def test_npr_parses_rss(self, mock_urlopen) -> None:
+        from newsfeed.agents.npr import NPRAgent
+        self._mock_urlopen(mock_urlopen)
+        agent = NPRAgent("npr1", "Track US news")
+        items = agent._fetch_feed("world", "https://feeds.npr.org/1004/rss.xml", self.task)
+        self.assertEqual(len(items), 3)
+        self.assertEqual(items[0].source, "npr")
+        self.assertEqual(items[0].evidence_score, 0.80)
+        self.assertTrue(items[0].candidate_id.startswith("npr1-"))
+
+    @patch("newsfeed.agents.rss_generic.urlopen")
+    def test_cnbc_parses_rss(self, mock_urlopen) -> None:
+        from newsfeed.agents.cnbc import CNBCAgent
+        self._mock_urlopen(mock_urlopen)
+        agent = CNBCAgent("cnbc1", "Track markets")
+        items = agent._fetch_feed("top", "https://cnbc.example.com/rss", self.task)
+        self.assertEqual(len(items), 3)
+        self.assertEqual(items[0].source, "cnbc")
+        self.assertEqual(items[0].evidence_score, 0.76)
+
+    @patch("newsfeed.agents.rss_generic.urlopen")
+    def test_france24_parses_rss(self, mock_urlopen) -> None:
+        from newsfeed.agents.france24 import France24Agent
+        self._mock_urlopen(mock_urlopen)
+        agent = France24Agent("f241", "Track EU")
+        items = agent._fetch_feed("europe", "https://france24.example.com/rss", self.task)
+        self.assertEqual(len(items), 3)
+        self.assertEqual(items[0].source, "france24")
+        self.assertEqual(items[0].evidence_score, 0.74)
+
+    @patch("newsfeed.agents.rss_generic.urlopen")
+    def test_techcrunch_parses_rss(self, mock_urlopen) -> None:
+        from newsfeed.agents.techcrunch import TechCrunchAgent
+        self._mock_urlopen(mock_urlopen)
+        agent = TechCrunchAgent("tc1", "Track startups")
+        items = agent._fetch_feed("top", "https://techcrunch.com/feed/", self.task)
+        self.assertEqual(len(items), 3)
+        self.assertEqual(items[0].source, "techcrunch")
+        self.assertEqual(items[0].evidence_score, 0.70)
+
+    @patch("newsfeed.agents.nature_rss.urlopen")
+    def test_nature_parses_rdf_rss(self, mock_urlopen) -> None:
+        from newsfeed.agents.nature_rss import NatureAgent
+        rdf_xml = """<?xml version="1.0" encoding="UTF-8"?>
+        <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+                 xmlns="http://purl.org/rss/1.0/"
+                 xmlns:dc="http://purl.org/dc/elements/1.1/"
+                 xmlns:content="http://purl.org/rss/1.0/modules/content/">
+            <channel><title>Nature</title></channel>
+            <item rdf:about="https://www.nature.com/articles/test1">
+                <title>Quantum Computing Breakthrough</title>
+                <link>https://www.nature.com/articles/test1</link>
+                <content:encoded><![CDATA[<p>A major advance in quantum error correction.</p>]]></content:encoded>
+                <dc:date>2026-02-12</dc:date>
+            </item>
+            <item rdf:about="https://www.nature.com/articles/test2">
+                <title>Climate Model Predicts Faster Warming</title>
+                <link>https://www.nature.com/articles/test2</link>
+                <content:encoded><![CDATA[New models suggest accelerated warming trends.]]></content:encoded>
+                <dc:date>2026-02-11</dc:date>
+            </item>
+        </rdf:RDF>"""
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = rdf_xml.encode("utf-8")
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_resp
+        agent = NatureAgent("nat1", "Track science")
+        items = agent._fetch_feed("top", "https://www.nature.com/nature.rss", self.task)
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0].source, "nature")
+        self.assertEqual(items[0].evidence_score, 0.88)
+        self.assertEqual(items[0].title, "Quantum Computing Breakthrough")
+        self.assertIn("quantum error correction", items[0].summary)
+
+    @patch("newsfeed.agents.rss_generic.urlopen")
+    def test_generic_rss_deduplicates(self, mock_urlopen) -> None:
+        """Duplicate titles across feeds should be deduplicated."""
+        from newsfeed.agents.npr import NPRAgent
+        self._mock_urlopen(mock_urlopen)
+        agent = NPRAgent("npr1", "Track news")
+        # run() fetches multiple feeds — with same mock data, titles repeat
+        results = agent.run(self.task, top_k=10)
+        titles = [r.title for r in results]
+        self.assertEqual(len(titles), len(set(t.lower().strip() for t in titles)))
+
+    def test_generic_rss_select_feeds_includes_first(self) -> None:
+        """First feed should always be included in selection."""
+        from newsfeed.agents.npr import NPRAgent
+        agent = NPRAgent("npr1", "Track news")
+        feeds = agent._select_feeds({"geopolitics": 0.9})
+        self.assertIn("top", feeds)
+
+    def test_generic_rss_select_feeds_limits(self) -> None:
+        """Feed selection should respect max_feeds limit."""
+        from newsfeed.agents.npr import NPRAgent
+        agent = NPRAgent("npr1", "Track news")
+        feeds = agent._select_feeds({"geopolitics": 0.9, "technology": 0.8, "markets": 0.7, "science": 0.6})
+        self.assertLessEqual(len(feeds), 4)  # NPR max_feeds=4
+
+    @patch("newsfeed.agents.rss_generic.urlopen")
+    def test_generic_rss_handles_network_error(self, mock_urlopen) -> None:
+        from newsfeed.agents.npr import NPRAgent
+        mock_urlopen.side_effect = URLError("Connection refused")
+        agent = NPRAgent("npr1", "Track news")
+        items = agent._fetch_feed("top", "https://feeds.npr.org/1001/rss.xml", self.task)
+        self.assertEqual(items, [])
+
+    @patch("newsfeed.agents.rss_generic.urlopen")
+    def test_generic_rss_handles_malformed_xml(self, mock_urlopen) -> None:
+        from newsfeed.agents.npr import NPRAgent
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b"<not valid xml"
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_resp
+        agent = NPRAgent("npr1", "Track news")
+        items = agent._fetch_feed("top", "https://feeds.npr.org/1001/rss.xml", self.task)
+        self.assertEqual(items, [])
+
+    def test_generic_rss_strip_html(self) -> None:
+        from newsfeed.agents.rss_generic import GenericRSSAgent
+        self.assertEqual(GenericRSSAgent._strip_html("<p>Hello <b>world</b></p>"), "Hello world")
+        self.assertEqual(GenericRSSAgent._strip_html("No tags here"), "No tags here")
+
+    @patch("newsfeed.agents.rss_generic.urlopen")
+    def test_generic_rss_novelty_decreases(self, mock_urlopen) -> None:
+        """Novelty score should decrease for items lower in the feed."""
+        from newsfeed.agents.npr import NPRAgent
+        self._mock_urlopen(mock_urlopen)
+        agent = NPRAgent("npr1", "Track news")
+        items = agent._fetch_feed("world", "https://feeds.npr.org/1004/rss.xml", self.task)
+        self.assertGreater(items[0].novelty_score, items[2].novelty_score)
+
+    @patch("newsfeed.agents.rss_generic.urlopen")
+    def test_generic_rss_html_entities_decoded(self, mock_urlopen) -> None:
+        """HTML entities in RSS should be decoded."""
+        from newsfeed.agents.npr import NPRAgent
+        rss = """<?xml version="1.0"?>
+        <rss><channel><item>
+            <title>Tom &amp; Jerry&#039;s Return</title>
+            <description>A &quot;classic&quot; show</description>
+            <link>https://example.com/test</link>
+        </item></channel></rss>"""
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = rss.encode("utf-8")
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_resp
+        agent = NPRAgent("npr1", "Track news")
+        items = agent._fetch_feed("top", "https://feeds.npr.org/1001/rss.xml", self.task)
+        self.assertEqual(items[0].title, "Tom & Jerry's Return")
+        self.assertIn('"classic"', items[0].summary)
 
 
 class NewExpertCouncilTests(unittest.TestCase):

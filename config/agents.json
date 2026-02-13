@@ -35,7 +35,12 @@
     {"id": "gdelt_agent", "source": "gdelt", "mandate": "Leverage GDELT global event monitoring for early crisis detection, conflict tracking, and cross-border escalation signals across 100+ languages"},
     {"id": "web_agent_discovery", "source": "web", "mandate": "Broad open-web discovery via Google News RSS for stories that fall outside individual source agent coverage"},
     {"id": "web_agent_verification", "source": "web", "mandate": "Cross-reference search to verify and corroborate claims from social and tier-2 sources against mainstream coverage"},
-    {"id": "web_agent_emerging", "source": "web", "mandate": "Emerging topic expansion — search for developing stories with low current coverage but rising signals"}
+    {"id": "web_agent_emerging", "source": "web", "mandate": "Emerging topic expansion — search for developing stories with low current coverage but rising signals"},
+    {"id": "news_agent_npr", "source": "npr", "mandate": "Monitor NPR across 7 topic feeds for US domestic policy, international affairs, science, and public-interest coverage with strong editorial standards"},
+    {"id": "news_agent_cnbc", "source": "cnbc", "mandate": "Track CNBC market signals — earnings, central bank moves, economic data releases, and sector analysis for market-moving intelligence"},
+    {"id": "news_agent_france24", "source": "france24", "mandate": "Capture France 24 European and francophone perspective on global events, especially Africa, Middle East, and EU policy underrepresented in Anglo-American feeds"},
+    {"id": "news_agent_techcrunch", "source": "techcrunch", "mandate": "Surface TechCrunch startup and technology industry signals — funding rounds, product launches, acquisitions, and industry shifts"},
+    {"id": "news_agent_nature", "source": "nature", "mandate": "Monitor Nature journal for high-impact scientific breakthroughs, peer-reviewed research findings, and editorial analysis on research significance"}
   ],
   "expert_agents": [
     {
@@ -65,19 +70,22 @@
     }
   ],
   "topic_capabilities": {
-    "geopolitics": ["reuters", "ap", "bbc", "guardian", "ft", "aljazeera", "gdelt", "x", "reddit", "web"],
-    "ai_policy": ["arxiv", "hackernews", "x", "reddit", "guardian", "web", "reuters", "bbc"],
-    "technology": ["hackernews", "arxiv", "x", "reddit", "web", "guardian", "bbc"],
-    "markets": ["ft", "reuters", "x", "web", "reddit", "hackernews", "bbc"],
-    "crypto": ["x", "reddit", "web", "hackernews", "ft"],
-    "climate": ["guardian", "bbc", "reuters", "ap", "web", "reddit", "arxiv"],
-    "science": ["arxiv", "hackernews", "guardian", "bbc", "reddit", "web"],
-    "middle_east": ["aljazeera", "bbc", "reuters", "ap", "guardian", "gdelt", "x"],
-    "africa": ["aljazeera", "bbc", "reuters", "gdelt", "guardian", "web"]
+    "geopolitics": ["reuters", "ap", "bbc", "guardian", "ft", "aljazeera", "gdelt", "x", "reddit", "web", "npr", "france24"],
+    "ai_policy": ["arxiv", "hackernews", "x", "reddit", "guardian", "web", "reuters", "bbc", "techcrunch"],
+    "technology": ["hackernews", "arxiv", "x", "reddit", "web", "guardian", "bbc", "techcrunch", "cnbc"],
+    "markets": ["ft", "reuters", "x", "web", "reddit", "hackernews", "bbc", "cnbc"],
+    "crypto": ["x", "reddit", "web", "hackernews", "ft", "cnbc"],
+    "climate": ["guardian", "bbc", "reuters", "ap", "web", "reddit", "arxiv", "npr", "nature"],
+    "science": ["arxiv", "hackernews", "guardian", "bbc", "reddit", "web", "nature", "npr"],
+    "middle_east": ["aljazeera", "bbc", "reuters", "ap", "guardian", "gdelt", "x", "france24"],
+    "africa": ["aljazeera", "bbc", "reuters", "gdelt", "guardian", "web", "france24"],
+    "health": ["bbc", "guardian", "reuters", "ap", "npr", "nature", "web"]
   },
   "source_priority": {
     "reuters": 0.95, "ap": 0.93, "bbc": 0.90, "guardian": 0.88, "ft": 0.90,
-    "aljazeera": 0.80, "arxiv": 0.78, "hackernews": 0.65, "reddit": 0.58,
+    "aljazeera": 0.80, "npr": 0.82, "cnbc": 0.78, "france24": 0.76,
+    "nature": 0.85, "techcrunch": 0.68,
+    "arxiv": 0.78, "hackernews": 0.65, "reddit": 0.58,
     "x": 0.55, "gdelt": 0.60, "web": 0.50
   },
   "review_agents": [
