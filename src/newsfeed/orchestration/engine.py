@@ -9,6 +9,7 @@ from pathlib import Path
 from newsfeed.agents.base import ResearchAgent
 from newsfeed.agents.experts import ExpertCouncil
 from newsfeed.agents.registry import create_agent
+from newsfeed.db.analytics import AnalyticsDB
 from newsfeed.delivery.telegram import TelegramFormatter
 from newsfeed.intelligence.clustering import StoryClustering
 from newsfeed.intelligence.enrichment import ArticleEnricher
@@ -212,6 +213,11 @@ class NewsFeedEngine:
             self._persistence = StatePersistence(state_dir)
             self._load_state()
 
+        # Analytics database — persistent SQLite for ALL user data collection
+        analytics_dir = Path(persist_cfg.get("state_dir", "state"))
+        analytics_dir.mkdir(parents=True, exist_ok=True)
+        self.analytics = AnalyticsDB(analytics_dir / "analytics.db")
+
         log.info(
             "Engine ready: %d agents, %d experts, stages=%s",
             len(config.get("research_agents", [])),
@@ -254,6 +260,9 @@ class NewsFeedEngine:
         # Override with caller-provided topics if specified
         if weighted_topics:
             task.weighted_topics = weighted_topics
+
+        # Analytics: record request start
+        self.analytics.record_request_start(request_id, user_id, prompt, task.weighted_topics, limit)
 
         # Self-optimization: apply any pending recommendations before research
         opt_actions = self.optimizer.apply_recommendations()
@@ -332,6 +341,16 @@ class NewsFeedEngine:
         # Update optimizer with per-agent selection data
         for c in selected:
             self.optimizer.record_agent_selection(c.discovered_by, 1)
+
+        # Analytics: record all candidates, votes, and agent performance
+        self.analytics.record_candidates(request_id, all_candidates, selected_ids)
+        self.analytics.record_expert_votes(request_id, debate.votes)
+        for agent_id, count in by_agent.items():
+            agent_selected = sum(1 for c in selected if c.discovered_by == agent_id)
+            self.analytics.record_agent_performance(
+                request_id, agent_id, count, agent_selected,
+                research_ms / max(len(by_agent), 1),
+            )
 
         dominant_topic = max(task.weighted_topics, key=task.weighted_topics.get, default="general")
         self.cache.put(user_id, dominant_topic, reserve)
@@ -435,6 +454,21 @@ class NewsFeedEngine:
             request_id, user_id, len(report_items),
             briefing_type.value, lifecycle.total_elapsed(),
         )
+
+        # Analytics: record full briefing + intelligence snapshots
+        self.analytics.record_briefing(request_id, user_id, payload)
+        self.analytics.record_request_complete(
+            request_id, len(all_candidates), len(selected),
+            briefing_type.value, lifecycle.total_elapsed(),
+        )
+        if geo_risks:
+            self.analytics.record_georisk_snapshot(request_id, geo_risks)
+        if trend_snapshots:
+            self.analytics.record_trend_snapshot(request_id, trend_snapshots)
+        self.analytics.record_credibility_snapshot(request_id, self.credibility.snapshot())
+        self.analytics.record_expert_snapshot(request_id, self.experts.chair.snapshot())
+        # Snapshot user profile after briefing
+        self.analytics.record_profile_snapshot(user_id, self.preferences.snapshot().get(user_id, {}))
 
         log.info("Report generated: %d items, briefing=%s", len(report_items), briefing_type.value)
         return payload
@@ -620,6 +654,13 @@ class NewsFeedEngine:
                     self._persistence.save("preferences", self.preferences.snapshot())
                 except Exception:
                     log.exception("Failed to persist preferences after feedback")
+
+        # Analytics: record feedback and each preference change
+        self.analytics.record_feedback(user_id, feedback_text, results)
+        for key, val in results.items():
+            self.analytics.record_preference_change(
+                user_id, "feedback", key, None, val, source="user_feedback",
+            )
 
         log.info("Applied %d updates for user=%s", len(results), user_id)
         return results
