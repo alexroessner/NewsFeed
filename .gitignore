@@ -4,3 +4,4 @@ __pycache__/
 config/secrets.json
 .env
 state/
+live_test*.py
