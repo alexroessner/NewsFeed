@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -32,7 +33,9 @@ from newsfeed.models.domain import (
     configure_scoring,
     validate_candidate,
 )
+from newsfeed.orchestration.audit import AuditTrail
 from newsfeed.orchestration.communication import CommunicationAgent
+from newsfeed.orchestration.configurator import SystemConfigurator
 from newsfeed.orchestration.orchestrator import OrchestratorAgent, RequestStage
 from newsfeed.orchestration.optimizer import SystemOptimizationAgent
 from newsfeed.review.agents import ClarityReviewAgent, StyleReviewAgent
@@ -49,8 +52,6 @@ def _run_sync(coro: object) -> object:
         loop = None
 
     if loop is not None and loop.is_running():
-        # Already inside an async context — run agents synchronously to avoid
-        # nested event-loop errors.
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             return pool.submit(asyncio.run, coro).result()
@@ -99,6 +100,7 @@ class NewsFeedEngine:
             self._scheduler = BriefingScheduler()
             self._comm_agent = CommunicationAgent(
                 engine=self, bot=self._bot, scheduler=self._scheduler,
+                default_topics=pipeline.get("default_topics"),
             )
             log.info("Telegram bot + communication agent initialized")
 
@@ -109,26 +111,36 @@ class NewsFeedEngine:
             persona_notes=personas.get("persona_notes", {}),
         )
 
-        # Review agents (editorial layer)
+        # Review agents (editorial layer) with config-driven templates
         llm_key = api_keys.get("anthropic_api_key", "")
         llm_model = ec_cfg.get("llm_model", "claude-sonnet-4-5-20250929")
         llm_base = ec_cfg.get("llm_base_url", "https://api.anthropic.com/v1")
+        editorial_cfg = pipeline.get("editorial_review", {})
         self._style_reviewer = StyleReviewAgent(
             persona_context=self.review_stack.active_context(),
             llm_api_key=llm_key, llm_model=llm_model, llm_base_url=llm_base,
+            editorial_cfg=editorial_cfg,
         )
         self._clarity_reviewer = ClarityReviewAgent(
             llm_api_key=llm_key, llm_model=llm_model, llm_base_url=llm_base,
+            editorial_cfg=editorial_cfg,
         )
 
-        # Orchestrator agent (lifecycle management)
+        # Orchestrator agent (lifecycle management + config-driven routing)
         self.orchestrator = OrchestratorAgent(
             agent_configs=config.get("research_agents", []),
             pipeline_cfg=pipeline,
+            agents_cfg=config,
         )
 
-        # System optimization agent (health monitoring)
+        # System optimization agent (health monitoring + self-tuning)
         self.optimizer = SystemOptimizationAgent()
+
+        # Audit trail (full decision tracking)
+        self.audit = AuditTrail()
+
+        # Universal configurator (plain-text config changes)
+        self.configurator = SystemConfigurator(pipeline, config, personas)
 
         # Intelligence modules with full config propagation
         intel_cfg = pipeline.get("intelligence", {})
@@ -170,6 +182,9 @@ class NewsFeedEngine:
         self._bt_critical_min = bt.get("breaking_alert_critical_min", 1)
         self._bt_breaking_min = bt.get("breaking_alert_breaking_min", 2)
 
+        # Disabled agents (populated by optimizer or configurator)
+        self._disabled_agents: set[str] = set()
+
         # State persistence
         persist_cfg = pipeline.get("persistence", {})
         self._persistence: StatePersistence | None = None
@@ -188,6 +203,10 @@ class NewsFeedEngine:
         api_keys = self.pipeline.get("api_keys", {})
         agents = []
         for a in self.config.get("research_agents", []):
+            agent_id = a.get("id", "")
+            # Skip agents disabled by optimizer or configurator
+            if agent_id in self._disabled_agents or self.optimizer.is_agent_disabled(agent_id):
+                continue
             agent = create_agent(a, api_keys)
             agents.append(agent)
         return agents
@@ -211,16 +230,33 @@ class NewsFeedEngine:
 
         # Orchestrator compiles brief and tracks lifecycle
         task, lifecycle = self.orchestrator.compile_brief(user_id, prompt, profile, limit)
+        request_id = task.request_id
         # Override with caller-provided topics if specified
         if weighted_topics:
             task.weighted_topics = weighted_topics
 
+        # Self-optimization: apply any pending recommendations before research
+        opt_actions = self.optimizer.apply_recommendations()
+        for action in opt_actions:
+            self.audit.record_config_change(request_id, "optimizer", None, action, "system_optimization_agent")
+
         # Stage 1: Research fan-out
         lifecycle.advance(RequestStage.RESEARCHING)
         top_k = self.pipeline.get("limits", {}).get("top_discoveries_per_research_agent", 5)
+        t0 = time.monotonic()
         all_candidates = self._run_research(task, top_k)
+        research_ms = (time.monotonic() - t0) * 1000
         self.orchestrator.record_research_results(lifecycle, len(all_candidates))
-        log.info("Research produced %d candidates", len(all_candidates))
+        self.optimizer.record_stage_run("research", research_ms)
+        log.info("Research produced %d candidates in %.0fms", len(all_candidates), research_ms)
+
+        # Audit: record per-agent contributions
+        by_agent: dict[str, int] = {}
+        for c in all_candidates:
+            by_agent[c.discovered_by] = by_agent.get(c.discovered_by, 0) + 1
+        for agent_id, count in by_agent.items():
+            self.audit.record_research(request_id, agent_id, "", count, research_ms / max(len(by_agent), 1))
+            self.optimizer.record_agent_run(agent_id, "", count, research_ms / max(len(by_agent), 1))
 
         # Validate candidates from agents
         valid_candidates: list[CandidateItem] = []
@@ -233,13 +269,36 @@ class NewsFeedEngine:
         all_candidates = valid_candidates
 
         # Stage 2: Intelligence enrichment (conditionally enabled, with error isolation)
+        t0 = time.monotonic()
         all_candidates = self._run_intelligence(all_candidates)
+        intel_ms = (time.monotonic() - t0) * 1000
+        self.optimizer.record_stage_run("intelligence", intel_ms)
 
-        # Stage 3: Expert council selection (with arbitration)
+        # Stage 3: Expert council selection (with arbitration + weighted voting)
         lifecycle.advance(RequestStage.EXPERT_REVIEW)
+        t0 = time.monotonic()
         selected, reserve, debate = self.experts.select(all_candidates, limit)
+        expert_ms = (time.monotonic() - t0) * 1000
         self.orchestrator.record_selection(lifecycle, len(selected))
+        self.optimizer.record_stage_run("expert_council", expert_ms)
         log.info("Expert council: %d selected, %d reserve, %d votes", len(selected), len(reserve), len(debate.votes))
+
+        # Audit: record all votes
+        selected_ids = {c.candidate_id for c in selected}
+        for vote in debate.votes:
+            self.audit.record_vote(
+                request_id, vote.expert_id, vote.candidate_id,
+                vote.keep, vote.confidence, vote.rationale, vote.risk_note,
+                arbitrated="arbitration" in vote.rationale.lower(),
+            )
+        # Audit: record selection decisions
+        for c in all_candidates:
+            is_selected = c.candidate_id in selected_ids
+            reason = "Accepted by expert council" if is_selected else "Below vote threshold or deduplicated"
+            self.audit.record_selection(request_id, c.candidate_id, c.title, is_selected, reason, c.composite_score())
+        # Update optimizer with per-agent selection data
+        for c in selected:
+            self.optimizer.record_agent_selection(c.discovered_by, 1)
 
         dominant_topic = max(task.weighted_topics, key=task.weighted_topics.get, default="general")
         self.cache.put(user_id, dominant_topic, reserve)
@@ -270,7 +329,10 @@ class NewsFeedEngine:
 
         # Stage 7: Report assembly with editorial review
         lifecycle.advance(RequestStage.EDITORIAL_REVIEW)
-        report_items = self._assemble_report(selected, threads, profile)
+        t0 = time.monotonic()
+        report_items = self._assemble_report(selected, threads, profile, request_id)
+        review_ms = (time.monotonic() - t0) * 1000
+        self.optimizer.record_stage_run("editorial_review", review_ms)
 
         # Stage 8: Determine briefing type
         briefing_type = self._determine_briefing_type(selected)
@@ -295,6 +357,7 @@ class NewsFeedEngine:
                 "geo_risk_regions": len(geo_risks),
                 "emerging_trends": sum(1 for t in trend_snapshots if t.is_emerging),
                 "intelligence_stages": active_stages,
+                "expert_influence": {eid: f"{inf:.2f}" for eid, inf, _ in self.experts.chair.rankings()},
             },
             briefing_type=briefing_type,
             threads=threads,
@@ -312,6 +375,12 @@ class NewsFeedEngine:
         # Record completion in orchestrator
         lifecycle.advance(RequestStage.FORMATTING)
         self.orchestrator.record_completion(lifecycle)
+
+        # Audit: delivery record
+        self.audit.record_delivery(
+            request_id, user_id, len(report_items),
+            briefing_type.value, lifecycle.total_elapsed(),
+        )
 
         log.info("Report generated: %d items, briefing=%s", len(report_items), briefing_type.value)
         return self.formatter.format(payload)
@@ -347,7 +416,8 @@ class NewsFeedEngine:
         return candidates
 
     def _assemble_report(self, selected: list[CandidateItem], threads: list,
-                         profile: UserProfile | None = None) -> list[ReportItem]:
+                         profile: UserProfile | None = None,
+                         request_id: str = "") -> list[ReportItem]:
         """Assemble report items from selected candidates, then apply editorial review."""
         report_items = []
         adjacent_bounds = self.pipeline.get("limits", {}).get("adjacent_reads_per_item", {"min": 2, "max": 3})
@@ -399,14 +469,24 @@ class NewsFeedEngine:
         if profile is None:
             profile = UserProfile(user_id="default")
         for item in report_items:
+            cid = item.candidate.candidate_id
+            # Style review with audit
+            before_why = item.why_it_matters
             try:
                 self._style_reviewer.review(item, profile)
             except Exception:
-                log.exception("Style review failed for %s", item.candidate.candidate_id)
+                log.exception("Style review failed for %s", cid)
+            if request_id:
+                self.audit.record_review(request_id, "review_agent_style", cid, "why_it_matters", before_why, item.why_it_matters)
+
+            # Clarity review with audit
+            before_outlook = item.predictive_outlook
             try:
                 self._clarity_reviewer.review(item, profile)
             except Exception:
-                log.exception("Clarity review failed for %s", item.candidate.candidate_id)
+                log.exception("Clarity review failed for %s", cid)
+            if request_id:
+                self.audit.record_review(request_id, "review_agent_clarity", cid, "predictive_outlook", before_outlook, item.predictive_outlook)
 
         return report_items
 
@@ -417,8 +497,18 @@ class NewsFeedEngine:
     def apply_user_feedback(self, user_id: str, feedback_text: str) -> dict[str, str]:
         log.info("Feedback from user=%s: %r", user_id, feedback_text[:80])
         results: dict[str, str] = {}
-        commands = parse_preference_commands(feedback_text, deltas=self._preference_deltas)
 
+        # First: try universal configurator for system-level changes
+        config_changes = self.configurator.parse_and_apply(feedback_text)
+        for change in config_changes:
+            results[change.path] = str(change.new_value)
+            self.audit.record_config_change(
+                f"feedback-{user_id}", change.path,
+                change.old_value, change.new_value, "user_command",
+            )
+
+        # Then: preference commands for user-level changes
+        commands = parse_preference_commands(feedback_text, deltas=self._preference_deltas)
         for cmd in commands:
             if cmd.action == "topic_delta" and cmd.topic and cmd.value:
                 delta = float(cmd.value)
@@ -440,7 +530,13 @@ class NewsFeedEngine:
                 self.preferences.apply_max_items(user_id, int(cmd.value))
                 results["max_items"] = cmd.value
 
-        log.info("Applied %d preference updates for user=%s", len(results), user_id)
+        if results:
+            self.audit.record_preference(
+                f"feedback-{user_id}", user_id,
+                "multi_update", "; ".join(f"{k}={v}" for k, v in results.items()),
+            )
+
+        log.info("Applied %d updates for user=%s", len(results), user_id)
         return results
 
     def _build_assumptions(self, c) -> list[str]:
@@ -479,6 +575,9 @@ class NewsFeedEngine:
             "cache_entries": sum(len(v) for v in self.cache._entries.values()),
             "orchestrator_metrics": self.orchestrator.metrics(),
             "optimizer_health": self.optimizer.health_report(),
+            "audit_stats": self.audit.stats(),
+            "expert_influence": self.experts.chair.snapshot(),
+            "config_changes": len(self.configurator.history()),
         }
 
     def _save_state(self) -> None:
@@ -489,3 +588,4 @@ class NewsFeedEngine:
         self._persistence.save("georisk", self.georisk.snapshot())
         self._persistence.save("trends", self.trends.snapshot())
         self._persistence.save("optimizer", self.optimizer.snapshot())
+        self._persistence.save("debate_chair", self.experts.chair.snapshot())

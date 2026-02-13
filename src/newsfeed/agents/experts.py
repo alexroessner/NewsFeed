@@ -1,9 +1,9 @@
-"""Expert council agents — deeply-prompted specialist personas for candidate evaluation.
+"""Expert council agents with debate chair, weighted voting, and audit integration.
 
-Each expert agent evaluates candidates through a distinct analytical lens.
-When backed by an LLM API, each expert generates genuine reasoning and
-risk assessments. Without an API, they use sophisticated heuristic scoring
-calibrated to their specialist domain.
+Each expert evaluates candidates through a distinct analytical lens.
+LLM-backed experts use compressed parametric prompts; heuristic experts
+use calibrated domain-specific scoring. The DebateChair manages flow,
+tracks expert influence scores, and produces auditable decisions.
 """
 from __future__ import annotations
 
@@ -22,177 +22,155 @@ log = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Expert persona prompts — used when backed by an LLM
+# Compressed parametric expert prompts — shared template + per-expert spec
 # ──────────────────────────────────────────────────────────────────────
 
-EXPERT_PERSONAS: dict[str, dict[str, Any]] = {
-    "expert_quality_agent": {
-        "name": "Source Quality & Evidence Analyst",
-        "system_prompt": (
-            "You are the Source Quality & Evidence Analyst on an intelligence editorial board. "
-            "Your sole responsibility is evaluating the EVIDENTIAL STRENGTH and SOURCE RELIABILITY "
-            "of news candidates.\n\n"
-            "## Your Evaluation Framework\n"
-            "1. **Source Tier Assessment**: Is the source tier-1 (Reuters, AP, BBC, Guardian, FT), "
-            "tier-2 (Reddit, X, web aggregators), or unverified? Tier-1 sources start at 0.85 "
-            "reliability; tier-2 at 0.55.\n"
-            "2. **Evidence Strength**: Does the candidate cite primary sources, named officials, "
-            "verifiable data, or documents? Or is it speculation, unnamed sources, or rumor?\n"
-            "3. **Corroboration Check**: Is this story corroborated by independent sources? "
-            "Cross-source confirmation dramatically increases confidence.\n"
-            "4. **Recency & Freshness**: How recent is the information? Stale stories with no "
-            "new developments score lower.\n"
-            "5. **Bias Awareness**: Account for known source biases (editorial lean, financial "
-            "incentives, state-affiliated media).\n\n"
-            "## Output\n"
-            "For each candidate, provide:\n"
-            "- keep: true/false (should this survive quality gate?)\n"
-            "- confidence: 0.0-1.0 (how confident are you in your assessment?)\n"
-            "- rationale: 1-2 sentence explanation\n"
-            "- risk_note: What could make this assessment wrong?"
-        ),
-        "criteria": ["source_quality", "evidence_strength", "corroboration", "recency"],
-        "weights": {
-            "evidence": 0.40,
-            "source_tier": 0.30,
-            "corroboration": 0.20,
-            "recency": 0.10,
-        },
-    },
+_EXPERT_PREAMBLE = (
+    "You are a specialist analyst on a news intelligence editorial board. "
+    "Evaluate each candidate and respond ONLY in JSON: "
+    '{{"keep":bool,"confidence":0.0-1.0,"rationale":"1-2 sentences","risk_note":"string"}}'
+)
 
-    "expert_relevance_agent": {
-        "name": "Topic Relevance & Novelty Analyst",
-        "system_prompt": (
-            "You are the Topic Relevance & Novelty Analyst on an intelligence editorial board. "
-            "Your sole responsibility is evaluating whether candidates are GENUINELY NOVEL and "
-            "RELEVANT to the user's current intelligence requirements.\n\n"
-            "## Your Evaluation Framework\n"
-            "1. **Topic Alignment**: How closely does this candidate match the user's weighted "
-            "topic interests? A perfect match on a high-weight topic scores near 1.0.\n"
-            "2. **Novelty Delta**: Is this genuinely new information, or a rehash of known "
-            "developments? Score the information novelty — what does this tell us that we "
-            "didn't know 6 hours ago?\n"
-            "3. **Signal vs. Noise**: Is this a real development or noise? Distinguish between "
-            "substantive developments and clickbait/opinion repackaging.\n"
-            "4. **Story Lifecycle**: Where is this story in its lifecycle? Breaking stories "
-            "score higher than waning rehashes.\n"
-            "5. **Contrarian Value**: Does this challenge prevailing narratives? High-novelty "
-            "contrarian signals are valuable even if uncomfortable.\n\n"
-            "## Output\n"
-            "For each candidate, provide:\n"
-            "- keep: true/false (does this pass the novelty and relevance gate?)\n"
-            "- confidence: 0.0-1.0 (how confident are you?)\n"
-            "- rationale: 1-2 sentence explanation\n"
-            "- risk_note: What's the risk of including/excluding this?"
-        ),
-        "criteria": ["topic_relevance", "novelty_delta", "signal_noise", "lifecycle_stage"],
-        "weights": {
-            "novelty": 0.35,
-            "preference_fit": 0.30,
-            "lifecycle": 0.20,
-            "contrarian": 0.15,
-        },
-    },
-
-    "expert_preference_fit_agent": {
-        "name": "User Preference & Decision Utility Analyst",
-        "system_prompt": (
-            "You are the User Preference & Decision Utility Analyst on an intelligence editorial "
-            "board. Your sole responsibility is evaluating whether candidates serve the USER'S "
-            "specific needs and decision-making context.\n\n"
-            "## Your Evaluation Framework\n"
-            "1. **Preference Alignment**: How well does this match the user's stated topic "
-            "weights, tone preferences, and regional interests?\n"
-            "2. **Decision Utility**: Will this information help the user make better decisions? "
-            "Pure entertainment value is low; actionable intelligence is high.\n"
-            "3. **Briefing Fit**: Given the current briefing type (morning digest, breaking alert, "
-            "deep dive), does this candidate fit the format and urgency level?\n"
-            "4. **Cognitive Load**: Is this adding value or adding noise to the user's briefing? "
-            "Every item competes for attention — only include what earns it.\n"
-            "5. **Style Match**: Does the framing match the user's preferred tone (concise, "
-            "analyst, executive)? Would the user's persona review stack approve?\n\n"
-            "## Output\n"
-            "For each candidate, provide:\n"
-            "- keep: true/false (does this serve the user's intelligence needs?)\n"
-            "- confidence: 0.0-1.0 (how well does this fit?)\n"
-            "- rationale: 1-2 sentence explanation\n"
-            "- risk_note: What might the user miss if we exclude this?"
-        ),
-        "criteria": ["user_affinity_probability", "style_alignment", "decision_utility", "briefing_fit"],
-        "weights": {
-            "preference_fit": 0.35,
-            "prediction_signal": 0.25,
-            "urgency": 0.20,
-            "diversity": 0.20,
-        },
-    },
-
-    "expert_geopolitical_risk_agent": {
-        "name": "Geopolitical Risk & Escalation Analyst",
-        "system_prompt": (
-            "You are the Geopolitical Risk & Escalation Analyst on an intelligence editorial "
-            "board. Your sole responsibility is evaluating candidates for their GEOPOLITICAL "
-            "SIGNIFICANCE and ESCALATION POTENTIAL.\n\n"
-            "## Your Evaluation Framework\n"
-            "1. **Escalation Potential**: Could this development escalate into a larger crisis? "
-            "Military movements, sanctions, diplomatic incidents score high.\n"
-            "2. **Regional Impact**: How many regions are affected? Cross-regional contagion "
-            "risk amplifies importance.\n"
-            "3. **Actor Analysis**: Who are the key actors? State actors, non-state actors, "
-            "institutional actors? Higher-tier actors increase significance.\n"
-            "4. **Historical Pattern**: Does this match historical escalation patterns? "
-            "Pre-conflict signals, economic warfare indicators.\n"
-            "5. **De-escalation Signals**: Are there counter-signals suggesting resolution? "
-            "Balance escalation bias with de-escalation evidence.\n\n"
-            "## Output\n"
-            "For each candidate, provide:\n"
-            "- keep: true/false (is this geopolitically significant?)\n"
-            "- confidence: 0.0-1.0\n"
-            "- rationale: Focus on escalation/de-escalation dynamics\n"
-            "- risk_note: What's the worst-case trajectory?"
-        ),
-        "criteria": ["escalation_potential", "regional_impact", "actor_significance", "pattern_match"],
-        "weights": {
-            "urgency": 0.35,
-            "evidence": 0.25,
-            "regions": 0.25,
-            "novelty": 0.15,
-        },
-    },
-
-    "expert_market_signal_agent": {
-        "name": "Market Signal & Economic Impact Analyst",
-        "system_prompt": (
-            "You are the Market Signal & Economic Impact Analyst on an intelligence editorial "
-            "board. Your sole responsibility is evaluating candidates for their MARKET-MOVING "
-            "POTENTIAL and ECONOMIC IMPLICATIONS.\n\n"
-            "## Your Evaluation Framework\n"
-            "1. **Market Impact**: Could this move markets? Central bank decisions, trade policy, "
-            "earnings surprises, commodity shocks score highest.\n"
-            "2. **Leading Indicator**: Is this a leading indicator of broader economic shifts? "
-            "Job data, PMI, yield curve moves, credit spreads.\n"
-            "3. **Sector Exposure**: Which sectors/asset classes are affected? Broader impact "
-            "scores higher.\n"
-            "4. **Policy Signal**: Does this signal regulatory or policy changes? New regulations, "
-            "antitrust actions, trade restrictions.\n"
-            "5. **Prediction Market Cross-ref**: Does this align with or contradict prediction "
-            "market movements?\n\n"
-            "## Output\n"
-            "For each candidate, provide:\n"
-            "- keep: true/false (is this economically significant?)\n"
-            "- confidence: 0.0-1.0\n"
-            "- rationale: Focus on market/economic implications\n"
-            "- risk_note: What's the tail risk?"
-        ),
-        "criteria": ["market_impact", "leading_indicator", "sector_exposure", "policy_signal"],
-        "weights": {
-            "prediction_signal": 0.35,
-            "evidence": 0.25,
-            "novelty": 0.20,
-            "preference_fit": 0.20,
-        },
-    },
+# Per-expert: (name, focus directive, criteria list)
+_EXPERT_SPECS: dict[str, tuple[str, str, list[str]]] = {
+    "expert_quality_agent": (
+        "Source Quality & Evidence Analyst",
+        "Evaluate EVIDENTIAL STRENGTH and SOURCE RELIABILITY. "
+        "Tier-1 (Reuters/AP/BBC/Guardian/FT) starts at 0.85; tier-2 at 0.55. "
+        "Score: primary sources > named officials > documents > unnamed sources > speculation. "
+        "Cross-source corroboration dramatically boosts confidence. "
+        "Account for source bias and recency decay.",
+        ["source_quality", "evidence_strength", "corroboration", "recency"],
+    ),
+    "expert_relevance_agent": (
+        "Topic Relevance & Novelty Analyst",
+        "Evaluate GENUINE NOVELTY and TOPIC RELEVANCE. "
+        "Score information delta vs 6h ago. Distinguish substantive developments from noise/rehash. "
+        "Breaking > developing > ongoing > waning. "
+        "High-novelty contrarian signals valuable even if uncomfortable.",
+        ["topic_relevance", "novelty_delta", "signal_noise", "lifecycle_stage"],
+    ),
+    "expert_preference_fit_agent": (
+        "User Preference & Decision Utility Analyst",
+        "Evaluate USER-SPECIFIC FIT and DECISION UTILITY. "
+        "Match against user's topic weights, tone, and regional interests. "
+        "Actionable intelligence > entertainment. Every item competes for attention — "
+        "only include what earns it. Consider briefing type fit and cognitive load.",
+        ["user_affinity", "style_alignment", "decision_utility", "briefing_fit"],
+    ),
+    "expert_geopolitical_risk_agent": (
+        "Geopolitical Risk & Escalation Analyst",
+        "Evaluate GEOPOLITICAL SIGNIFICANCE and ESCALATION POTENTIAL. "
+        "Score: military movements, sanctions, diplomatic incidents highest. "
+        "Cross-regional contagion amplifies importance. State actors > non-state. "
+        "Check historical escalation patterns. Balance with de-escalation signals.",
+        ["escalation_potential", "regional_impact", "actor_significance", "pattern_match"],
+    ),
+    "expert_market_signal_agent": (
+        "Market Signal & Economic Impact Analyst",
+        "Evaluate MARKET-MOVING POTENTIAL and ECONOMIC IMPLICATIONS. "
+        "Score: central bank decisions, trade policy, earnings surprises, commodity shocks highest. "
+        "Leading indicators > lagging. Broader sector impact scores higher. "
+        "Cross-reference prediction market signals.",
+        ["market_impact", "leading_indicator", "sector_exposure", "policy_signal"],
+    ),
 }
+
+def _build_system_prompt(expert_id: str) -> str:
+    """Build a compressed system prompt from preamble + expert spec."""
+    spec = _EXPERT_SPECS.get(expert_id)
+    if not spec:
+        return _EXPERT_PREAMBLE
+    return f"{_EXPERT_PREAMBLE}\n\nRole: {spec[0]}.\n{spec[1]}"
+
+
+# Heuristic scoring weights per expert (used when no LLM API)
+_EXPERT_WEIGHTS: dict[str, dict[str, float]] = {
+    "expert_quality_agent": {"evidence": 0.40, "source_tier": 0.30, "corroboration": 0.20, "recency": 0.10},
+    "expert_relevance_agent": {"novelty": 0.35, "preference_fit": 0.30, "lifecycle": 0.20, "contrarian": 0.15},
+    "expert_preference_fit_agent": {"preference_fit": 0.35, "prediction_signal": 0.25, "urgency": 0.20, "diversity": 0.20},
+    "expert_geopolitical_risk_agent": {"urgency": 0.35, "evidence": 0.25, "regions": 0.25, "novelty": 0.15},
+    "expert_market_signal_agent": {"prediction_signal": 0.35, "evidence": 0.25, "novelty": 0.20, "preference_fit": 0.20},
+}
+
+# Backward-compat wrapper used by heuristic voter
+EXPERT_PERSONAS: dict[str, dict[str, Any]] = {}
+for _eid, (_name, _focus, _criteria) in _EXPERT_SPECS.items():
+    EXPERT_PERSONAS[_eid] = {
+        "name": _name,
+        "system_prompt": _build_system_prompt(_eid),
+        "criteria": _criteria,
+        "weights": _EXPERT_WEIGHTS.get(_eid, {}),
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Expert influence tracking (DebateChair)
+# ──────────────────────────────────────────────────────────────────────
+
+class DebateChair:
+    """Manages debate flow, tracks expert influence, and produces weighted votes.
+
+    Expert influence adjusts based on track record:
+    - Experts whose "keep" picks consistently make the final slate gain influence
+    - Experts whose picks get rejected or whose rationale is overridden lose influence
+    - Influence is bounded [0.5, 2.0] and decays toward 1.0 over time
+    """
+
+    def __init__(self, expert_ids: list[str], decay: float = 0.95) -> None:
+        self._influence: dict[str, float] = {eid: 1.0 for eid in expert_ids}
+        self._decay = decay
+        self._total_votes: dict[str, int] = {eid: 0 for eid in expert_ids}
+        self._correct_votes: dict[str, int] = {eid: 0 for eid in expert_ids}
+
+    def get_influence(self, expert_id: str) -> float:
+        return self._influence.get(expert_id, 1.0)
+
+    def weighted_keep_count(self, votes: list[DebateVote]) -> float:
+        """Compute influence-weighted keep count."""
+        return sum(self.get_influence(v.expert_id) for v in votes if v.keep)
+
+    def weighted_total(self, votes: list[DebateVote]) -> float:
+        """Compute total influence weight of voters."""
+        return sum(self.get_influence(v.expert_id) for v in votes)
+
+    def record_outcome(self, expert_id: str, voted_keep: bool, was_selected: bool) -> None:
+        """Update influence based on whether expert's vote aligned with final outcome."""
+        self._total_votes[expert_id] = self._total_votes.get(expert_id, 0) + 1
+        correct = (voted_keep and was_selected) or (not voted_keep and not was_selected)
+        if correct:
+            self._correct_votes[expert_id] = self._correct_votes.get(expert_id, 0) + 1
+
+        # Adjust influence
+        current = self._influence.get(expert_id, 1.0)
+        if correct:
+            new = min(2.0, current * 1.02)  # Small reward
+        else:
+            new = max(0.5, current * 0.97)  # Small penalty
+
+        # Decay toward 1.0
+        new = new * self._decay + 1.0 * (1.0 - self._decay)
+        self._influence[expert_id] = round(new, 4)
+
+    def accuracy(self, expert_id: str) -> float:
+        total = self._total_votes.get(expert_id, 0)
+        if total == 0:
+            return 0.0
+        return round(self._correct_votes.get(expert_id, 0) / total, 3)
+
+    def rankings(self) -> list[tuple[str, float, float]]:
+        """Return experts ranked by influence: (id, influence, accuracy)."""
+        return sorted(
+            [(eid, inf, self.accuracy(eid)) for eid, inf in self._influence.items()],
+            key=lambda x: x[1], reverse=True,
+        )
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "influence": dict(self._influence),
+            "accuracy": {eid: self.accuracy(eid) for eid in self._influence},
+            "total_votes": dict(self._total_votes),
+        }
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -231,6 +209,7 @@ class ExpertCouncil:
         self._llm_model = llm_model
         self._llm_base_url = llm_base_url
         self._use_llm = bool(llm_api_key)
+        self.chair = DebateChair(self.expert_ids)
 
     def _required_votes(self) -> int:
         n = len(self.expert_ids)
@@ -324,24 +303,18 @@ class ExpertCouncil:
         )
 
     def _vote_llm(self, expert_id: str, candidate: CandidateItem) -> DebateVote:
-        """Generate a vote using LLM reasoning with expert persona."""
-        persona = EXPERT_PERSONAS.get(expert_id, {})
-        system_prompt = persona.get("system_prompt", "Evaluate this news candidate.")
+        """Generate a vote using LLM reasoning with compressed expert prompt."""
+        system_prompt = _build_system_prompt(expert_id)
 
+        # Compact user message — no redundant labels, minimal tokens
+        corr = ",".join(candidate.corroborated_by[:3]) or "-"
+        rgn = ",".join(candidate.regions[:3]) or "-"
         user_message = (
-            f"Evaluate this candidate:\n"
-            f"- Title: {candidate.title}\n"
-            f"- Source: {candidate.source}\n"
-            f"- Topic: {candidate.topic}\n"
-            f"- Summary: {candidate.summary[:200]}\n"
-            f"- Evidence Score: {candidate.evidence_score}\n"
-            f"- Novelty Score: {candidate.novelty_score}\n"
-            f"- Urgency: {candidate.urgency.value}\n"
-            f"- Lifecycle: {candidate.lifecycle.value}\n"
-            f"- Corroborated by: {', '.join(candidate.corroborated_by) or 'none'}\n"
-            f"- Regions: {', '.join(candidate.regions) or 'none'}\n\n"
-            f"Respond in JSON: {{\"keep\": bool, \"confidence\": float, "
-            f"\"rationale\": string, \"risk_note\": string}}"
+            f"{candidate.title} | {candidate.source} | {candidate.topic}\n"
+            f"{candidate.summary[:150]}\n"
+            f"ev={candidate.evidence_score:.2f} nov={candidate.novelty_score:.2f} "
+            f"urg={candidate.urgency.value} life={candidate.lifecycle.value} "
+            f"corr=[{corr}] rgn=[{rgn}]"
         )
 
         try:
@@ -558,10 +531,13 @@ class ExpertCouncil:
         for vote in final_votes:
             final_by_candidate.setdefault(vote.candidate_id, []).append(vote)
 
+        # Use influence-weighted voting via DebateChair
         accepted_ids: set[str] = set()
         for candidate_id, cvotes in final_by_candidate.items():
-            keep_votes = sum(1 for v in cvotes if v.keep)
-            if keep_votes >= required:
+            weighted_keep = self.chair.weighted_keep_count(cvotes)
+            weighted_total = self.chair.weighted_total(cvotes)
+            # Accept if weighted keep proportion exceeds threshold
+            if weighted_total > 0 and (weighted_keep / weighted_total) >= 0.5:
                 accepted_ids.add(candidate_id)
 
         # Update debate record with final (potentially revised) votes
@@ -580,11 +556,20 @@ class ExpertCouncil:
         selected = ranked[:max_items]
         reserve = ranked[max_items:]
 
+        # Record outcomes in DebateChair for influence tracking
+        selected_ids = {c.candidate_id for c in selected}
+        for vote in final_votes:
+            self.chair.record_outcome(
+                vote.expert_id, vote.keep,
+                vote.candidate_id in selected_ids,
+            )
+
         log.info(
             "Expert council: %d/%d accepted (%d experts, %d required, %d arbitrated), "
-            "%d selected, %d reserve",
+            "%d selected, %d reserve, chair=%s",
             len(accepted_ids), len(candidates), len(self.expert_ids),
             required, arbitration_count, len(selected), len(reserve),
+            {eid: f"{inf:.2f}" for eid, inf, _ in self.chair.rankings()[:3]},
         )
 
         return selected, reserve, debate

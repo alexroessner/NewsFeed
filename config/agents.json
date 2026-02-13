@@ -64,6 +64,22 @@
       "description": "Assesses market-moving potential, leading economic indicators, sector exposure breadth, and policy signal strength"
     }
   ],
+  "topic_capabilities": {
+    "geopolitics": ["reuters", "ap", "bbc", "guardian", "ft", "aljazeera", "gdelt", "x", "reddit", "web"],
+    "ai_policy": ["arxiv", "hackernews", "x", "reddit", "guardian", "web", "reuters", "bbc"],
+    "technology": ["hackernews", "arxiv", "x", "reddit", "web", "guardian", "bbc"],
+    "markets": ["ft", "reuters", "x", "web", "reddit", "hackernews", "bbc"],
+    "crypto": ["x", "reddit", "web", "hackernews", "ft"],
+    "climate": ["guardian", "bbc", "reuters", "ap", "web", "reddit", "arxiv"],
+    "science": ["arxiv", "hackernews", "guardian", "bbc", "reddit", "web"],
+    "middle_east": ["aljazeera", "bbc", "reuters", "ap", "guardian", "gdelt", "x"],
+    "africa": ["aljazeera", "bbc", "reuters", "gdelt", "guardian", "web"]
+  },
+  "source_priority": {
+    "reuters": 0.95, "ap": 0.93, "bbc": 0.90, "guardian": 0.88, "ft": 0.90,
+    "aljazeera": 0.80, "arxiv": 0.78, "hackernews": 0.65, "reddit": 0.58,
+    "x": 0.55, "gdelt": 0.60, "web": 0.50
+  },
   "review_agents": [
     {"id": "review_agent_style", "focus": "voice, tone, personalization, and audience-appropriate language"},
     {"id": "review_agent_clarity", "focus": "clarity, structure, concision, and actionable framing"}
