@@ -158,6 +158,101 @@
     "more": 0.2,
     "less": -0.2
   },
+  "editorial_review": {
+    "tone_templates": {
+      "concise": {
+        "why_prefix": "",
+        "outlook_prefix": "Outlook: ",
+        "changed_prefix": "Update: ",
+        "style": "Short, direct sentences. No filler. Lead with the key fact."
+      },
+      "analyst": {
+        "why_prefix": "Assessment: ",
+        "outlook_prefix": "Forward-looking: ",
+        "changed_prefix": "Delta: ",
+        "style": "Technical, evidence-anchored language. Quantify when possible."
+      },
+      "executive": {
+        "why_prefix": "Bottom line: ",
+        "outlook_prefix": "Strategic view: ",
+        "changed_prefix": "Key development: ",
+        "style": "High-level framing. Decision-relevant. Skip operational detail."
+      },
+      "brief": {
+        "why_prefix": "",
+        "outlook_prefix": "",
+        "changed_prefix": "",
+        "style": "Minimum viable context. One sentence per field."
+      },
+      "deep": {
+        "why_prefix": "Deep context: ",
+        "outlook_prefix": "Scenario analysis: ",
+        "changed_prefix": "Evolution: ",
+        "style": "Thorough analysis. Include nuance, uncertainty, alternative readings."
+      }
+    },
+    "urgency_framing": {
+      "critical": "Immediate attention required. ",
+      "breaking": "Developing rapidly. ",
+      "elevated": "Worth monitoring closely. ",
+      "routine": ""
+    },
+    "watchpoints": {
+      "geopolitics": "Watch for official statements and alliance responses in next 24-48h.",
+      "ai_policy": "Track regulatory body announcements and industry response.",
+      "markets": "Monitor market open and sector rotation for follow-through.",
+      "technology": "Watch for adoption signals and competitive responses.",
+      "crypto": "Track on-chain metrics and exchange flows for confirmation.",
+      "climate": "Monitor policy responses and institutional commitments.",
+      "science": "Watch for peer review outcomes and replication attempts."
+    },
+    "filler_patterns": [
+      ["\\bit is worth noting that\\b", ""],
+      ["\\bit should be noted that\\b", ""],
+      ["\\bin terms of\\b", "regarding"],
+      ["\\bat this point in time\\b", "now"],
+      ["\\bat the end of the day\\b", "ultimately"],
+      ["\\bdue to the fact that\\b", "because"],
+      ["\\bin order to\\b", "to"],
+      ["\\ba significant amount of\\b", "substantial"],
+      ["\\bthe fact that\\b", "that"],
+      ["\\bin the process of\\b", ""],
+      ["\\bon a going-forward basis\\b", "going forward"]
+    ],
+    "topic_adjacent_reads": {
+      "geopolitics": [
+        "Historical context: prior escalation patterns in {region}",
+        "Stakeholder analysis: key actors and their stated positions",
+        "Timeline: sequence of events leading to current development"
+      ],
+      "ai_policy": [
+        "Technical assessment: capabilities and limitations at play",
+        "Regulatory landscape: existing and proposed frameworks",
+        "Industry response: major player positions and commitments"
+      ],
+      "markets": [
+        "Sector impact analysis: direct and indirect exposure",
+        "Historical parallel: similar market events and outcomes",
+        "Policy implications: regulatory and central bank response potential"
+      ],
+      "technology": [
+        "Technical deep-dive: architecture and implementation details",
+        "Competitive landscape: market positioning and alternatives",
+        "Adoption trajectory: deployment timeline and barriers"
+      ]
+    },
+    "default_adjacent_reads": [
+      "Background context for {topic}",
+      "Expert analysis on {topic} implications",
+      "Related developments in {topic}"
+    ]
+  },
+  "default_topics": {
+    "geopolitics": 0.8,
+    "ai_policy": 0.7,
+    "technology": 0.6,
+    "markets": 0.5
+  },
   "stages": [
     {"id": "ingress", "owner": "communication_agent", "outputs": ["request"]},
     {"id": "briefing", "owner": "orchestrator_agent", "inputs": ["request", "user_profile", "memory"], "outputs": ["weighted_brief"]},
