@@ -80,7 +80,10 @@ class EngineTests(unittest.TestCase):
         cfg = load_runtime_config(root / "config")
         engine = NewsFeedEngine(cfg.agents, cfg.pipeline, cfg.personas, root / "personas")
 
-        candidates = engine._research_agents()[0].run(
+        # Use a simulated agent for reliable test candidates (real agents may 401)
+        from newsfeed.agents.simulated import SimulatedResearchAgent
+        agent = SimulatedResearchAgent(agent_id="test_sim", source="reuters", mandate="test")
+        candidates = agent.run(
             ResearchTask(request_id="r1", user_id="u1", prompt="p", weighted_topics={"geopolitics": 1.0}),
             top_k=3,
         )
