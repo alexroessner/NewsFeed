@@ -117,8 +117,9 @@ class D1Client:
 
         Splits on semicolons and sends each statement individually,
         since the D1 REST API only accepts single statements per request.
-        Continues on failure so partial schema creation is possible
-        (all DDL uses IF NOT EXISTS, so re-running is safe).
+        Bails out on first failure to avoid blocking for minutes when
+        credentials are wrong. All DDL uses IF NOT EXISTS, so re-running
+        on next invocation is safe.
         """
         for raw in script.split(";"):
             # Strip comment-only lines first, then check if anything remains
@@ -128,8 +129,9 @@ class D1Client:
                 try:
                     self.execute(clean)
                 except Exception:
-                    log.warning("D1 script statement failed (will retry on next init): %s",
+                    log.warning("D1 schema init failed, skipping remaining statements: %s",
                                 clean.replace("\n", " ")[:100])
+                    return
 
     def query(self, sql: str, params: tuple = ()) -> list[dict]:
         """Execute a read query and return list of row dicts."""
