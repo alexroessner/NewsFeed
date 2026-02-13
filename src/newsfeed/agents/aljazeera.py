@@ -122,6 +122,12 @@ class AlJazeeraAgent(ResearchAgent):
             regions = self._detect_regions(title, summary)
             cid = hashlib.sha256(f"{self.agent_id}:{link}".encode()).hexdigest()[:16]
 
+            # Content-aware scoring
+            age_hours = max(0.1, (datetime.now(timezone.utc) - created_at).total_seconds() / 3600)
+            recency_novelty = round(max(0.3, min(1.0, 1.0 - age_hours / 48)), 3)
+            mandate_fit = self._mandate_boost(title, summary)
+            pred_boost = self._prediction_boost(title, summary)
+
             candidates.append(CandidateItem(
                 candidate_id=f"{self.agent_id}-{cid}",
                 title=title,
@@ -130,9 +136,9 @@ class AlJazeeraAgent(ResearchAgent):
                 url=link,
                 topic=topic,
                 evidence_score=0.78,
-                novelty_score=round(max(0.3, 1.0 - idx * 0.05), 3),
-                preference_fit=preference_fit,
-                prediction_signal=0.48,
+                novelty_score=recency_novelty,
+                preference_fit=round(min(1.0, preference_fit + mandate_fit), 3),
+                prediction_signal=round(min(1.0, 0.48 + pred_boost), 3),
                 discovered_by=self.agent_id,
                 created_at=created_at,
                 regions=regions,

@@ -194,7 +194,10 @@ class CommunicationAgent:
 
     def _run_briefing(self, chat_id: int | str, user_id: str,
                       topic_hint: str = "", deep: bool = False) -> dict[str, Any]:
-        """Run a full research cycle and deliver the briefing."""
+        """Run a full research cycle and deliver as multi-message flow.
+
+        Flow: header (ticker + overview) -> individual story cards -> action buttons
+        """
         profile = self._engine.preferences.get_or_create(user_id)
 
         # Build topic weights from profile, with optional topic hint boost
@@ -206,17 +209,18 @@ class CommunicationAgent:
         prompt = topic_hint or "Generate intelligence briefing"
         max_items = profile.max_items
         if deep:
-            max_items = min(max_items + 5, 20)  # Deep dives get more items
+            max_items = min(max_items + 5, 20)
 
-        # Run the intelligence pipeline
-        formatted = self._engine.handle_request(
+        # Run the intelligence pipeline — get structured payload
+        payload = self._engine.handle_request_payload(
             user_id=user_id,
             prompt=prompt,
             weighted_topics=topics,
             max_items=max_items,
         )
 
-        # Prepend market ticker bar
+        # Build market ticker bar
+        ticker_bar = ""
         try:
             crypto_ids = profile.watchlist_crypto or None
             stock_tickers = profile.watchlist_stocks or None
@@ -224,8 +228,6 @@ class CommunicationAgent:
             all_quotes = market_data.get("crypto", []) + market_data.get("stocks", [])
             if all_quotes:
                 ticker_bar = MarketTicker.format_ticker_bar(all_quotes)
-                if ticker_bar:
-                    formatted = ticker_bar + "\n\n" + formatted
         except Exception:
             log.debug("Market ticker fetch skipped", exc_info=True)
 
@@ -233,14 +235,30 @@ class CommunicationAgent:
         self._shown_ids.setdefault(user_id, set())
         dominant_topic = max(topics, key=topics.get, default="general")
         self._last_topic[user_id] = dominant_topic
-
-        # Store per-item info for per-item feedback buttons
         self._last_items[user_id] = self._engine.last_briefing_items(user_id)
 
-        # Deliver via bot with clean action buttons
-        self._bot.send_briefing(chat_id, formatted)
+        formatter = self._engine.formatter
 
-        log.info("Briefing delivered to user=%s chat=%s", user_id, chat_id)
+        # Message 1: Header (ticker + geo risks + trends + threads)
+        header = formatter.format_header(payload, ticker_bar)
+        self._bot.send_message(chat_id, header)
+
+        # Messages 2..N: Individual story cards (one per message)
+        for idx, item in enumerate(payload.items, start=1):
+            card = formatter.format_story_card(item, idx)
+            is_last = (idx == len(payload.items))
+            self._bot.send_story_card(chat_id, card, is_last=is_last)
+
+        if not payload.items:
+            self._bot.send_message(
+                chat_id,
+                "No stories matched your current filters. Try /feedback to adjust."
+            )
+
+        log.info(
+            "Multi-message briefing: user=%s chat=%s (%d cards)",
+            user_id, chat_id, len(payload.items),
+        )
         return {"action": "briefing", "user_id": user_id, "topic": dominant_topic}
 
     def _show_more(self, chat_id: int | str, user_id: str,

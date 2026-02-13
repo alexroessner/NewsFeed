@@ -229,7 +229,7 @@ class NewsFeedEngine:
         """Run research fan-out, safely handling sync/async contexts."""
         return _run_sync(self._run_research_async(task, top_k))
 
-    def handle_request(self, user_id: str, prompt: str, weighted_topics: dict[str, float], max_items: int | None = None) -> str:
+    def handle_request_payload(self, user_id: str, prompt: str, weighted_topics: dict[str, float], max_items: int | None = None) -> DeliveryPayload:
         log.info("handle_request user=%s prompt=%r", user_id, prompt[:80])
         profile = self.preferences.get_or_create(user_id)
         limit = min(max_items or profile.max_items, self.pipeline.get("limits", {}).get("default_max_items", 10))
@@ -412,6 +412,11 @@ class NewsFeedEngine:
         )
 
         log.info("Report generated: %d items, briefing=%s", len(report_items), briefing_type.value)
+        return payload
+
+    def handle_request(self, user_id: str, prompt: str, weighted_topics: dict[str, float], max_items: int | None = None) -> str:
+        """Run the full pipeline and return formatted string (backward compat)."""
+        payload = self.handle_request_payload(user_id, prompt, weighted_topics, max_items)
         return self.formatter.format(payload)
 
     def _run_intelligence(self, candidates: list[CandidateItem]) -> list[CandidateItem]:
