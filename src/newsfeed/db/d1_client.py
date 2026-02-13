@@ -1,0 +1,139 @@
+"""Lightweight Cloudflare D1 REST client — zero external dependencies.
+
+Uses urllib.request (stdlib) to talk to the D1 HTTP API.
+Drop-in replacement transport for AnalyticsDB when D1 credentials are present.
+
+Env vars:
+    CLOUDFLARE_ACCOUNT_ID  — Cloudflare account ID
+    CLOUDFLARE_API_TOKEN   — API token with D1 read/write permissions
+    D1_DATABASE_ID         — D1 database UUID
+"""
+from __future__ import annotations
+
+import json
+import logging
+import urllib.error
+import urllib.request
+from typing import Any
+
+log = logging.getLogger(__name__)
+
+
+class D1Client:
+    """Minimal Cloudflare D1 REST API client.
+
+    Provides execute/query methods that mirror sqlite3.Connection semantics
+    so AnalyticsDB can swap backends transparently.
+    """
+
+    def __init__(self, account_id: str, database_id: str, api_token: str) -> None:
+        self._url = (
+            f"https://api.cloudflare.com/client/v4/accounts/{account_id}"
+            f"/d1/database/{database_id}/query"
+        )
+        self._headers = {
+            "Authorization": f"Bearer {api_token}",
+            "Content-Type": "application/json",
+        }
+        self.account_id = account_id
+        self.database_id = database_id
+
+    def _post(self, body: dict | list) -> list[dict]:
+        """Send a query to D1 and return the result array."""
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(
+            self._url, data=data, headers=self._headers, method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            body_text = e.read().decode("utf-8", errors="replace")[:500]
+            log.error("D1 API error %d: %s", e.code, body_text)
+            raise
+        except urllib.error.URLError as e:
+            log.error("D1 network error: %s", e.reason)
+            raise
+
+        if not result.get("success"):
+            errors = result.get("errors", [])
+            log.error("D1 query failed: %s", errors)
+            raise RuntimeError(f"D1 query failed: {errors}")
+
+        return result.get("result", [])
+
+    def execute(self, sql: str, params: tuple = ()) -> list[dict]:
+        """Execute a single SQL statement. Returns list of row dicts."""
+        body = {"sql": sql}
+        if params:
+            body["params"] = [_convert_param(p) for p in params]
+
+        results = self._post(body)
+        if results and isinstance(results, list):
+            return results[0].get("results", [])
+        return []
+
+    def execute_many(self, sql: str, params_list: list[tuple]) -> None:
+        """Execute a parameterized statement for each set of params (batch).
+
+        D1 supports up to 100 statements per batch. We chunk accordingly.
+        """
+        if not params_list:
+            return
+
+        for chunk_start in range(0, len(params_list), 100):
+            chunk = params_list[chunk_start:chunk_start + 100]
+            batch = []
+            for params in chunk:
+                stmt: dict[str, Any] = {"sql": sql}
+                if params:
+                    stmt["params"] = [_convert_param(p) for p in params]
+                batch.append(stmt)
+            self._post(batch)
+
+    def execute_script(self, script: str) -> None:
+        """Execute a multi-statement SQL script (schema init).
+
+        Splits on semicolons and sends as a batch.
+        """
+        statements = []
+        for raw in script.split(";"):
+            stmt = raw.strip()
+            if stmt and not stmt.startswith("--"):
+                # Skip pure comments
+                lines = [l for l in stmt.split("\n") if not l.strip().startswith("--")]
+                clean = "\n".join(lines).strip()
+                if clean:
+                    statements.append({"sql": clean})
+
+        if not statements:
+            return
+
+        # D1 batch limit is 100 statements; chunk if schema is large
+        for chunk_start in range(0, len(statements), 100):
+            chunk = statements[chunk_start:chunk_start + 100]
+            self._post(chunk)
+
+    def query(self, sql: str, params: tuple = ()) -> list[dict]:
+        """Execute a read query and return list of row dicts."""
+        return self.execute(sql, params)
+
+    def ping(self) -> bool:
+        """Test connectivity."""
+        try:
+            self.execute("SELECT 1 as ok")
+            return True
+        except Exception:
+            return False
+
+
+def _convert_param(value: Any) -> Any:
+    """Convert Python values to D1-compatible JSON types."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return 1 if value else 0
+    if isinstance(value, (int, float, str)):
+        return value
+    # Fallback: stringify
+    return str(value)

@@ -9,7 +9,7 @@ from pathlib import Path
 from newsfeed.agents.base import ResearchAgent
 from newsfeed.agents.experts import ExpertCouncil
 from newsfeed.agents.registry import create_agent
-from newsfeed.db.analytics import AnalyticsDB
+from newsfeed.db.analytics import AnalyticsDB, create_analytics_db
 from newsfeed.delivery.telegram import TelegramFormatter
 from newsfeed.intelligence.clustering import StoryClustering
 from newsfeed.intelligence.enrichment import ArticleEnricher
@@ -213,10 +213,10 @@ class NewsFeedEngine:
             self._persistence = StatePersistence(state_dir)
             self._load_state()
 
-        # Analytics database — persistent SQLite for ALL user data collection
+        # Analytics database — auto-selects Cloudflare D1 (persistent) or local SQLite
         analytics_dir = Path(persist_cfg.get("state_dir", "state"))
         analytics_dir.mkdir(parents=True, exist_ok=True)
-        self.analytics = AnalyticsDB(analytics_dir / "analytics.db")
+        self.analytics = create_analytics_db(local_path=analytics_dir / "analytics.db")
 
         log.info(
             "Engine ready: %d agents, %d experts, stages=%s",
