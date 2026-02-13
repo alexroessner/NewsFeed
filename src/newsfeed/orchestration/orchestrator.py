@@ -77,8 +77,8 @@ class RequestLifecycle:
 # Agent capability routing
 # ──────────────────────────────────────────────────────────────────────
 
-# Maps topics to the agent sources most capable of covering them
-_TOPIC_CAPABILITIES: dict[str, list[str]] = {
+# Default topic→source mapping — overridden by agents.json topic_capabilities
+_DEFAULT_TOPIC_CAPABILITIES: dict[str, list[str]] = {
     "geopolitics": ["reuters", "ap", "bbc", "guardian", "ft", "aljazeera", "gdelt", "x", "reddit", "web"],
     "ai_policy": ["arxiv", "hackernews", "x", "reddit", "guardian", "web", "reuters", "bbc"],
     "technology": ["hackernews", "arxiv", "x", "reddit", "web", "guardian", "bbc"],
@@ -90,8 +90,8 @@ _TOPIC_CAPABILITIES: dict[str, list[str]] = {
     "africa": ["aljazeera", "bbc", "reuters", "gdelt", "guardian", "web"],
 }
 
-# Source reliability for brief weighting
-_SOURCE_PRIORITY: dict[str, float] = {
+# Default source reliability — overridden by agents.json source_priority
+_DEFAULT_SOURCE_PRIORITY: dict[str, float] = {
     "reuters": 0.95, "ap": 0.93, "bbc": 0.90, "guardian": 0.88, "ft": 0.90,
     "aljazeera": 0.80, "arxiv": 0.78, "hackernews": 0.65, "reddit": 0.58,
     "x": 0.55, "gdelt": 0.60, "web": 0.50,
@@ -110,11 +110,22 @@ class OrchestratorAgent:
 
     agent_id = "orchestrator_agent"
 
-    def __init__(self, agent_configs: list[dict], pipeline_cfg: dict) -> None:
+    def __init__(self, agent_configs: list[dict], pipeline_cfg: dict,
+                 agents_cfg: dict | None = None) -> None:
         self._agent_configs = agent_configs
         self._limits = pipeline_cfg.get("limits", {})
         self._default_max_items = self._limits.get("default_max_items", 10)
         self._top_k = self._limits.get("top_discoveries_per_research_agent", 5)
+
+        # Load topic capabilities and source priority from config or defaults
+        acfg = agents_cfg or {}
+        self._topic_capabilities = acfg.get("topic_capabilities", _DEFAULT_TOPIC_CAPABILITIES)
+        self._source_priority = acfg.get("source_priority", _DEFAULT_SOURCE_PRIORITY)
+
+        # Default topics for brief compilation
+        self._default_topics = pipeline_cfg.get("default_topics", {
+            "geopolitics": 0.8, "ai_policy": 0.7, "technology": 0.6, "markets": 0.5,
+        })
 
         # Active lifecycle tracking (most recent per user)
         self._active_requests: dict[str, RequestLifecycle] = {}
@@ -137,24 +148,19 @@ class OrchestratorAgent:
 
         # Ensure at least default topics if user has no weights
         if not weighted_topics:
-            weighted_topics = {
-                "geopolitics": 0.8,
-                "ai_policy": 0.7,
-                "technology": 0.6,
-                "markets": 0.5,
-            }
+            weighted_topics = dict(self._default_topics)
 
         # Boost topics mentioned in the prompt
         prompt_lower = prompt.lower()
-        for topic in list(weighted_topics.keys()) + list(_TOPIC_CAPABILITIES.keys()):
+        for topic in list(weighted_topics.keys()) + list(self._topic_capabilities.keys()):
             keywords = topic.lower().replace("_", " ").split()
             if any(kw in prompt_lower for kw in keywords):
                 weighted_topics[topic] = min(1.0, weighted_topics.get(topic, 0.3) + 0.3)
 
         # Apply region-based topic boosts
         for region in profile.regions_of_interest:
-            if region in _TOPIC_CAPABILITIES:
-                for source in _TOPIC_CAPABILITIES[region][:3]:
+            if region in self._topic_capabilities:
+                for source in self._topic_capabilities[region][:3]:
                     # Boost topics that this region is relevant to
                     weighted_topics[region] = min(1.0, weighted_topics.get(region, 0.3) + 0.2)
 
@@ -190,14 +196,14 @@ class OrchestratorAgent:
             score = 0.0
 
             for topic, weight in top_topics:
-                capable_sources = _TOPIC_CAPABILITIES.get(topic, [])
+                capable_sources = self._topic_capabilities.get(topic, [])
                 if source in capable_sources:
                     # Position in capability list matters
                     position_bonus = 1.0 - (capable_sources.index(source) / max(len(capable_sources), 1)) * 0.3
                     score += weight * position_bonus
 
             # Add base source priority
-            score += _SOURCE_PRIORITY.get(source, 0.50) * 0.1
+            score += self._source_priority.get(source, 0.50) * 0.1
 
             agent_scores.append((agent_cfg, score))
 
