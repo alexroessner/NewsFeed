@@ -31,6 +31,9 @@ class D1Client:
     """
 
     def __init__(self, account_id: str, database_id: str, api_token: str) -> None:
+        account_id = account_id.strip()
+        database_id = database_id.strip()
+        api_token = api_token.strip()
         self._url = (
             f"https://api.cloudflare.com/client/v4/accounts/{account_id}"
             f"/d1/database/{database_id}/query"
