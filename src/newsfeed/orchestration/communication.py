@@ -79,28 +79,38 @@ class CommunicationAgent:
 
         log.info("Processing %s from user=%s: cmd=%s args=%r", cmd_type, user_id, command, args)
 
+        result: dict[str, Any] | None = None
         try:
             if cmd_type == "command":
-                return self._handle_command(chat_id, user_id, command, args)
+                result = self._handle_command(chat_id, user_id, command, args)
 
-            if cmd_type == "preference":
-                return self._handle_preference(chat_id, user_id, command)
+            elif cmd_type == "preference":
+                result = self._handle_preference(chat_id, user_id, command)
 
-            if cmd_type == "feedback":
-                return self._handle_feedback(chat_id, user_id, text)
+            elif cmd_type == "feedback":
+                result = self._handle_feedback(chat_id, user_id, text)
 
-            if cmd_type == "mute":
-                return self._handle_mute(chat_id, user_id, args)
+            elif cmd_type == "mute":
+                result = self._handle_mute(chat_id, user_id, args)
 
-            if cmd_type == "rate":
-                return self._handle_rate(chat_id, user_id, command)
+            elif cmd_type == "rate":
+                result = self._handle_rate(chat_id, user_id, command)
 
         except Exception:
             log.exception("Error handling update for user=%s", user_id)
             self._bot.send_message(chat_id, "Something went wrong. Please try again.")
-            return {"action": "error", "user_id": user_id}
+            result = {"action": "error", "user_id": user_id}
 
-        return None
+        # Analytics: record EVERY interaction
+        self._engine.analytics.record_interaction(
+            user_id=user_id, chat_id=chat_id,
+            interaction_type=cmd_type, command=command,
+            args=args, raw_text=text,
+            result_action=result.get("action") if result else None,
+            result_data=result,
+        )
+
+        return result
 
     def _handle_command(self, chat_id: int | str, user_id: str,
                         command: str, args: str) -> dict[str, Any]:
@@ -169,6 +179,9 @@ class CommunicationAgent:
             self._bot.send_message(chat_id, "All preferences reset to defaults.")
             return {"action": "reset", "user_id": user_id}
 
+        if command == "admin":
+            return self._handle_admin(chat_id, user_id, args)
+
         # Unknown command
         self._bot.send_message(chat_id, f"Unknown command: /{command}. Try /help")
         return {"action": "unknown_command", "user_id": user_id, "command": command}
@@ -176,6 +189,7 @@ class CommunicationAgent:
     def _onboard(self, chat_id: int | str, user_id: str) -> dict[str, Any]:
         """Welcome a new user and create their default profile."""
         self._engine.preferences.get_or_create(user_id)
+        self._engine.analytics.record_user_seen(user_id, chat_id)
         self._bot.send_message(
             chat_id,
             "<b>\U0001f4e1 Welcome to NewsFeed Intelligence</b>\n\n"
@@ -335,6 +349,10 @@ class CommunicationAgent:
             adjustments = []
             for topic in briefing_topics:
                 self._engine.apply_user_feedback(user_id, f"more {topic}")
+                self._engine.analytics.record_preference_change(
+                    user_id, "topic_boost", topic, None, "+0.2",
+                    source="more_similar_button",
+                )
                 adjustments.append(topic)
             topic_list = ", ".join(adjustments)
             self._bot.send_message(chat_id, f"Got it — boosting {topic_list} in future briefings.")
@@ -345,6 +363,10 @@ class CommunicationAgent:
             adjustments = []
             for topic in briefing_topics:
                 self._engine.apply_user_feedback(user_id, f"less {topic}")
+                self._engine.analytics.record_preference_change(
+                    user_id, "topic_reduce", topic, None, "-0.2",
+                    source="less_similar_button",
+                )
                 adjustments.append(topic)
             topic_list = ", ".join(adjustments)
             self._bot.send_message(chat_id, f"Understood — reducing {topic_list} weight.")
@@ -406,6 +428,13 @@ class CommunicationAgent:
             self._bot.send_message(chat_id, f"\U0001f44e Reduced {topic} (story #{item_num})")
         else:
             return {"action": "rate_error", "user_id": user_id}
+
+        # Analytics: record per-item rating
+        self._engine.analytics.record_rating(
+            user_id, item_num, direction,
+            topic=topic, source=item.get("source"),
+            title=item.get("title"),
+        )
 
         return {"action": "rate", "user_id": user_id, "item": item_num, "direction": direction}
 
@@ -652,3 +681,280 @@ class CommunicationAgent:
         keyboard = {"inline_keyboard": rows}
         self._bot.send_message(chat_id, "\n".join(lines), reply_markup=keyboard)
         return {"action": "rate_prompt", "user_id": user_id}
+
+    # ──────────────────────────────────────────────────────────────
+    # ADMIN COMMANDS — owner-only analytics dashboard via Telegram
+    # ──────────────────────────────────────────────────────────────
+
+    def _is_admin(self, user_id: str) -> bool:
+        """Check if user is the admin/owner."""
+        import os
+        owner_id = os.environ.get("TELEGRAM_OWNER_ID", "")
+        if not owner_id:
+            # If no owner configured, allow the first registered user
+            users = self._engine.analytics.get_all_users()
+            if users:
+                owner_id = users[-1]["user_id"]  # oldest user
+        return str(user_id) == str(owner_id)
+
+    def _handle_admin(self, chat_id: int | str, user_id: str,
+                      args: str) -> dict[str, Any]:
+        """Handle /admin commands for analytics dashboard."""
+        import html as html_mod
+        from datetime import datetime, timezone
+
+        if not self._is_admin(user_id):
+            self._bot.send_message(chat_id, "Admin access required.")
+            return {"action": "admin_denied", "user_id": user_id}
+
+        parts = args.strip().split(maxsplit=1)
+        subcmd = parts[0].lower() if parts else "help"
+        subargs = parts[1].strip() if len(parts) > 1 else ""
+        db = self._engine.analytics
+
+        if subcmd == "help":
+            self._bot.send_message(chat_id, (
+                "<b>Admin Commands</b>\n\n"
+                "/admin stats \u2014 System-wide statistics\n"
+                "/admin users \u2014 All registered users\n"
+                "/admin user [id] \u2014 Full user profile + activity\n"
+                "/admin interactions [id] \u2014 User interaction log\n"
+                "/admin ratings [id] \u2014 User rating history\n"
+                "/admin feedback [id] \u2014 User feedback history\n"
+                "/admin prefs [id] \u2014 User preference change log\n"
+                "/admin requests \u2014 Recent pipeline requests\n"
+                "/admin request [id] \u2014 Full request detail\n"
+                "/admin topics \u2014 Top topics (30 days)\n"
+                "/admin sources \u2014 Top sources (30 days)\n"
+                "/admin briefings [user_id] \u2014 User briefing history"
+            ))
+            return {"action": "admin_help", "user_id": user_id}
+
+        if subcmd == "stats":
+            stats = db.get_system_stats()
+            lines = ["<b>System Analytics</b>", ""]
+            for key, val in stats.items():
+                lines.append(f"  {key}: <code>{val}</code>")
+            self._bot.send_message(chat_id, "\n".join(lines))
+            return {"action": "admin_stats", "user_id": user_id}
+
+        if subcmd == "users":
+            users = db.get_all_users()
+            if not users:
+                self._bot.send_message(chat_id, "No users registered yet.")
+                return {"action": "admin_users", "user_id": user_id}
+            lines = [f"<b>All Users ({len(users)})</b>", ""]
+            for u in users:
+                last = datetime.fromtimestamp(u["last_active_at"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+                lines.append(
+                    f"  <code>{u['user_id']}</code> | "
+                    f"req:{u['total_requests']} brief:{u['total_briefings']} "
+                    f"fb:{u['total_feedback']} rate:{u['total_ratings']} | "
+                    f"last: {last}"
+                )
+            self._bot.send_message(chat_id, "\n".join(lines))
+            return {"action": "admin_users", "user_id": user_id}
+
+        if subcmd == "user":
+            if not subargs:
+                self._bot.send_message(chat_id, "Usage: /admin user [user_id]")
+                return {"action": "admin_user_help", "user_id": user_id}
+            target = subargs.strip()
+            summary = db.get_user_summary(target)
+            if not summary:
+                self._bot.send_message(chat_id, f"User {target} not found.")
+                return {"action": "admin_user_notfound", "user_id": user_id}
+            first = datetime.fromtimestamp(summary["first_seen_at"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+            last = datetime.fromtimestamp(summary["last_active_at"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+            # Get current profile
+            profile = self._engine.preferences.get_or_create(target)
+            lines = [
+                f"<b>User: {html_mod.escape(target)}</b>",
+                f"  Chat ID: <code>{summary['chat_id']}</code>",
+                f"  First seen: {first}",
+                f"  Last active: {last}",
+                f"  Requests: {summary['total_requests']}",
+                f"  Briefings: {summary['total_briefings']}",
+                f"  Feedback: {summary['total_feedback']}",
+                f"  Ratings: {summary['total_ratings']}",
+                "",
+                "<b>Current Profile:</b>",
+                f"  Tone: {profile.tone}",
+                f"  Format: {profile.format}",
+                f"  Max items: {profile.max_items}",
+                f"  Cadence: {profile.briefing_cadence}",
+                f"  Timezone: {profile.timezone}",
+                f"  Topics: {dict(profile.topic_weights)}",
+                f"  Sources: {dict(profile.source_weights)}",
+                f"  Regions: {list(profile.regions_of_interest)}",
+                f"  Muted: {list(profile.muted_topics)}",
+                f"  Crypto: {list(profile.watchlist_crypto)}",
+                f"  Stocks: {list(profile.watchlist_stocks)}",
+            ]
+            self._bot.send_message(chat_id, "\n".join(lines))
+            return {"action": "admin_user", "user_id": user_id, "target": target}
+
+        if subcmd == "interactions":
+            target = subargs.strip() if subargs else user_id
+            interactions = db.get_user_interactions(target, limit=30)
+            if not interactions:
+                self._bot.send_message(chat_id, f"No interactions for {target}.")
+                return {"action": "admin_interactions", "user_id": user_id}
+            lines = [f"<b>Interactions: {html_mod.escape(target)}</b> (last 30)", ""]
+            for i in interactions:
+                ts = datetime.fromtimestamp(i["ts"], tz=timezone.utc).strftime("%m-%d %H:%M")
+                cmd = i["command"] or "-"
+                text = (i["raw_text"] or "")[:60]
+                lines.append(f"  {ts} [{i['interaction_type']}] /{cmd} {html_mod.escape(text)}")
+            self._bot.send_message(chat_id, "\n".join(lines))
+            return {"action": "admin_interactions", "user_id": user_id}
+
+        if subcmd == "ratings":
+            target = subargs.strip() if subargs else user_id
+            ratings = db.get_user_ratings(target, limit=30)
+            if not ratings:
+                self._bot.send_message(chat_id, f"No ratings for {target}.")
+                return {"action": "admin_ratings", "user_id": user_id}
+            lines = [f"<b>Ratings: {html_mod.escape(target)}</b> (last 30)", ""]
+            for r in ratings:
+                ts = datetime.fromtimestamp(r["ts"], tz=timezone.utc).strftime("%m-%d %H:%M")
+                icon = "\U0001f44d" if r["direction"] == "up" else "\U0001f44e"
+                title = html_mod.escape((r["title"] or r["topic"] or "?")[:50])
+                lines.append(f"  {ts} {icon} #{r['item_index']} {title} [{r['source']}]")
+            self._bot.send_message(chat_id, "\n".join(lines))
+            return {"action": "admin_ratings", "user_id": user_id}
+
+        if subcmd == "feedback":
+            target = subargs.strip() if subargs else user_id
+            feedback = db.get_user_feedback_history(target, limit=20)
+            if not feedback:
+                self._bot.send_message(chat_id, f"No feedback for {target}.")
+                return {"action": "admin_feedback", "user_id": user_id}
+            lines = [f"<b>Feedback: {html_mod.escape(target)}</b> (last 20)", ""]
+            for f in feedback:
+                ts = datetime.fromtimestamp(f["ts"], tz=timezone.utc).strftime("%m-%d %H:%M")
+                text = html_mod.escape((f["feedback_text"] or "")[:80])
+                changes = f["changes_applied"] or "{}"
+                lines.append(f"  {ts} \"{text}\"")
+                lines.append(f"    Changes: <code>{html_mod.escape(changes[:100])}</code>")
+            self._bot.send_message(chat_id, "\n".join(lines))
+            return {"action": "admin_feedback", "user_id": user_id}
+
+        if subcmd == "prefs":
+            target = subargs.strip() if subargs else user_id
+            prefs = db.get_user_preference_history(target, limit=30)
+            if not prefs:
+                self._bot.send_message(chat_id, f"No preference changes for {target}.")
+                return {"action": "admin_prefs", "user_id": user_id}
+            lines = [f"<b>Preference History: {html_mod.escape(target)}</b> (last 30)", ""]
+            for p in prefs:
+                ts = datetime.fromtimestamp(p["ts"], tz=timezone.utc).strftime("%m-%d %H:%M")
+                lines.append(
+                    f"  {ts} [{p['change_type']}] {p['field']}: "
+                    f"{p['old_value']} -> {p['new_value']} ({p['source']})"
+                )
+            self._bot.send_message(chat_id, "\n".join(lines))
+            return {"action": "admin_prefs", "user_id": user_id}
+
+        if subcmd == "requests":
+            reqs = db.get_recent_requests(limit=15)
+            if not reqs:
+                self._bot.send_message(chat_id, "No requests recorded.")
+                return {"action": "admin_requests", "user_id": user_id}
+            lines = ["<b>Recent Requests</b> (last 15)", ""]
+            for r in reqs:
+                ts = datetime.fromtimestamp(r["started_at"], tz=timezone.utc).strftime("%m-%d %H:%M")
+                elapsed = f"{r['total_elapsed_s']:.1f}s" if r["total_elapsed_s"] else "?"
+                lines.append(
+                    f"  {ts} <code>{r['request_id'][:20]}</code> "
+                    f"u:{r['user_id'][:8]} cand:{r['candidate_count']} "
+                    f"sel:{r['selected_count']} {elapsed} [{r['status']}]"
+                )
+            self._bot.send_message(chat_id, "\n".join(lines))
+            return {"action": "admin_requests", "user_id": user_id}
+
+        if subcmd == "request":
+            if not subargs:
+                self._bot.send_message(chat_id, "Usage: /admin request [request_id]")
+                return {"action": "admin_request_help", "user_id": user_id}
+            detail = db.get_request_detail(subargs.strip())
+            req = detail["request"]
+            if not req:
+                self._bot.send_message(chat_id, f"Request {subargs} not found.")
+                return {"action": "admin_request_notfound", "user_id": user_id}
+            lines = [
+                f"<b>Request: {html_mod.escape(req['request_id'][:30])}</b>",
+                f"  User: {req['user_id']}",
+                f"  Prompt: {html_mod.escape((req['prompt'] or '')[:80])}",
+                f"  Candidates: {req['candidate_count']}",
+                f"  Selected: {req['selected_count']}",
+                f"  Type: {req['briefing_type']}",
+                f"  Elapsed: {req['total_elapsed_s']}s",
+                f"  Status: {req['status']}",
+                "",
+                f"<b>Votes:</b> {len(detail['votes'])} total",
+                f"<b>Items delivered:</b> {len(detail['items'])}",
+            ]
+            # Show top selected candidates
+            selected = [c for c in detail["candidates"] if c["was_selected"]]
+            if selected:
+                lines.append("")
+                lines.append("<b>Selected Stories:</b>")
+                for c in selected[:10]:
+                    lines.append(
+                        f"  [{c['source']}] {html_mod.escape((c['title'] or '')[:60])} "
+                        f"(score:{c['composite_score']:.3f})"
+                    )
+            self._bot.send_message(chat_id, "\n".join(lines))
+            return {"action": "admin_request", "user_id": user_id}
+
+        if subcmd == "topics":
+            topics = db.get_top_topics()
+            if not topics:
+                self._bot.send_message(chat_id, "No topic data yet.")
+                return {"action": "admin_topics", "user_id": user_id}
+            lines = ["<b>Top Topics (30 days)</b>", ""]
+            for t in topics:
+                lines.append(
+                    f"  {t['topic']}: {t['count']} candidates, "
+                    f"{t['times_selected']} selected, "
+                    f"avg score: {t['avg_score']:.3f}"
+                )
+            self._bot.send_message(chat_id, "\n".join(lines))
+            return {"action": "admin_topics", "user_id": user_id}
+
+        if subcmd == "sources":
+            sources = db.get_top_sources()
+            if not sources:
+                self._bot.send_message(chat_id, "No source data yet.")
+                return {"action": "admin_sources", "user_id": user_id}
+            lines = ["<b>Top Sources (30 days)</b>", ""]
+            for s in sources:
+                sel_rate = (s["times_selected"] / s["total_candidates"] * 100) if s["total_candidates"] else 0
+                lines.append(
+                    f"  {s['source']}: {s['total_candidates']} cand, "
+                    f"{s['times_selected']} sel ({sel_rate:.0f}%), "
+                    f"avg: {s['avg_score']:.3f}"
+                )
+            self._bot.send_message(chat_id, "\n".join(lines))
+            return {"action": "admin_sources", "user_id": user_id}
+
+        if subcmd == "briefings":
+            target = subargs.strip() if subargs else user_id
+            briefings = db.get_user_briefings(target, limit=15)
+            if not briefings:
+                self._bot.send_message(chat_id, f"No briefings for {target}.")
+                return {"action": "admin_briefings", "user_id": user_id}
+            lines = [f"<b>Briefings: {html_mod.escape(target)}</b> (last 15)", ""]
+            for b in briefings:
+                ts = datetime.fromtimestamp(b["delivered_at"], tz=timezone.utc).strftime("%m-%d %H:%M")
+                lines.append(
+                    f"  {ts} [{b['briefing_type']}] "
+                    f"{b['item_count']} items | "
+                    f"<code>{b['request_id'][:16]}</code>"
+                )
+            self._bot.send_message(chat_id, "\n".join(lines))
+            return {"action": "admin_briefings", "user_id": user_id}
+
+        self._bot.send_message(chat_id, f"Unknown admin command: {subcmd}. Try /admin help")
+        return {"action": "admin_unknown", "user_id": user_id}
