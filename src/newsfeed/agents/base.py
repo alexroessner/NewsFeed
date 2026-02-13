@@ -125,3 +125,74 @@ class ResearchAgent(ABC):
         text = f"{title} {summary}".lower()
         hits = sum(1 for kw in self._FORWARD_KW if kw in text)
         return round(min(0.12, hits * 0.03), 3)
+
+    # ── Location detection ──────────────────────────────────────────
+    # Maps keywords → location tags at city, country, region, or continent level.
+    # Used by all agents to auto-tag stories with geographic context.
+
+    _LOCATION_MAP: dict[str, str] = {
+        # Cities
+        "washington": "Washington, US", "beijing": "Beijing, China",
+        "moscow": "Moscow, Russia", "kyiv": "Kyiv, Ukraine",
+        "london": "London, UK", "paris": "Paris, France",
+        "berlin": "Berlin, Germany", "tokyo": "Tokyo, Japan",
+        "jerusalem": "Jerusalem, Israel", "tehran": "Tehran, Iran",
+        "taipei": "Taipei, Taiwan", "new delhi": "New Delhi, India",
+        "delhi": "Delhi, India", "mumbai": "Mumbai, India",
+        "brussels": "Brussels, Belgium", "geneva": "Geneva, Switzerland",
+        "davos": "Davos, Switzerland",
+        "cairo": "Cairo, Egypt", "riyadh": "Riyadh, Saudi Arabia",
+        "istanbul": "Istanbul, Turkey", "kabul": "Kabul, Afghanistan",
+        "hong kong": "Hong Kong", "singapore": "Singapore",
+        "seoul": "Seoul, South Korea", "pyongyang": "Pyongyang, North Korea",
+        "baghdad": "Baghdad, Iraq", "damascus": "Damascus, Syria",
+        "nairobi": "Nairobi, Kenya", "addis ababa": "Addis Ababa, Ethiopia",
+        "silicon valley": "Silicon Valley, US",
+        "wall street": "Wall Street, US",
+        # Countries
+        "united states": "United States", "china": "China",
+        "russia": "Russia", "ukraine": "Ukraine", "israel": "Israel",
+        "palestine": "Palestine", "iran": "Iran", "iraq": "Iraq",
+        "syria": "Syria", "yemen": "Yemen", "lebanon": "Lebanon",
+        "saudi arabia": "Saudi Arabia", "turkey": "Turkey",
+        "india": "India", "pakistan": "Pakistan",
+        "taiwan": "Taiwan", "japan": "Japan", "south korea": "South Korea",
+        "north korea": "North Korea", "australia": "Australia",
+        "brazil": "Brazil", "mexico": "Mexico", "canada": "Canada",
+        "germany": "Germany", "france": "France",
+        "united kingdom": "United Kingdom",
+        "nigeria": "Nigeria", "ethiopia": "Ethiopia",
+        "kenya": "Kenya", "sudan": "Sudan", "somalia": "Somalia",
+        "congo": "Congo", "libya": "Libya", "egypt": "Egypt",
+        "south africa": "South Africa", "afghanistan": "Afghanistan",
+        "myanmar": "Myanmar", "venezuela": "Venezuela", "colombia": "Colombia",
+        # Regions and blocs
+        "nato": "NATO", "european union": "European Union",
+        "middle east": "Middle East", "sahel": "Sahel",
+        "gaza": "Gaza", "west bank": "West Bank",
+        "kashmir": "Kashmir", "xinjiang": "Xinjiang",
+        "crimea": "Crimea", "donbas": "Donbas",
+        "arctic": "Arctic", "south china sea": "South China Sea",
+        "korean peninsula": "Korean Peninsula",
+        "persian gulf": "Persian Gulf", "horn of africa": "Horn Of Africa",
+        "baltic": "Baltic States",
+        # Continents
+        "europe": "Europe", "asia": "Asia", "africa": "Africa",
+        "americas": "Americas", "latin america": "Latin America",
+        "south asia": "South Asia", "east asia": "East Asia",
+        "southeast asia": "Southeast Asia", "central asia": "Central Asia",
+        "north america": "North America",
+    }
+
+    def detect_locations(self, title: str, summary: str) -> list[str]:
+        """Detect geographic locations at city/country/region/continent level."""
+        text = f"{title} {summary}".lower()
+        seen: set[str] = set()
+        locations: list[str] = []
+        for keyword, location in self._LOCATION_MAP.items():
+            if keyword in text and location not in seen:
+                seen.add(location)
+                locations.append(location)
+            if len(locations) >= 5:
+                break
+        return locations

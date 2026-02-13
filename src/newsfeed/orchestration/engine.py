@@ -11,6 +11,7 @@ from newsfeed.agents.experts import ExpertCouncil
 from newsfeed.agents.registry import create_agent
 from newsfeed.delivery.telegram import TelegramFormatter
 from newsfeed.intelligence.clustering import StoryClustering
+from newsfeed.intelligence.enrichment import ArticleEnricher
 from newsfeed.intelligence.credibility import (
     CredibilityTracker,
     detect_cross_corroboration,
@@ -172,6 +173,19 @@ class NewsFeedEngine:
             baseline_decay=intel_cfg.get("baseline_decay", 0.8),
         )
 
+        # Article enrichment — fetch and summarize full articles post-selection
+        enrich_cfg = pipeline.get("enrichment", {})
+        self.enricher = ArticleEnricher(
+            llm_api_key=api_keys.get("anthropic_api_key", ""),
+            llm_model=ec_cfg.get("llm_model", "claude-sonnet-4-5-20250929"),
+            llm_base_url=ec_cfg.get("llm_base_url", "https://api.anthropic.com/v1"),
+            gemini_api_key=api_keys.get("gemini_api_key", ""),
+            gemini_model=enrich_cfg.get("gemini_model", "gemini-2.0-flash"),
+            fetch_timeout=enrich_cfg.get("fetch_timeout", 8),
+            max_workers=enrich_cfg.get("max_workers", 5),
+            target_summary_chars=enrich_cfg.get("target_summary_chars", 500),
+        )
+
         # Configurable thresholds
         self._confidence_offset = scoring_cfg.get("confidence_band_offset", 0.15)
         self._contrarian_novelty = intel_cfg.get("contrarian_novelty_threshold", 0.8)
@@ -321,6 +335,17 @@ class NewsFeedEngine:
 
         dominant_topic = max(task.weighted_topics, key=task.weighted_topics.get, default="general")
         self.cache.put(user_id, dominant_topic, reserve)
+
+        # Stage 3.5: Article enrichment — fetch full articles and generate real summaries
+        # Only the selected stories get enriched (not all candidates)
+        t0 = time.monotonic()
+        try:
+            selected = self.enricher.enrich(selected)
+        except Exception:
+            log.exception("Article enrichment failed, continuing with RSS summaries")
+        enrich_ms = (time.monotonic() - t0) * 1000
+        self.optimizer.record_stage_run("article_enrichment", enrich_ms)
+        log.info("Article enrichment completed in %.0fms", enrich_ms)
 
         # Stage 4: Narrative threading
         threads = []
