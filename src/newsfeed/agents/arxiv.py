@@ -110,6 +110,12 @@ class ArXivAgent(ResearchAgent):
             author_note = f"by {', '.join(authors[:3])}" if authors else ""
             cat_note = f"[{', '.join(categories[:2])}]" if categories else ""
 
+            # Content-aware scoring
+            age_hours = max(0.1, (datetime.now(timezone.utc) - created_at).total_seconds() / 3600)
+            recency_novelty = round(max(0.5, min(1.0, 1.0 - age_hours / 48)), 3)
+            mandate_fit = self._mandate_boost(title, summary)
+            pred_boost = self._prediction_boost(title, summary)
+
             candidates.append(CandidateItem(
                 candidate_id=f"{self.agent_id}-{cid}",
                 title=title[:200],
@@ -118,9 +124,9 @@ class ArXivAgent(ResearchAgent):
                 url=paper_url,
                 topic=topic,
                 evidence_score=0.72,  # Preprints: high novelty, moderate evidence pre-peer-review
-                novelty_score=round(max(0.5, 1.0 - idx * 0.04), 3),
-                preference_fit=preference_fit,
-                prediction_signal=0.60,  # Academic papers have strong predictive value
+                novelty_score=recency_novelty,
+                preference_fit=round(min(1.0, preference_fit + mandate_fit), 3),
+                prediction_signal=round(min(1.0, 0.60 + pred_boost), 3),
                 discovered_by=self.agent_id,
                 created_at=created_at,
             ))
