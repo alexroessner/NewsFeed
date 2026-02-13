@@ -6,6 +6,7 @@ Feeds: https://www.bbc.co.uk/news/10628494
 from __future__ import annotations
 
 import hashlib
+import html
 import logging
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -131,6 +132,9 @@ class BBCAgent(ResearchAgent):
 
             if not title:
                 continue
+
+            title = html.unescape(title)
+            summary = html.unescape(summary)
 
             created_at = datetime.now(timezone.utc)
             if pub_date_el is not None and pub_date_el.text:

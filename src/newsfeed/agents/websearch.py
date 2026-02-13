@@ -48,19 +48,35 @@ class WebSearchAgent(ResearchAgent):
 
     def run(self, task: ResearchTask, top_k: int = 5) -> list[CandidateItem]:
         all_items: list[CandidateItem] = []
+        sorted_topics = sorted(task.weighted_topics, key=task.weighted_topics.get, reverse=True)
 
-        # Strategy 1: Topic-specific feeds
-        top_topics = sorted(task.weighted_topics, key=task.weighted_topics.get, reverse=True)[:2]
-        for topic in top_topics:
-            if topic in _GNEWS_TOPICS:
-                items = self._fetch_rss(_GNEWS_TOPICS[topic], topic, task)
-                all_items.extend(items)
-
-        # Strategy 2: Keyword search
-        query = self._build_query(task)
-        search_url = _GNEWS_SEARCH.format(query=quote_plus(query))
-        search_items = self._fetch_rss(search_url, "general", task)
-        all_items.extend(search_items)
+        # Each web agent uses a different search strategy so they don't return
+        # identical results.  Strategy is selected based on agent_id suffix.
+        if "verification" in self.agent_id:
+            # Verification agent: keyword search for specific claims/names
+            query = self._build_verification_query(task)
+            search_url = _GNEWS_SEARCH.format(query=quote_plus(query))
+            all_items.extend(self._fetch_rss(search_url, "general", task))
+        elif "emerging" in self.agent_id:
+            # Emerging agent: lower-weighted topics that might be developing
+            tail_topics = sorted_topics[2:5] if len(sorted_topics) > 2 else sorted_topics
+            for topic in tail_topics:
+                if topic in _GNEWS_TOPICS:
+                    all_items.extend(self._fetch_rss(_GNEWS_TOPICS[topic], topic, task))
+            if not all_items:
+                query = " ".join(t.replace("_", " ") for t in tail_topics[:3])
+                search_url = _GNEWS_SEARCH.format(query=quote_plus(query))
+                all_items.extend(self._fetch_rss(search_url, "general", task))
+        else:
+            # Discovery agent (default): top-priority topic feeds
+            top_topics = sorted_topics[:2]
+            for topic in top_topics:
+                if topic in _GNEWS_TOPICS:
+                    all_items.extend(self._fetch_rss(_GNEWS_TOPICS[topic], topic, task))
+            # Plus keyword search for the prompt itself
+            if task.prompt:
+                search_url = _GNEWS_SEARCH.format(query=quote_plus(task.prompt[:60]))
+                all_items.extend(self._fetch_rss(search_url, "general", task))
 
         # Dedupe by title
         seen: set[str] = set()
@@ -151,6 +167,20 @@ class WebSearchAgent(ResearchAgent):
         for topic in top_topics:
             keywords.extend(topic.replace("_", " ").split())
         return " ".join(keywords[:5]) if keywords else task.prompt[:80]
+
+    def _build_verification_query(self, task: ResearchTask) -> str:
+        """Build a cross-reference search query for fact-checking angles."""
+        top_topic = max(task.weighted_topics, key=task.weighted_topics.get, default="news")
+        # Search for analysis and fact-check content, not just headlines
+        verification_terms = {
+            "geopolitics": "geopolitical analysis latest developments",
+            "ai_policy": "AI regulation policy update analysis",
+            "technology": "technology industry analysis latest",
+            "markets": "financial markets analysis economic outlook",
+            "climate": "climate policy analysis environment update",
+            "crypto": "cryptocurrency regulation analysis",
+        }
+        return verification_terms.get(top_topic, f"{top_topic.replace('_', ' ')} analysis latest")
 
     def _source_evidence(self, source_name: str) -> float:
         """Estimate evidence quality based on source name."""
