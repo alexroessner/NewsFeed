@@ -57,6 +57,19 @@ def load_runtime_config(config_dir: Path) -> RuntimeConfig:
     agents = load_json(config_dir / "agents.json")
     pipeline = load_json(config_dir / "pipelines.json")
     personas = load_json(config_dir / "review_personas.json")
+
+    # Merge secrets into api_keys (secrets.json is gitignored)
+    secrets_path = config_dir / "secrets.json"
+    if secrets_path.exists():
+        try:
+            secrets = load_json(secrets_path)
+            api_keys = pipeline.setdefault("api_keys", {})
+            for key, value in secrets.items():
+                if value:  # Only override if secret has a non-empty value
+                    api_keys[key] = value
+        except ConfigError:
+            pass  # Malformed secrets file — skip silently
+
     cfg = RuntimeConfig(agents=agents, pipeline=pipeline, personas=personas)
     cfg.validate()
     return cfg
