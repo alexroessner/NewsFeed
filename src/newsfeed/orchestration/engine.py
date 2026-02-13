@@ -579,6 +579,12 @@ class NewsFeedEngine:
                 f"feedback-{user_id}", user_id,
                 "multi_update", "; ".join(f"{k}={v}" for k, v in results.items()),
             )
+            # Persist immediately so feedback survives restarts
+            if self._persistence:
+                try:
+                    self._persistence.save("preferences", self.preferences.snapshot())
+                except Exception:
+                    log.exception("Failed to persist preferences after feedback")
 
         log.info("Applied %d updates for user=%s", len(results), user_id)
         return results

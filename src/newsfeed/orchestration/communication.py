@@ -144,6 +144,10 @@ class CommunicationAgent:
 
         if command == "reset":
             self._engine.preferences.reset(user_id)
+            self._engine.apply_user_feedback(user_id, "reset preferences")
+            self._shown_ids.pop(user_id, None)
+            self._last_items.pop(user_id, None)
+            self._last_topic.pop(user_id, None)
             self._bot.send_message(chat_id, "All preferences reset to defaults.")
             return {"action": "reset", "user_id": user_id}
 
@@ -322,7 +326,7 @@ class CommunicationAgent:
         except ValueError:
             return {"action": "rate_error", "user_id": user_id}
 
-        direction = parts[2]
+        direction = parts[2].lower()
         items = self._last_items.get(user_id, [])
 
         if item_num < 1 or item_num > len(items):
