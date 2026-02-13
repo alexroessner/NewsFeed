@@ -5,3 +5,4 @@ config/secrets.json
 .env
 state/
 live_test*.py
+run_briefing_review.py

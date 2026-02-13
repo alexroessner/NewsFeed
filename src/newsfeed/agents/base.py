@@ -12,10 +12,29 @@ log = logging.getLogger(__name__)
 class ResearchAgent(ABC):
     """Base class for all research agents (simulated and real)."""
 
+    # Stop words excluded from mandate keyword extraction
+    _STOP = frozenset({
+        "the", "and", "for", "from", "with", "that", "this", "are", "has", "have",
+        "been", "its", "their", "which", "into", "also", "than", "more", "most",
+        "other", "all", "any", "each", "but", "not", "can", "may", "will",
+        "about", "across", "between", "through", "when", "where", "how",
+        "monitor", "track", "surface", "mine", "scan", "map", "capture",
+        "leverage", "sweep", "check", "detect", "identify", "key",
+    })
+
+    # Forward-looking language for prediction signal
+    _FORWARD_KW = frozenset({
+        "forecast", "predict", "expect", "outlook", "ahead", "future",
+        "plan", "announce", "upcoming", "next", "target", "proposal",
+        "guidance", "estimate", "proposed", "pending", "launch",
+    })
+
     def __init__(self, agent_id: str, source: str, mandate: str) -> None:
         self.agent_id = agent_id
         self.source = source
         self.mandate = mandate
+        # Extract mandate keywords for content-aware scoring
+        self._mandate_kw = self._extract_mandate_kw()
 
     @abstractmethod
     def run(self, task: ResearchTask, top_k: int = 5) -> list[CandidateItem]:
@@ -83,3 +102,26 @@ class ResearchAgent(ABC):
                 hit_rate = hits / len(keywords)
                 score += (weight / total_weight) * min(1.0, hit_rate * 3.0 + 0.2)
         return round(min(1.0, score + 0.15), 3)  # baseline relevance of 0.15
+
+    def _extract_mandate_kw(self) -> list[str]:
+        """Extract content-matching keywords from the agent's mandate."""
+        words: set[str] = set()
+        for token in self.mandate.lower().replace("-", " ").split():
+            cleaned = token.strip(",.;:()[]{}\"'")
+            if len(cleaned) >= 3 and cleaned not in self._STOP:
+                words.add(cleaned)
+        return sorted(words)
+
+    def _mandate_boost(self, title: str, summary: str) -> float:
+        """Score how well an article matches this agent's specific mandate."""
+        if not self._mandate_kw:
+            return 0.0
+        text = f"{title} {summary}".lower()
+        hits = sum(1 for kw in self._mandate_kw if kw in text)
+        return round(min(0.15, hits / max(len(self._mandate_kw), 1) * 0.3), 3)
+
+    def _prediction_boost(self, title: str, summary: str) -> float:
+        """Detect forward-looking language for prediction signal enhancement."""
+        text = f"{title} {summary}".lower()
+        hits = sum(1 for kw in self._FORWARD_KW if kw in text)
+        return round(min(0.12, hits * 0.03), 3)

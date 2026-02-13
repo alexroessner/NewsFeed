@@ -173,6 +173,32 @@ class TelegramBot:
         keyboard = {"inline_keyboard": rows}
         return self.send_message(chat_id, formatted_text, reply_markup=keyboard)
 
+    def send_story_card(
+        self,
+        chat_id: int | str,
+        text: str,
+        is_last: bool = False,
+    ) -> dict:
+        """Send a single story card, with action buttons only on the last one."""
+        if is_last:
+            rows: list[list[dict]] = [
+                [
+                    {"text": "\u25b6 More", "callback_data": "cmd:more"},
+                    {"text": "\U0001f50d Deep Dive", "callback_data": "cmd:deep_dive"},
+                ],
+                [
+                    {"text": "\U0001f44d More like this", "callback_data": "pref:more_similar"},
+                    {"text": "\U0001f44e Less like this", "callback_data": "pref:less_similar"},
+                ],
+                [
+                    {"text": "\u2b50 Rate Stories", "callback_data": "cmd:rate_prompt"},
+                    {"text": "\u2699 Settings", "callback_data": "cmd:settings"},
+                ],
+            ]
+            keyboard = {"inline_keyboard": rows}
+            return self.send_message(chat_id, text, reply_markup=keyboard)
+        return self.send_message(chat_id, text)
+
     def send_breaking_alert(self, chat_id: int | str, formatted_text: str) -> dict:
         """Send a breaking alert with urgency formatting."""
         keyboard = {
