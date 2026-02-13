@@ -12,11 +12,15 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import urllib.error
 import urllib.request
 from typing import Any
 
 log = logging.getLogger(__name__)
+
+_MAX_RETRIES = 3
+_RETRY_BACKOFF = (1.0, 2.0, 4.0)
 
 
 class D1Client:
@@ -39,28 +43,48 @@ class D1Client:
         self.database_id = database_id
 
     def _post(self, body: dict | list) -> list[dict]:
-        """Send a query to D1 and return the result array."""
+        """Send a query to D1 and return the result array.
+
+        Retries on transient 403/429/5xx errors with exponential backoff.
+        """
         data = json.dumps(body).encode("utf-8")
-        req = urllib.request.Request(
-            self._url, data=data, headers=self._headers, method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                result = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            body_text = e.read().decode("utf-8", errors="replace")[:500]
-            log.error("D1 API error %d: %s", e.code, body_text)
-            raise
-        except urllib.error.URLError as e:
-            log.error("D1 network error: %s", e.reason)
-            raise
 
-        if not result.get("success"):
-            errors = result.get("errors", [])
-            log.error("D1 query failed: %s", errors)
-            raise RuntimeError(f"D1 query failed: {errors}")
+        for attempt in range(_MAX_RETRIES + 1):
+            req = urllib.request.Request(
+                self._url, data=data, headers=self._headers, method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    result = json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                body_text = e.read().decode("utf-8", errors="replace")[:500]
+                # Retry on transient errors (403 rate-limit, 429, 5xx)
+                if e.code in (403, 429, 500, 502, 503) and attempt < _MAX_RETRIES:
+                    wait = _RETRY_BACKOFF[attempt]
+                    log.warning("D1 API %d (attempt %d/%d), retrying in %.1fs: %s",
+                                e.code, attempt + 1, _MAX_RETRIES + 1, wait, body_text[:120])
+                    time.sleep(wait)
+                    continue
+                log.error("D1 API error %d: %s", e.code, body_text)
+                raise
+            except urllib.error.URLError as e:
+                if attempt < _MAX_RETRIES:
+                    wait = _RETRY_BACKOFF[attempt]
+                    log.warning("D1 network error (attempt %d/%d), retrying in %.1fs: %s",
+                                attempt + 1, _MAX_RETRIES + 1, wait, e.reason)
+                    time.sleep(wait)
+                    continue
+                log.error("D1 network error: %s", e.reason)
+                raise
 
-        return result.get("result", [])
+            if not result.get("success"):
+                errors = result.get("errors", [])
+                log.error("D1 query failed: %s", errors)
+                raise RuntimeError(f"D1 query failed: {errors}")
+
+            return result.get("result", [])
+
+        return []  # unreachable, but satisfies type checker
 
     def execute(self, sql: str, params: tuple = ()) -> list[dict]:
         """Execute a single SQL statement. Returns list of row dicts."""
@@ -74,45 +98,35 @@ class D1Client:
         return []
 
     def execute_many(self, sql: str, params_list: list[tuple]) -> None:
-        """Execute a parameterized statement for each set of params (batch).
+        """Execute a parameterized statement for each set of params.
 
-        D1 supports up to 100 statements per batch. We chunk accordingly.
+        The D1 REST API only accepts single statements per request,
+        so we iterate and send each individually.
         """
         if not params_list:
             return
 
-        for chunk_start in range(0, len(params_list), 100):
-            chunk = params_list[chunk_start:chunk_start + 100]
-            batch = []
-            for params in chunk:
-                stmt: dict[str, Any] = {"sql": sql}
-                if params:
-                    stmt["params"] = [_convert_param(p) for p in params]
-                batch.append(stmt)
-            self._post(batch)
+        for params in params_list:
+            self.execute(sql, params)
 
     def execute_script(self, script: str) -> None:
         """Execute a multi-statement SQL script (schema init).
 
-        Splits on semicolons and sends as a batch.
+        Splits on semicolons and sends each statement individually,
+        since the D1 REST API only accepts single statements per request.
+        Continues on failure so partial schema creation is possible
+        (all DDL uses IF NOT EXISTS, so re-running is safe).
         """
-        statements = []
         for raw in script.split(";"):
-            stmt = raw.strip()
-            if stmt and not stmt.startswith("--"):
-                # Skip pure comments
-                lines = [l for l in stmt.split("\n") if not l.strip().startswith("--")]
-                clean = "\n".join(lines).strip()
-                if clean:
-                    statements.append({"sql": clean})
-
-        if not statements:
-            return
-
-        # D1 batch limit is 100 statements; chunk if schema is large
-        for chunk_start in range(0, len(statements), 100):
-            chunk = statements[chunk_start:chunk_start + 100]
-            self._post(chunk)
+            # Strip comment-only lines first, then check if anything remains
+            lines = [l for l in raw.split("\n") if not l.strip().startswith("--")]
+            clean = "\n".join(lines).strip()
+            if clean:
+                try:
+                    self.execute(clean)
+                except Exception:
+                    log.warning("D1 script statement failed (will retry on next init): %s",
+                                clean.replace("\n", " ")[:100])
 
     def query(self, sql: str, params: tuple = ()) -> list[dict]:
         """Execute a read query and return list of row dicts."""

@@ -391,12 +391,17 @@ class AnalyticsDB:
             try:
                 if self._d1:
                     self._d1.execute_script(_SCHEMA_SQL)
-                    rows = self._d1.query("SELECT version FROM schema_version LIMIT 1")
-                    if not rows:
-                        self._d1.execute(
-                            "INSERT INTO schema_version (version) VALUES (?)",
-                            (_SCHEMA_VERSION,),
-                        )
+                    # Verify schema_version table exists (proves at least partial init)
+                    try:
+                        rows = self._d1.query("SELECT version FROM schema_version LIMIT 1")
+                        if not rows:
+                            self._d1.execute(
+                                "INSERT INTO schema_version (version) VALUES (?)",
+                                (_SCHEMA_VERSION,),
+                            )
+                    except Exception:
+                        log.warning("schema_version check failed on D1, will retry next time")
+                        return  # Don't set _initialized so we retry
                     log.info("Analytics DB initialized on Cloudflare D1 (schema v%d)", _SCHEMA_VERSION)
                 else:
                     conn = self._conn()
@@ -408,6 +413,7 @@ class AnalyticsDB:
                     log.info("Analytics DB initialized at %s (schema v%d)", self._db_path, _SCHEMA_VERSION)
             except Exception:
                 log.exception("Failed to initialize analytics schema on %s", self._backend)
+                return  # Don't set _initialized so we retry
             self._initialized = True
 
     def _safe_exec(self, sql: str, params: tuple = ()) -> None:
