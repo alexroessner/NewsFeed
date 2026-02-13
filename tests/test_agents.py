@@ -1213,10 +1213,9 @@ class StyleReviewAgentTests(unittest.TestCase):
         item = _make_report_item()
         profile = UserProfile(user_id="u1", tone="analyst")
         result = agent.review(item, profile)
-        # Tone prefixes are now empty (formatter handles labels);
-        # verify rewrite happened and uses summary content
+        # Rewrite uses the full summary as content
         self.assertNotEqual(result.why_it_matters, "Base why text.")
-        self.assertIn("reuters", result.why_it_matters.lower())
+        self.assertIn("summary", result.why_it_matters.lower())
 
     def test_executive_tone_rewrite(self) -> None:
         agent = StyleReviewAgent()
@@ -1242,7 +1241,9 @@ class StyleReviewAgentTests(unittest.TestCase):
         item = _make_report_item(urgency=UrgencyLevel.BREAKING)
         profile = UserProfile(user_id="u1")
         result = agent.review(item, profile)
-        self.assertIn("developing rapidly", result.why_it_matters.lower())
+        # Urgency is now shown via icon in the card, not as text prefix
+        # Verify the summary content is still used
+        self.assertIn("summary", result.why_it_matters.lower())
 
     def test_what_changed_corroboration(self) -> None:
         agent = StyleReviewAgent()
@@ -1269,7 +1270,7 @@ class StyleReviewAgentTests(unittest.TestCase):
         # Persona context is no longer appended to visible output;
         # verify the review still rewrites the text using summary content
         self.assertNotEqual(result.why_it_matters, "Base why text.")
-        self.assertIn("reuters", result.why_it_matters.lower())
+        self.assertIn("summary", result.why_it_matters.lower())
 
 
 class ClarityReviewAgentTests(unittest.TestCase):

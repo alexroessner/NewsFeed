@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import re
 
 from newsfeed.models.domain import (
     BriefingType,
@@ -53,6 +54,32 @@ def _section(title: str) -> str:
     return f"<b>\u2500\u2500\u2500 {title} {trail}</b>"
 
 
+def _clean_summary(text: str) -> str:
+    """Clean up RSS summary artifacts (Google News multi-headline concatenations, etc.)."""
+    # Normalize non-breaking spaces (\xa0) to regular spaces first
+    normalized = text.replace("\xa0", " ")
+    # Google News RSS concatenates headlines: "Story  SourceOther story  Source2..."
+    # Split on double-space followed by a capitalized word (source name boundary)
+    parts = re.split(r"  +(?=[A-Z])", normalized, maxsplit=1)
+    cleaned = parts[0].strip()
+    # Also remove "via SourceName: " prefix from web aggregator summaries
+    cleaned = re.sub(r"^via\s+[^:]+:\s*", "", cleaned, flags=re.IGNORECASE)
+    # Cap at a readable length
+    if len(cleaned) > 280:
+        # Cut at last sentence boundary before 280
+        cut = cleaned[:280].rfind(".")
+        if cut > 100:
+            cleaned = cleaned[:cut + 1]
+        else:
+            cleaned = cleaned[:277] + "..."
+    return cleaned
+
+
+def _format_region(name: str) -> str:
+    """Format a region name for display."""
+    return name.replace("_", " ").title()
+
+
 class TelegramFormatter:
     def format(self, payload: DeliveryPayload, ticker_bar: str = "") -> str:
         lines: list[str] = []
@@ -79,7 +106,7 @@ class TelegramFormatter:
                 for risk in escalating[:4]:
                     arrow = "\u2191" if risk.escalation_delta > 0 else "\u2193"
                     lines.append(
-                        f"  \u2022 <b>{_esc(risk.region)}</b>: {risk.risk_level:.0%} "
+                        f"  \u2022 <b>{_esc(_format_region(risk.region))}</b>: {risk.risk_level:.0%} "
                         f"({arrow}{abs(risk.escalation_delta):.0%})"
                     )
 
@@ -218,7 +245,7 @@ class TelegramFormatter:
                 for risk in escalating[:4]:
                     arrow = "\u2191" if risk.escalation_delta > 0 else "\u2193"
                     lines.append(
-                        f"  \u2022 <b>{_esc(risk.region)}</b>: {risk.risk_level:.0%} "
+                        f"  \u2022 <b>{_esc(_format_region(risk.region))}</b>: {risk.risk_level:.0%} "
                         f"({arrow}{abs(risk.escalation_delta):.0%})"
                     )
 
@@ -258,12 +285,13 @@ class TelegramFormatter:
         return "\n".join(lines).strip()
 
     def format_story_card(self, item: ReportItem, index: int) -> str:
-        """Format a single story as a standalone message card."""
+        """Format a single story as a clean, readable news card."""
         lines: list[str] = []
         c = item.candidate
         urgency_icon = _URGENCY_ICON.get(c.urgency, "")
         prefix = f"{urgency_icon} " if urgency_icon else ""
 
+        # Title as clickable link + source
         title_esc = _esc(c.title)
         if c.url and not c.url.startswith("https://example.com"):
             title_line = (
@@ -275,29 +303,33 @@ class TelegramFormatter:
 
         source_tag = f"<i>[{_esc(c.source)}]</i>"
         lines.append(f"{title_line} {source_tag}")
-        lines.append(f"   {_esc(item.why_it_matters)}")
 
-        if item.what_changed:
-            lines.append(
-                f"   \u25b8 <i>Changed:</i> {_esc(item.what_changed)}"
-            )
-        if item.predictive_outlook:
-            lines.append(
-                f"   \u25b8 <i>Outlook:</i> {_esc(item.predictive_outlook)}"
-            )
-        if item.confidence:
-            lines.append(
-                f"   \u25b8 <i>Confidence:</i> {item.confidence.label()} "
-                f"({item.confidence.low:.0%}\u2013{item.confidence.high:.0%})"
+        # Main body: the actual story content
+        body = c.summary.strip() if c.summary else ""
+        if body:
+            body = _clean_summary(body)
+            lines.append("")
+            lines.append(_esc(body))
+
+        # Contrarian signal — genuinely interesting when present
+        if item.contrarian_note:
+            lines.append("")
+            lines.append(f"\u26a1 {_esc(item.contrarian_note)}")
+
+        # Compact metadata footer: regions + corroboration
+        meta_parts: list[str] = []
+        if c.regions:
+            meta_parts.append(
+                f"\U0001f4cd {', '.join(r.replace('_', ' ').title() for r in c.regions[:3])}"
             )
         if c.corroborated_by:
-            lines.append(
-                f"   \u25b8 <i>Verified by:</i> {', '.join(c.corroborated_by)}"
+            meta_parts.append(
+                f"\u2713 {', '.join(c.corroborated_by[:3])}"
             )
-        if item.contrarian_note:
-            lines.append(
-                f"   \u26a1 <i>{_esc(item.contrarian_note)}</i>"
-            )
+        if meta_parts:
+            lines.append("")
+            dot_sep = " \u00b7 "
+            lines.append(f"<i>{dot_sep.join(meta_parts)}</i>")
 
         return "\n".join(lines).strip()
 
