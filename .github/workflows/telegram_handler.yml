@@ -20,6 +20,21 @@ jobs:
       - name: Install dependencies
         run: pip install -e .
 
+      - name: Debug secrets and payload
+        env:
+          TELEGRAM_UPDATE: ${{ toJson(github.event.client_payload.update) }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          echo "=== Payload Debug ==="
+          echo "TELEGRAM_UPDATE length: ${#TELEGRAM_UPDATE}"
+          echo "TELEGRAM_UPDATE first 200: ${TELEGRAM_UPDATE:0:200}"
+          echo "=== Secrets Debug (lengths only) ==="
+          echo "TELEGRAM_BOT_TOKEN length: ${#TELEGRAM_BOT_TOKEN}"
+          echo "GEMINI_API_KEY length: ${#GEMINI_API_KEY}"
+          echo "=== Python check ==="
+          python3 -c "import newsfeed; print('Package import OK')"
+
       - name: Process Telegram update
         env:
           TELEGRAM_UPDATE: ${{ toJson(github.event.client_payload.update) }}
