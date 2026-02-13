@@ -59,16 +59,45 @@ class PreferenceStore:
             profile.regions_of_interest.remove(region)
         return profile
 
+    def set_watchlist(self, user_id: str, crypto: list[str] | None = None,
+                     stocks: list[str] | None = None) -> UserProfile:
+        profile = self.get_or_create(user_id)
+        if crypto is not None:
+            profile.watchlist_crypto = crypto
+        if stocks is not None:
+            profile.watchlist_stocks = stocks
+        return profile
+
+    def set_timezone(self, user_id: str, tz: str) -> UserProfile:
+        profile = self.get_or_create(user_id)
+        profile.timezone = tz
+        return profile
+
+    def mute_topic(self, user_id: str, topic: str) -> UserProfile:
+        profile = self.get_or_create(user_id)
+        if topic not in profile.muted_topics:
+            profile.muted_topics.append(topic)
+        return profile
+
+    def unmute_topic(self, user_id: str, topic: str) -> UserProfile:
+        profile = self.get_or_create(user_id)
+        if topic in profile.muted_topics:
+            profile.muted_topics.remove(topic)
+        return profile
+
     def reset(self, user_id: str) -> UserProfile:
         """Reset all user preferences to defaults."""
         profile = self.get_or_create(user_id)
         profile.topic_weights.clear()
         profile.source_weights.clear()
         profile.regions_of_interest.clear()
+        profile.muted_topics.clear()
         profile.tone = "concise"
         profile.format = "bullet"
         profile.max_items = 10
         profile.briefing_cadence = "on_demand"
+        profile.timezone = "UTC"
+        # Keep watchlists on reset — those are data, not weights
         return profile
 
     def snapshot(self) -> dict[str, dict]:
@@ -82,6 +111,10 @@ class PreferenceStore:
                 "max_items": p.max_items,
                 "cadence": p.briefing_cadence,
                 "regions": list(p.regions_of_interest),
+                "watchlist_crypto": list(p.watchlist_crypto),
+                "watchlist_stocks": list(p.watchlist_stocks),
+                "timezone": p.timezone,
+                "muted_topics": list(p.muted_topics),
             }
         return result
 

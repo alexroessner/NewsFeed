@@ -40,6 +40,10 @@ BOT_COMMANDS = [
     {"command": "schedule", "description": "Set briefing schedule (e.g. /schedule morning 08:00)"},
     {"command": "status", "description": "System status and last briefing info"},
     {"command": "reset", "description": "Reset all preferences to defaults"},
+    {"command": "watchlist", "description": "Set market watchlist (e.g. /watchlist crypto BTC ETH)"},
+    {"command": "timezone", "description": "Set your timezone (e.g. /timezone US/Eastern)"},
+    {"command": "mute", "description": "Mute a topic (e.g. /mute crypto)"},
+    {"command": "unmute", "description": "Unmute a topic (e.g. /unmute crypto)"},
     {"command": "help", "description": "Show available commands and usage"},
 ]
 
@@ -148,35 +152,24 @@ class TelegramBot:
 
     def send_briefing(self, chat_id: int | str, formatted_text: str,
                       item_count: int = 0) -> dict:
-        """Send a formatted briefing with feedback buttons.
+        """Send a formatted briefing with clean action buttons.
 
-        If item_count > 0, adds per-item thumbs up/down rating rows.
+        Per-item rating is available via the 'Rate Stories' button on demand.
         """
-        rows: list[list[dict]] = []
-
-        # Per-item rating buttons (compact rows of up to 5 per row)
-        if item_count > 0:
-            up_row: list[dict] = []
-            down_row: list[dict] = []
-            for i in range(1, min(item_count + 1, 9)):  # Telegram max 8 buttons/row
-                up_row.append({"text": f"\U0001f44d{i}", "callback_data": f"rate:{i}:up"})
-                down_row.append({"text": f"\U0001f44e{i}", "callback_data": f"rate:{i}:down"})
-            rows.append(up_row)
-            rows.append(down_row)
-
-        rows.extend([
+        rows: list[list[dict]] = [
             [
-                {"text": "More stories", "callback_data": "cmd:more"},
-                {"text": "Deeper analysis", "callback_data": "cmd:deep_dive"},
+                {"text": "\u25b6 More", "callback_data": "cmd:more"},
+                {"text": "\U0001f50d Deep Dive", "callback_data": "cmd:deep_dive"},
             ],
             [
-                {"text": "More like this", "callback_data": "pref:more_similar"},
-                {"text": "Less like this", "callback_data": "pref:less_similar"},
+                {"text": "\U0001f44d More like this", "callback_data": "pref:more_similar"},
+                {"text": "\U0001f44e Less like this", "callback_data": "pref:less_similar"},
             ],
             [
-                {"text": "Settings", "callback_data": "cmd:settings"},
+                {"text": "\u2b50 Rate Stories", "callback_data": "cmd:rate_prompt"},
+                {"text": "\u2699 Settings", "callback_data": "cmd:settings"},
             ],
-        ])
+        ]
         keyboard = {"inline_keyboard": rows}
         return self.send_message(chat_id, formatted_text, reply_markup=keyboard)
 
@@ -307,15 +300,17 @@ class TelegramBot:
 
     def format_settings(self, profile: dict) -> str:
         """Format user settings for display."""
-        lines = ["<b>Your NewsFeed Settings</b>", ""]
-        lines.append(f"Tone: <code>{profile.get('tone', 'concise')}</code>")
-        lines.append(f"Format: <code>{profile.get('format', 'bullet')}</code>")
-        lines.append(f"Max items: <code>{profile.get('max_items', 10)}</code>")
-        lines.append(f"Cadence: <code>{profile.get('cadence', 'on_demand')}</code>")
+        lines = ["<b>\u2699 Your NewsFeed Settings</b>", ""]
+
+        lines.append(f"\u2022 Tone: <code>{profile.get('tone', 'concise')}</code>")
+        lines.append(f"\u2022 Format: <code>{profile.get('format', 'bullet')}</code>")
+        lines.append(f"\u2022 Max items: <code>{profile.get('max_items', 10)}</code>")
+        lines.append(f"\u2022 Cadence: <code>{profile.get('cadence', 'on_demand')}</code>")
+        lines.append(f"\u2022 Timezone: <code>{profile.get('timezone', 'UTC')}</code>")
 
         schedule = profile.get("schedule")
         if schedule:
-            lines.append(f"Schedule: <code>{schedule}</code>")
+            lines.append(f"\u2022 Schedule: <code>{schedule}</code>")
 
         topics = profile.get("topic_weights", {})
         if topics:
@@ -339,33 +334,47 @@ class TelegramBot:
             lines.append("")
             lines.append(f"<b>Regions:</b> {', '.join(regions)}")
 
+        muted = profile.get("muted_topics", [])
+        if muted:
+            lines.append(f"<b>Muted:</b> {', '.join(muted)}")
+
+        crypto = profile.get("watchlist_crypto", [])
+        stocks = profile.get("watchlist_stocks", [])
+        if crypto or stocks:
+            lines.append("")
+            lines.append("<b>Market Watchlist:</b>")
+            if crypto:
+                lines.append(f"  Crypto: {', '.join(c.upper() for c in crypto)}")
+            if stocks:
+                lines.append(f"  Stocks: {', '.join(stocks)}")
+
         return "\n".join(lines)
 
     def format_help(self) -> str:
         """Format help message."""
         lines = [
-            "<b>NewsFeed Intelligence Bot</b>",
+            "<b>\U0001f4e1 NewsFeed Intelligence Bot</b>",
             "",
-            "Available commands:",
+            "<b>Commands:</b>",
             "",
         ]
         for cmd in BOT_COMMANDS:
-            lines.append(f"/{cmd['command']} — {cmd['description']}")
+            lines.append(f"/{cmd['command']} \u2014 {cmd['description']}")
 
         lines.extend([
             "",
-            "<b>Feedback Examples:</b>",
-            "• <code>more geopolitics</code> — Increase geopolitics weight",
-            "• <code>less crypto</code> — Decrease crypto weight",
-            "• <code>tone: analyst</code> — Switch to analyst tone",
-            "• <code>format: sections</code> — Switch to sections format",
-            "• <code>region: middle_east</code> — Add region of interest",
-            "• <code>remove region: middle_east</code> — Remove a region",
-            "• <code>cadence: morning</code> — Set daily morning briefing",
-            "• <code>max: 15</code> — Set max items per briefing",
-            "• <code>prefer reuters</code> — Boost a source",
-            "• <code>demote reddit</code> — Penalize a source",
-            "• <code>reset preferences</code> — Reset all to defaults",
+            "<b>Feedback (send as plain text):</b>",
+            "\u2022 <code>more geopolitics</code> \u2014 Increase topic weight",
+            "\u2022 <code>less crypto</code> \u2014 Decrease topic weight",
+            "\u2022 <code>tone: analyst</code> \u2014 Change tone",
+            "\u2022 <code>format: sections</code> \u2014 Change format",
+            "\u2022 <code>region: middle_east</code> \u2014 Add region",
+            "\u2022 <code>remove region: middle_east</code> \u2014 Remove region",
+            "\u2022 <code>cadence: morning</code> \u2014 Set cadence",
+            "\u2022 <code>max: 15</code> \u2014 Set max items",
+            "\u2022 <code>prefer reuters</code> \u2014 Boost source",
+            "\u2022 <code>demote reddit</code> \u2014 Penalize source",
+            "\u2022 <code>reset preferences</code> \u2014 Reset all",
         ])
 
         return "\n".join(lines)
