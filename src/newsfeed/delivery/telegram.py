@@ -239,7 +239,8 @@ class TelegramFormatter:
 
         return "\n".join(lines).strip()
 
-    def format_story_card(self, item: ReportItem, index: int) -> str:
+    def format_story_card(self, item: ReportItem, index: int,
+                          is_tracked: bool = False) -> str:
         """Format a single story as a rich, readable news card.
 
         Includes the full intelligence context: summary, why it matters,
@@ -249,15 +250,18 @@ class TelegramFormatter:
         lines: list[str] = []
         c = item.candidate
 
+        # ── Tracked badge ──
+        tracked_badge = "\U0001f4cc " if is_tracked else ""
+
         # ── Title + source ──
         title_esc = _esc(c.title)
         if c.url and not c.url.startswith("https://example.com"):
             title_line = (
-                f'<b>{index}. '
+                f'<b>{tracked_badge}{index}. '
                 f'<a href="{_esc_url(c.url)}">{title_esc}</a></b>'
             )
         else:
-            title_line = f"<b>{index}. {title_esc}</b>"
+            title_line = f"<b>{tracked_badge}{index}. {title_esc}</b>"
 
         source_tag = f"<i>[{_esc(c.source)}]</i>"
         lines.append(f"{title_line} {source_tag}")

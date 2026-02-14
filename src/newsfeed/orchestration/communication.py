@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from newsfeed.orchestration.engine import NewsFeedEngine
 
 from newsfeed.delivery.market import MarketTicker
+from newsfeed.memory.store import match_tracked
 
 log = logging.getLogger(__name__)
 
@@ -177,6 +178,15 @@ class CommunicationAgent:
         if command == "rate_prompt":
             return self._send_rate_prompt(chat_id, user_id)
 
+        if command == "track":
+            return self._track_story(chat_id, user_id, args)
+
+        if command == "tracked":
+            return self._show_tracked(chat_id, user_id)
+
+        if command == "untrack":
+            return self._untrack_story(chat_id, user_id, args)
+
         if command == "reset":
             self._engine.preferences.reset(user_id)
             self._engine.apply_user_feedback(user_id, "reset preferences")
@@ -264,10 +274,15 @@ class CommunicationAgent:
         header = formatter.format_header(payload, ticker_bar)
         self._bot.send_message(chat_id, header)
 
-        # Messages 2..N: Individual story cards with per-story thumbs up/down
+        # Messages 2..N: Individual story cards with per-story feedback
+        tracked = profile.tracked_stories
         for idx, item in enumerate(payload.items, start=1):
-            card = formatter.format_story_card(item, idx)
-            self._bot.send_story_card(chat_id, card, story_index=idx)
+            is_tracked = any(
+                match_tracked(item.candidate.topic, item.candidate.title, t)
+                for t in tracked
+            )
+            card = formatter.format_story_card(item, idx, is_tracked=is_tracked)
+            self._bot.send_story_card(chat_id, card, story_index=idx, is_tracked=is_tracked)
 
         if not payload.items:
             self._bot.send_message(
@@ -695,6 +710,82 @@ class CommunicationAgent:
         keyboard = {"inline_keyboard": rows}
         self._bot.send_message(chat_id, "\n".join(lines), reply_markup=keyboard)
         return {"action": "rate_prompt", "user_id": user_id}
+
+    def _track_story(self, chat_id: int | str, user_id: str,
+                     args: str) -> dict[str, Any]:
+        """Track a story from the last briefing for cross-session continuity."""
+        try:
+            story_num = int(args.strip())
+        except (ValueError, TypeError):
+            self._bot.send_message(chat_id, "Usage: tap the \U0001f4cc Track button on a story card.")
+            return {"action": "track_help", "user_id": user_id}
+
+        items = self._last_items.get(user_id, [])
+        if story_num < 1 or story_num > len(items):
+            self._bot.send_message(chat_id, "That story is no longer available. Run /briefing first.")
+            return {"action": "track_expired", "user_id": user_id}
+
+        item = items[story_num - 1]
+        topic = item["topic"]
+        headline = item["title"]
+
+        self._engine.preferences.track_story(user_id, topic, headline)
+        self._persist_prefs()
+        self._bot.send_message(
+            chat_id,
+            f"\U0001f4cc Now tracking: <b>{headline}</b>\n"
+            f"You'll see \U0001f4cc badges when new developments appear in future briefings.\n"
+            f"View tracked stories: /tracked"
+        )
+        return {"action": "track", "user_id": user_id, "story": story_num}
+
+    def _show_tracked(self, chat_id: int | str, user_id: str) -> dict[str, Any]:
+        """Show all stories the user is currently tracking."""
+        import html as html_mod
+        profile = self._engine.preferences.get_or_create(user_id)
+        tracked = profile.tracked_stories
+
+        if not tracked:
+            self._bot.send_message(
+                chat_id,
+                "You're not tracking any stories yet.\n"
+                "Tap \U0001f4cc Track on a story card to follow it across briefings."
+            )
+            return {"action": "tracked_empty", "user_id": user_id}
+
+        lines = [f"<b>\U0001f4cc Tracked Stories ({len(tracked)})</b>", ""]
+        for i, t in enumerate(tracked, 1):
+            topic = t["topic"].replace("_", " ").title()
+            headline = html_mod.escape(t["headline"][:80])
+            lines.append(f"  {i}. <b>{headline}</b>")
+            lines.append(f"     <i>{topic}</i>")
+        lines.append("")
+        lines.append("<i>Untrack: /untrack [number]</i>")
+        self._bot.send_message(chat_id, "\n".join(lines))
+        return {"action": "tracked", "user_id": user_id, "count": len(tracked)}
+
+    def _untrack_story(self, chat_id: int | str, user_id: str,
+                       args: str) -> dict[str, Any]:
+        """Stop tracking a story by its position in /tracked list."""
+        try:
+            index = int(args.strip())
+        except (ValueError, TypeError):
+            self._bot.send_message(chat_id, "Usage: /untrack [number] — see /tracked for the list.")
+            return {"action": "untrack_help", "user_id": user_id}
+
+        profile = self._engine.preferences.get_or_create(user_id)
+        if index < 1 or index > len(profile.tracked_stories):
+            self._bot.send_message(chat_id, f"No tracked story #{index}. See /tracked for the list.")
+            return {"action": "untrack_invalid", "user_id": user_id}
+
+        removed = profile.tracked_stories[index - 1]
+        self._engine.preferences.untrack_story(user_id, index)
+        self._persist_prefs()
+        self._bot.send_message(
+            chat_id,
+            f"Stopped tracking: <b>{removed['headline'][:80]}</b>"
+        )
+        return {"action": "untrack", "user_id": user_id, "index": index}
 
     def _deep_dive_story(self, chat_id: int | str, user_id: str,
                          story_num: int) -> dict[str, Any]:

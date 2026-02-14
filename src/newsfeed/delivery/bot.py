@@ -44,6 +44,8 @@ BOT_COMMANDS = [
     {"command": "timezone", "description": "Set your timezone (e.g. /timezone US/Eastern)"},
     {"command": "mute", "description": "Mute a topic (e.g. /mute crypto)"},
     {"command": "unmute", "description": "Unmute a topic (e.g. /unmute crypto)"},
+    {"command": "tracked", "description": "View stories you're tracking"},
+    {"command": "untrack", "description": "Stop tracking a story (e.g. /untrack 1)"},
     {"command": "help", "description": "Show available commands and usage"},
 ]
 
@@ -178,13 +180,16 @@ class TelegramBot:
         chat_id: int | str,
         text: str,
         story_index: int = 0,
+        is_tracked: bool = False,
     ) -> dict:
-        """Send a single story card with feedback + deep dive buttons."""
+        """Send a single story card with feedback, deep dive, and track buttons."""
+        track_label = "\U0001f4cc Tracked" if is_tracked else "\U0001f4cc Track"
         rows: list[list[dict]] = [
             [
                 {"text": "\U0001f44d", "callback_data": f"rate:{story_index}:up"},
                 {"text": "\U0001f44e", "callback_data": f"rate:{story_index}:down"},
                 {"text": "\U0001f50d Dive deeper", "callback_data": f"dive:{story_index}"},
+                {"text": track_label, "callback_data": f"track:{story_index}"},
             ],
         ]
         keyboard = {"inline_keyboard": rows}
@@ -302,6 +307,15 @@ class TelegramBot:
                     "user_id": user_id,
                     "command": "deep_dive",
                     "args": data[5:],  # story index number
+                    "text": "",
+                }
+            if data.startswith("track:"):
+                return {
+                    "type": "command",
+                    "chat_id": chat_id,
+                    "user_id": user_id,
+                    "command": "track",
+                    "args": data[6:],  # story index number
                     "text": "",
                 }
             return None
