@@ -112,7 +112,7 @@ def main() -> None:
     log.info("Config loaded. api_keys present: %s",
              [k for k in cfg.pipeline.get("api_keys", {}) if cfg.pipeline["api_keys"][k]])
 
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 
     try:
         personas_dir = root / "config" / "personas"
