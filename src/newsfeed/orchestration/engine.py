@@ -204,6 +204,8 @@ class NewsFeedEngine:
         self._last_briefing_topics: dict[str, list[str]] = {}
         # Track per-item info per user (for per-item thumbs up/down)
         self._last_briefing_items: dict[str, list[dict]] = {}  # [{topic, source}, ...]
+        # Track full ReportItem objects for per-story deep dive
+        self._last_report_items: dict[str, list[ReportItem]] = {}  # user_id -> [ReportItem, ...]
 
         # State persistence — save and restore preferences, credibility, etc.
         persist_cfg = pipeline.get("persistence", {})
@@ -309,6 +311,14 @@ class NewsFeedEngine:
         if profile.muted_topics:
             muted_set = set(profile.muted_topics)
             all_candidates = [c for c in all_candidates if c.topic not in muted_set]
+
+        # Boost stories matching user's regions of interest
+        if profile.regions_of_interest:
+            roi_set = {r.lower().replace(" ", "_") for r in profile.regions_of_interest}
+            for c in all_candidates:
+                candidate_regions = {r.lower().replace(" ", "_") for r in c.regions}
+                if candidate_regions & roi_set:
+                    c.preference_fit = round(min(1.0, c.preference_fit + 0.15), 3)
 
         # Stage 2: Intelligence enrichment (conditionally enabled, with error isolation)
         t0 = time.monotonic()
@@ -437,6 +447,8 @@ class NewsFeedEngine:
             {"topic": item.candidate.topic, "source": item.candidate.source, "title": item.candidate.title}
             for item in report_items
         ]
+        # Track full ReportItems for per-story deep dive
+        self._last_report_items[user_id] = list(report_items)
 
         # Persist state if enabled
         if self._persistence:
@@ -590,6 +602,13 @@ class NewsFeedEngine:
     def last_briefing_items(self, user_id: str) -> list[dict]:
         """Return per-item info [{topic, source}, ...] from the user's last briefing."""
         return self._last_briefing_items.get(user_id, [])
+
+    def get_report_item(self, user_id: str, index: int) -> ReportItem | None:
+        """Return a specific ReportItem from the user's last briefing (1-indexed)."""
+        items = self._last_report_items.get(user_id, [])
+        if 1 <= index <= len(items):
+            return items[index - 1]
+        return None
 
     def show_more(self, user_id: str, topic: str, already_seen_ids: set[str], limit: int = 5) -> list[CandidateItem]:
         """Return cached candidates the user hasn't seen yet."""
