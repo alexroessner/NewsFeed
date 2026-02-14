@@ -1,11 +1,43 @@
 from __future__ import annotations
 
 import json
+import re
+import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from newsfeed.models.domain import CandidateItem, UserProfile
+
+# Common stop words to exclude from keyword extraction
+_STOP_WORDS = frozenset({
+    "a", "an", "the", "in", "on", "at", "to", "for", "of", "and", "or",
+    "is", "are", "was", "were", "be", "been", "has", "have", "had", "do",
+    "does", "did", "will", "would", "could", "should", "may", "might",
+    "with", "from", "by", "as", "into", "about", "over", "after", "before",
+    "between", "under", "up", "down", "out", "new", "says", "said", "its",
+    "it", "that", "this", "but", "not", "no", "what", "how", "why", "who",
+    "when", "where", "which", "than", "more", "also", "can", "will", "just",
+})
+
+
+def extract_keywords(headline: str) -> list[str]:
+    """Extract meaningful keywords from a headline for tracking."""
+    words = re.findall(r"[a-zA-Z]+", headline.lower())
+    return [w for w in words if w not in _STOP_WORDS and len(w) > 2]
+
+
+def match_tracked(story_topic: str, story_title: str,
+                  tracked: dict) -> bool:
+    """Check if a story matches a tracked item.
+
+    Matches if same topic AND at least 2 keyword overlaps.
+    """
+    if story_topic != tracked["topic"]:
+        return False
+    story_words = set(extract_keywords(story_title))
+    tracked_words = set(tracked["keywords"])
+    return len(story_words & tracked_words) >= 2
 
 
 class PreferenceStore:
@@ -85,6 +117,35 @@ class PreferenceStore:
             profile.muted_topics.remove(topic)
         return profile
 
+    def track_story(self, user_id: str, topic: str,
+                    headline: str) -> UserProfile:
+        """Track a story for cross-briefing continuity."""
+        profile = self.get_or_create(user_id)
+        keywords = extract_keywords(headline)
+        if not keywords:
+            return profile
+        # Avoid duplicates — check if already tracking similar story
+        for existing in profile.tracked_stories:
+            if match_tracked(topic, headline, existing):
+                return profile  # already tracking
+        profile.tracked_stories.append({
+            "topic": topic,
+            "keywords": keywords,
+            "headline": headline,
+            "tracked_at": time.time(),
+        })
+        # Cap at 20 tracked stories
+        if len(profile.tracked_stories) > 20:
+            profile.tracked_stories = profile.tracked_stories[-20:]
+        return profile
+
+    def untrack_story(self, user_id: str, index: int) -> UserProfile:
+        """Remove a tracked story by 1-based index."""
+        profile = self.get_or_create(user_id)
+        if 1 <= index <= len(profile.tracked_stories):
+            profile.tracked_stories.pop(index - 1)
+        return profile
+
     def reset(self, user_id: str) -> UserProfile:
         """Reset all user preferences to defaults."""
         profile = self.get_or_create(user_id)
@@ -97,7 +158,7 @@ class PreferenceStore:
         profile.max_items = 10
         profile.briefing_cadence = "on_demand"
         profile.timezone = "UTC"
-        # Keep watchlists on reset — those are data, not weights
+        # Keep watchlists and tracked stories on reset — those are data, not weights
         return profile
 
     def snapshot(self) -> dict[str, dict]:
@@ -115,6 +176,7 @@ class PreferenceStore:
                 "watchlist_stocks": list(p.watchlist_stocks),
                 "timezone": p.timezone,
                 "muted_topics": list(p.muted_topics),
+                "tracked_stories": list(p.tracked_stories),
             }
         return result
 

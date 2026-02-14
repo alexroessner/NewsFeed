@@ -90,6 +90,9 @@ class UserProfile:
     watchlist_stocks: list[str] = field(default_factory=list)
     timezone: str = "UTC"
     muted_topics: list[str] = field(default_factory=list)
+    # Tracked stories: user follows developing narratives across briefings
+    # Each entry: {"topic": str, "keywords": [str], "headline": str, "tracked_at": float}
+    tracked_stories: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
