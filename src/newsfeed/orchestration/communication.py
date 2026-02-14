@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from newsfeed.orchestration.engine import NewsFeedEngine
 
 from newsfeed.delivery.market import MarketTicker
+from newsfeed.memory.store import match_tracked
 
 log = logging.getLogger(__name__)
 
@@ -153,7 +154,20 @@ class CommunicationAgent:
             return {"action": "help", "user_id": user_id}
 
         if command == "deep_dive":
+            # If args is a story number, deep dive on that specific story
+            try:
+                story_num = int(args.strip())
+                return self._deep_dive_story(chat_id, user_id, story_num)
+            except (ValueError, TypeError):
+                pass
+            # Otherwise run a fuller briefing
             return self._run_briefing(chat_id, user_id, args, deep=True)
+
+        if command == "compare":
+            return self._compare_story(chat_id, user_id, args)
+
+        if command == "recall":
+            return self._recall(chat_id, user_id, args)
 
         if command == "watchlist":
             return self._set_watchlist(chat_id, user_id, args)
@@ -169,6 +183,15 @@ class CommunicationAgent:
 
         if command == "rate_prompt":
             return self._send_rate_prompt(chat_id, user_id)
+
+        if command == "track":
+            return self._track_story(chat_id, user_id, args)
+
+        if command == "tracked":
+            return self._show_tracked(chat_id, user_id)
+
+        if command == "untrack":
+            return self._untrack_story(chat_id, user_id, args)
 
         if command == "reset":
             self._engine.preferences.reset(user_id)
@@ -253,14 +276,27 @@ class CommunicationAgent:
 
         formatter = self._engine.formatter
 
-        # Message 1: Header (ticker + geo risks + trends + threads)
-        header = formatter.format_header(payload, ticker_bar)
+        # Messages 2..N: Individual story cards with per-story feedback
+        tracked = profile.tracked_stories
+        tracked_count = 0
+        tracked_flags: list[bool] = []
+        for item in payload.items:
+            is_tracked = any(
+                match_tracked(item.candidate.topic, item.candidate.title, t)
+                for t in tracked
+            )
+            tracked_flags.append(is_tracked)
+            if is_tracked:
+                tracked_count += 1
+
+        # Message 1: Header (ticker + exec summary + geo risks + trends + threads)
+        header = formatter.format_header(payload, ticker_bar, tracked_count=tracked_count)
         self._bot.send_message(chat_id, header)
 
-        # Messages 2..N: Individual story cards with per-story thumbs up/down
         for idx, item in enumerate(payload.items, start=1):
-            card = formatter.format_story_card(item, idx)
-            self._bot.send_story_card(chat_id, card, story_index=idx)
+            is_tracked = tracked_flags[idx - 1]
+            card = formatter.format_story_card(item, idx, is_tracked=is_tracked)
+            self._bot.send_story_card(chat_id, card, story_index=idx, is_tracked=is_tracked)
 
         if not payload.items:
             self._bot.send_message(
@@ -528,6 +564,10 @@ class CommunicationAgent:
             )
             return {"action": "schedule_help", "user_id": user_id}
 
+        # Ensure scheduler has the user's timezone for local-time scheduling
+        profile = self._engine.preferences.get_or_create(user_id)
+        self._scheduler.set_user_timezone(user_id, profile.timezone)
+
         msg = self._scheduler.set_schedule(user_id, schedule_type, time_str)
         self._bot.send_message(chat_id, msg)
         return {"action": "schedule", "user_id": user_id, "type": schedule_type}
@@ -549,6 +589,12 @@ class CommunicationAgent:
                 sent += 1
             except Exception:
                 log.exception("Failed to deliver scheduled briefing to user=%s", user_id)
+
+        # Also check for proactive tracked story updates
+        try:
+            sent += self.check_tracked_updates()
+        except Exception:
+            log.exception("Tracked story update check failed")
 
         return sent
 
@@ -618,7 +664,10 @@ class CommunicationAgent:
 
         self._engine.preferences.set_timezone(user_id, tz)
         self._persist_prefs()
-        self._bot.send_message(chat_id, f"Timezone set to <code>{tz}</code>")
+        # Sync timezone to scheduler so scheduled briefings fire at user-local time
+        if self._scheduler:
+            self._scheduler.set_user_timezone(user_id, tz)
+        self._bot.send_message(chat_id, f"Timezone set to <code>{tz}</code>. Scheduled briefings now use your local time.")
         return {"action": "timezone", "user_id": user_id, "tz": tz}
 
     def _mute_topic(self, chat_id: int | str, user_id: str,
@@ -681,6 +730,189 @@ class CommunicationAgent:
         keyboard = {"inline_keyboard": rows}
         self._bot.send_message(chat_id, "\n".join(lines), reply_markup=keyboard)
         return {"action": "rate_prompt", "user_id": user_id}
+
+    def _track_story(self, chat_id: int | str, user_id: str,
+                     args: str) -> dict[str, Any]:
+        """Track a story from the last briefing for cross-session continuity."""
+        try:
+            story_num = int(args.strip())
+        except (ValueError, TypeError):
+            self._bot.send_message(chat_id, "Usage: tap the \U0001f4cc Track button on a story card.")
+            return {"action": "track_help", "user_id": user_id}
+
+        items = self._last_items.get(user_id, [])
+        if story_num < 1 or story_num > len(items):
+            self._bot.send_message(chat_id, "That story is no longer available. Run /briefing first.")
+            return {"action": "track_expired", "user_id": user_id}
+
+        item = items[story_num - 1]
+        topic = item["topic"]
+        headline = item["title"]
+
+        self._engine.preferences.track_story(user_id, topic, headline)
+        self._persist_prefs()
+        self._bot.send_message(
+            chat_id,
+            f"\U0001f4cc Now tracking: <b>{headline}</b>\n"
+            f"You'll see \U0001f4cc badges when new developments appear in future briefings.\n"
+            f"View tracked stories: /tracked"
+        )
+        return {"action": "track", "user_id": user_id, "story": story_num}
+
+    def _show_tracked(self, chat_id: int | str, user_id: str) -> dict[str, Any]:
+        """Show all stories the user is currently tracking."""
+        import html as html_mod
+        profile = self._engine.preferences.get_or_create(user_id)
+        tracked = profile.tracked_stories
+
+        if not tracked:
+            self._bot.send_message(
+                chat_id,
+                "You're not tracking any stories yet.\n"
+                "Tap \U0001f4cc Track on a story card to follow it across briefings."
+            )
+            return {"action": "tracked_empty", "user_id": user_id}
+
+        lines = [f"<b>\U0001f4cc Tracked Stories ({len(tracked)})</b>", ""]
+        for i, t in enumerate(tracked, 1):
+            topic = t["topic"].replace("_", " ").title()
+            headline = html_mod.escape(t["headline"][:80])
+            lines.append(f"  {i}. <b>{headline}</b>")
+            lines.append(f"     <i>{topic}</i>")
+        lines.append("")
+        lines.append("<i>Untrack: /untrack [number]</i>")
+        self._bot.send_message(chat_id, "\n".join(lines))
+        return {"action": "tracked", "user_id": user_id, "count": len(tracked)}
+
+    def _untrack_story(self, chat_id: int | str, user_id: str,
+                       args: str) -> dict[str, Any]:
+        """Stop tracking a story by its position in /tracked list."""
+        try:
+            index = int(args.strip())
+        except (ValueError, TypeError):
+            self._bot.send_message(chat_id, "Usage: /untrack [number] — see /tracked for the list.")
+            return {"action": "untrack_help", "user_id": user_id}
+
+        profile = self._engine.preferences.get_or_create(user_id)
+        if index < 1 or index > len(profile.tracked_stories):
+            self._bot.send_message(chat_id, f"No tracked story #{index}. See /tracked for the list.")
+            return {"action": "untrack_invalid", "user_id": user_id}
+
+        removed = profile.tracked_stories[index - 1]
+        self._engine.preferences.untrack_story(user_id, index)
+        self._persist_prefs()
+        self._bot.send_message(
+            chat_id,
+            f"Stopped tracking: <b>{removed['headline'][:80]}</b>"
+        )
+        return {"action": "untrack", "user_id": user_id, "index": index}
+
+    def _compare_story(self, chat_id: int | str, user_id: str,
+                       args: str) -> dict[str, Any]:
+        """Show how different sources cover the same story."""
+        try:
+            story_num = int(args.strip())
+        except (ValueError, TypeError):
+            self._bot.send_message(chat_id, "Usage: /compare [story number]")
+            return {"action": "compare_help", "user_id": user_id}
+
+        item, others = self._engine.get_story_thread(user_id, story_num)
+        if not item:
+            self._bot.send_message(
+                chat_id,
+                f"Story #{story_num} not found. Run /briefing first."
+            )
+            return {"action": "compare_not_found", "user_id": user_id}
+
+        formatter = self._engine.formatter
+        card = formatter.format_comparison(item, others, story_num)
+        self._bot.send_message(chat_id, card)
+        return {"action": "compare", "user_id": user_id, "story": story_num,
+                "source_count": 1 + len(others)}
+
+    def _recall(self, chat_id: int | str, user_id: str,
+                args: str) -> dict[str, Any]:
+        """Search past briefing history for a keyword."""
+        keyword = args.strip()
+        if not keyword:
+            self._bot.send_message(
+                chat_id,
+                "Usage: /recall [keyword]\n"
+                "Example: /recall AI regulation"
+            )
+            return {"action": "recall_help", "user_id": user_id}
+
+        items = self._engine.analytics.search_briefing_items(user_id, keyword)
+        formatter = self._engine.formatter
+        card = formatter.format_recall(keyword, items)
+        self._bot.send_message(chat_id, card)
+        return {"action": "recall", "user_id": user_id, "keyword": keyword,
+                "results": len(items)}
+
+    def check_tracked_updates(self) -> int:
+        """Check for proactive tracked story updates across all users.
+
+        Scans cached candidates against each user's tracked stories.
+        Sends notifications for matches the user hasn't seen yet.
+        Returns the number of notifications sent.
+        """
+        sent = 0
+        for user_id, profile_data in self._engine.preferences.snapshot().items():
+            tracked = profile_data.get("tracked_stories", [])
+            if not tracked:
+                continue
+
+            # Get all fresh candidates from cache
+            fresh = self._engine.cache.get_all_fresh(user_id)
+            if not fresh:
+                continue
+
+            # Check for matches not already seen
+            seen = self._shown_ids.get(user_id, set())
+            formatter = self._engine.formatter
+
+            for candidate in fresh:
+                if candidate.candidate_id in seen:
+                    continue
+                for t in tracked:
+                    if match_tracked(candidate.topic, candidate.title, t):
+                        # Send proactive notification
+                        msg = formatter.format_tracked_update(candidate, t["headline"])
+                        self._bot.send_message(user_id, msg)
+                        self._shown_ids.setdefault(user_id, set()).add(candidate.candidate_id)
+                        sent += 1
+                        break  # Only notify once per candidate
+
+        return sent
+
+    def _deep_dive_story(self, chat_id: int | str, user_id: str,
+                         story_num: int) -> dict[str, Any]:
+        """Deep dive into a specific story from the last briefing.
+
+        Shows full analysis: confidence band, key assumptions,
+        evidence/novelty breakdown, discovery agent, lifecycle stage.
+        """
+        item = self._engine.get_report_item(user_id, story_num)
+        if not item:
+            self._bot.send_message(
+                chat_id,
+                f"Story #{story_num} not found. Run /briefing first, then tap Dive deeper."
+            )
+            return {"action": "deep_dive_not_found", "user_id": user_id}
+
+        formatter = self._engine.formatter
+        card = formatter.format_deep_dive(item, story_num)
+        self._bot.send_message(chat_id, card)
+
+        self._engine.analytics.record_interaction(
+            user_id=user_id, chat_id=chat_id,
+            interaction_type="deep_dive", command="deep_dive",
+            args=str(story_num), raw_text="",
+            result_action="deep_dive_story",
+            result_data={"story": story_num, "title": item.candidate.title},
+        )
+
+        return {"action": "deep_dive_story", "user_id": user_id, "story": story_num}
 
     # ──────────────────────────────────────────────────────────────
     # ADMIN COMMANDS — owner-only analytics dashboard via Telegram

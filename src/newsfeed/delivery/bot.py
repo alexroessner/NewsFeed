@@ -44,6 +44,10 @@ BOT_COMMANDS = [
     {"command": "timezone", "description": "Set your timezone (e.g. /timezone US/Eastern)"},
     {"command": "mute", "description": "Mute a topic (e.g. /mute crypto)"},
     {"command": "unmute", "description": "Unmute a topic (e.g. /unmute crypto)"},
+    {"command": "tracked", "description": "View stories you're tracking"},
+    {"command": "untrack", "description": "Stop tracking a story (e.g. /untrack 1)"},
+    {"command": "compare", "description": "Compare sources on a story (e.g. /compare 2)"},
+    {"command": "recall", "description": "Search past briefings (e.g. /recall AI regulation)"},
     {"command": "help", "description": "Show available commands and usage"},
 ]
 
@@ -178,12 +182,16 @@ class TelegramBot:
         chat_id: int | str,
         text: str,
         story_index: int = 0,
+        is_tracked: bool = False,
     ) -> dict:
-        """Send a single story card with per-story thumbs up/down feedback."""
+        """Send a single story card with feedback, deep dive, and track buttons."""
+        track_label = "\U0001f4cc Tracked" if is_tracked else "\U0001f4cc Track"
         rows: list[list[dict]] = [
             [
                 {"text": "\U0001f44d", "callback_data": f"rate:{story_index}:up"},
                 {"text": "\U0001f44e", "callback_data": f"rate:{story_index}:down"},
+                {"text": "\U0001f50d Dive deeper", "callback_data": f"dive:{story_index}"},
+                {"text": track_label, "callback_data": f"track:{story_index}"},
             ],
         ]
         keyboard = {"inline_keyboard": rows}
@@ -292,6 +300,24 @@ class TelegramBot:
                     "user_id": user_id,
                     "command": data,  # "rate:N:up" or "rate:N:down"
                     "args": "",
+                    "text": "",
+                }
+            if data.startswith("dive:"):
+                return {
+                    "type": "command",
+                    "chat_id": chat_id,
+                    "user_id": user_id,
+                    "command": "deep_dive",
+                    "args": data[5:],  # story index number
+                    "text": "",
+                }
+            if data.startswith("track:"):
+                return {
+                    "type": "command",
+                    "chat_id": chat_id,
+                    "user_id": user_id,
+                    "command": "track",
+                    "args": data[6:],  # story index number
                     "text": "",
                 }
             return None
@@ -454,19 +480,36 @@ class BriefingScheduler:
     """Manages scheduled briefing delivery.
 
     Tracks per-user schedules and triggers briefing generation
-    at configured times. Also handles mute suppression.
+    at configured times. Converts user-local schedule times to UTC
+    using their configured timezone. Also handles mute suppression.
     """
 
     def __init__(self) -> None:
         self._schedules: dict[str, dict[str, Any]] = {}
         self._last_sent: dict[str, float] = {}
         self._muted_until: dict[str, float] = {}  # user_id -> timestamp when mute expires
+        self._user_timezones: dict[str, str] = {}  # user_id -> timezone string
+
+    def set_user_timezone(self, user_id: str, tz: str) -> None:
+        """Update the cached timezone for a user."""
+        self._user_timezones[user_id] = tz
+
+    def _user_local_time(self, user_id: str) -> str:
+        """Get current HH:MM in the user's timezone."""
+        tz_name = self._user_timezones.get(user_id, "UTC")
+        try:
+            from zoneinfo import ZoneInfo
+            user_tz = ZoneInfo(tz_name)
+            return datetime.now(user_tz).strftime("%H:%M")
+        except (ImportError, KeyError):
+            # Invalid timezone or zoneinfo unavailable — fall back to UTC
+            return datetime.now(timezone.utc).strftime("%H:%M")
 
     def set_schedule(self, user_id: str, schedule_type: str, time_str: str = "") -> str:
         """Set a briefing schedule for a user.
 
         schedule_type: 'morning', 'evening', 'realtime', 'off'
-        time_str: optional HH:MM for morning/evening
+        time_str: optional HH:MM in the user's local timezone
         """
         schedule_times = {
             "morning": "08:00",
@@ -479,27 +522,31 @@ class BriefingScheduler:
 
         if schedule_type == "realtime":
             self._schedules[user_id] = {"type": "realtime", "time": ""}
-            return "Breaking alerts enabled — you'll receive real-time notifications."
+            return "Breaking alerts enabled \u2014 you'll receive real-time notifications."
 
         target_time = time_str or schedule_times.get(schedule_type, "08:00")
         self._schedules[user_id] = {"type": schedule_type, "time": target_time}
-        return f"Briefing scheduled: {schedule_type} at {target_time} UTC."
+        tz_name = self._user_timezones.get(user_id, "UTC")
+        return f"Briefing scheduled: {schedule_type} at {target_time} ({tz_name})."
 
     def get_due_users(self) -> list[str]:
-        """Get list of user IDs whose briefings are due now."""
-        now = datetime.now(timezone.utc)
-        current_time = now.strftime("%H:%M")
+        """Get list of user IDs whose briefings are due now.
+
+        Compares the scheduled time against each user's local timezone,
+        so a user in US/Eastern with schedule "08:00" gets their briefing
+        at 8 AM Eastern, not 8 AM UTC.
+        """
         due: list[str] = []
 
         for user_id, schedule in self._schedules.items():
             if self.is_muted(user_id):
-                continue  # Muted — skip
+                continue
 
             if schedule["type"] == "realtime":
-                continue  # Realtime users get breaking alerts only
+                continue
 
-            if schedule["time"] == current_time:
-                # Avoid duplicate sends within same minute
+            user_now = self._user_local_time(user_id)
+            if schedule["time"] == user_now:
                 last = self._last_sent.get(user_id, 0)
                 if time.time() - last > 120:
                     due.append(user_id)

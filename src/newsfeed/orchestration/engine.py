@@ -204,6 +204,11 @@ class NewsFeedEngine:
         self._last_briefing_topics: dict[str, list[str]] = {}
         # Track per-item info per user (for per-item thumbs up/down)
         self._last_briefing_items: dict[str, list[dict]] = {}  # [{topic, source}, ...]
+        # Track full ReportItem objects for per-story deep dive
+        self._last_report_items: dict[str, list[ReportItem]] = {}  # user_id -> [ReportItem, ...]
+        # Track threads from last briefing for source comparison
+        from newsfeed.models.domain import NarrativeThread
+        self._last_threads: dict[str, list[NarrativeThread]] = {}  # user_id -> [NarrativeThread, ...]
 
         # State persistence — save and restore preferences, credibility, etc.
         persist_cfg = pipeline.get("persistence", {})
@@ -309,6 +314,14 @@ class NewsFeedEngine:
         if profile.muted_topics:
             muted_set = set(profile.muted_topics)
             all_candidates = [c for c in all_candidates if c.topic not in muted_set]
+
+        # Boost stories matching user's regions of interest
+        if profile.regions_of_interest:
+            roi_set = {r.lower().replace(" ", "_") for r in profile.regions_of_interest}
+            for c in all_candidates:
+                candidate_regions = {r.lower().replace(" ", "_") for r in c.regions}
+                if candidate_regions & roi_set:
+                    c.preference_fit = round(min(1.0, c.preference_fit + 0.15), 3)
 
         # Stage 2: Intelligence enrichment (conditionally enabled, with error isolation)
         t0 = time.monotonic()
@@ -437,6 +450,10 @@ class NewsFeedEngine:
             {"topic": item.candidate.topic, "source": item.candidate.source, "title": item.candidate.title}
             for item in report_items
         ]
+        # Track full ReportItems for per-story deep dive
+        self._last_report_items[user_id] = list(report_items)
+        # Track threads for source comparison
+        self._last_threads[user_id] = list(threads)
 
         # Persist state if enabled
         if self._persistence:
@@ -590,6 +607,29 @@ class NewsFeedEngine:
     def last_briefing_items(self, user_id: str) -> list[dict]:
         """Return per-item info [{topic, source}, ...] from the user's last briefing."""
         return self._last_briefing_items.get(user_id, [])
+
+    def get_report_item(self, user_id: str, index: int) -> ReportItem | None:
+        """Return a specific ReportItem from the user's last briefing (1-indexed)."""
+        items = self._last_report_items.get(user_id, [])
+        if 1 <= index <= len(items):
+            return items[index - 1]
+        return None
+
+    def get_story_thread(self, user_id: str, story_index: int) -> tuple[ReportItem | None, list[CandidateItem]]:
+        """Return a story and all candidates from its thread (for source comparison).
+
+        Returns (report_item, other_candidates_in_same_thread).
+        """
+        item = self.get_report_item(user_id, story_index)
+        if not item or not item.thread_id:
+            return item, []
+        threads = self._last_threads.get(user_id, [])
+        for thread in threads:
+            if thread.thread_id == item.thread_id:
+                # Return candidates from this thread that aren't the selected story
+                others = [c for c in thread.candidates if c.candidate_id != item.candidate.candidate_id]
+                return item, others
+        return item, []
 
     def show_more(self, user_id: str, topic: str, already_seen_ids: set[str], limit: int = 5) -> list[CandidateItem]:
         """Return cached candidates the user hasn't seen yet."""
@@ -748,6 +788,8 @@ class NewsFeedEngine:
                     profile.timezone = pdata["timezone"]
                 if isinstance(pdata.get("muted_topics"), list):
                     profile.muted_topics = list(pdata["muted_topics"])
+                if isinstance(pdata.get("tracked_stories"), list):
+                    profile.tracked_stories = list(pdata["tracked_stories"])
             log.info("Restored preferences for %d users from disk", len(prefs_data))
 
         log.info("State loaded from %s", self._persistence.state_dir)

@@ -184,7 +184,8 @@ class TelegramFormatter:
 
     # ── Multi-message formatters ──────────────────────────────────
 
-    def format_header(self, payload: DeliveryPayload, ticker_bar: str = "") -> str:
+    def format_header(self, payload: DeliveryPayload, ticker_bar: str = "",
+                      tracked_count: int = 0) -> str:
         """Format the briefing header message (ticker + geo risks + trends + threads)."""
         lines: list[str] = []
 
@@ -192,6 +193,12 @@ class TelegramFormatter:
         header = _BRIEFING_HEADER.get(payload.briefing_type, "NewsFeed Brief")
         lines.append(f"<b>{icon} {header}</b>")
         lines.append(f"<i>{_human_time(payload.generated_at)}</i>")
+
+        # Executive summary — one-line scan of what's in this briefing
+        if payload.items:
+            summary = self._build_exec_summary(payload, tracked_count)
+            lines.append("")
+            lines.append(summary)
 
         if ticker_bar:
             lines.append("")
@@ -239,7 +246,8 @@ class TelegramFormatter:
 
         return "\n".join(lines).strip()
 
-    def format_story_card(self, item: ReportItem, index: int) -> str:
+    def format_story_card(self, item: ReportItem, index: int,
+                          is_tracked: bool = False) -> str:
         """Format a single story as a rich, readable news card.
 
         Includes the full intelligence context: summary, why it matters,
@@ -249,15 +257,18 @@ class TelegramFormatter:
         lines: list[str] = []
         c = item.candidate
 
+        # ── Tracked badge ──
+        tracked_badge = "\U0001f4cc " if is_tracked else ""
+
         # ── Title + source ──
         title_esc = _esc(c.title)
         if c.url and not c.url.startswith("https://example.com"):
             title_line = (
-                f'<b>{index}. '
+                f'<b>{tracked_badge}{index}. '
                 f'<a href="{_esc_url(c.url)}">{title_esc}</a></b>'
             )
         else:
-            title_line = f"<b>{index}. {title_esc}</b>"
+            title_line = f"<b>{tracked_badge}{index}. {title_esc}</b>"
 
         source_tag = f"<i>[{_esc(c.source)}]</i>"
         lines.append(f"{title_line} {source_tag}")
@@ -364,5 +375,217 @@ class TelegramFormatter:
         lines.append("")
         lines.append("<i>Adjust: /feedback more [topic] or less [topic]</i>")
         lines.append("<i>Sources: /feedback prefer [source] or demote [source]</i>")
+
+        return "\n".join(lines).strip()
+
+    def format_deep_dive(self, item: ReportItem, index: int) -> str:
+        """Format a full deep-dive analysis of a single story.
+
+        Shows everything the pipeline knows: full summary, analysis context,
+        confidence band with key assumptions, evidence breakdown, discovery
+        source, lifecycle stage, and related reads.
+        """
+        lines: list[str] = []
+        c = item.candidate
+
+        # Header
+        lines.append(f"<b>\U0001f50d Deep Dive: Story #{index}</b>")
+        lines.append("")
+
+        # Title + source
+        title_esc = _esc(c.title)
+        if c.url and not c.url.startswith("https://example.com"):
+            lines.append(
+                f'<b><a href="{_esc_url(c.url)}">{title_esc}</a></b>'
+            )
+        else:
+            lines.append(f"<b>{title_esc}</b>")
+        lines.append(f"<i>[{_esc(c.source)}]</i>")
+
+        # Full summary — no truncation for deep dive
+        body = c.summary.strip() if c.summary else ""
+        if body:
+            body = body.replace("\xa0", " ")
+            lines.append("")
+            lines.append(_esc(body))
+
+        # Analysis section
+        lines.append("")
+        lines.append(_section("Analysis"))
+
+        if item.why_it_matters:
+            lines.append("")
+            lines.append(f"<b>Why it matters:</b> {_esc(item.why_it_matters)}")
+
+        if item.what_changed:
+            lines.append("")
+            lines.append(f"<b>What changed:</b> {_esc(item.what_changed)}")
+
+        if item.predictive_outlook:
+            lines.append("")
+            lines.append(f"\U0001f52e <b>Outlook:</b> {_esc(item.predictive_outlook)}")
+
+        if item.contrarian_note:
+            lines.append("")
+            lines.append(f"\u26a1 <b>Contrarian signal:</b> {_esc(item.contrarian_note)}")
+
+        # Confidence assessment
+        if item.confidence:
+            lines.append("")
+            lines.append(_section("Confidence"))
+            band = item.confidence
+            label = _confidence_label(item)
+            lines.append(
+                f"{label} ({band.low:.0%} \u2013 {band.mid:.0%} \u2013 {band.high:.0%})"
+            )
+            if band.key_assumptions:
+                lines.append("")
+                lines.append("<b>Key assumptions:</b>")
+                for assumption in band.key_assumptions[:4]:
+                    lines.append(f"  \u2022 {_esc(assumption)}")
+
+        # Source intelligence
+        lines.append("")
+        lines.append(_section("Source Intelligence"))
+
+        if c.discovered_by:
+            lines.append(f"Discovered by: {_esc(c.discovered_by)}")
+
+        if c.corroborated_by:
+            corr_list = ", ".join(c.corroborated_by)
+            lines.append(f"Corroborated by: {_esc(corr_list)}")
+
+        lines.append(f"Story stage: {c.lifecycle.value.title()}")
+        lines.append(
+            f"Scores: evidence {c.evidence_score:.0%} "
+            f"\u00b7 novelty {c.novelty_score:.0%} "
+            f"\u00b7 relevance {c.preference_fit:.0%}"
+        )
+
+        if c.regions:
+            region_list = ", ".join(_format_region(r) for r in c.regions)
+            lines.append(f"\U0001f4cd {region_list}")
+
+        # Related reads
+        if item.adjacent_reads:
+            reads = [_esc(r) for r in item.adjacent_reads if r]
+            if reads:
+                lines.append("")
+                lines.append(_section("Related"))
+                for read in reads[:5]:
+                    lines.append(f"  \u2022 {read}")
+
+        return "\n".join(lines).strip()
+
+    def _build_exec_summary(self, payload: DeliveryPayload,
+                            tracked_count: int = 0) -> str:
+        """Build a one-line executive summary of the briefing."""
+        from collections import Counter
+        topics = Counter(item.candidate.topic for item in payload.items)
+        top = topics.most_common(3)
+        topic_parts = []
+        for topic, count in top:
+            name = topic.replace("_", " ")
+            topic_parts.append(f"{count} {name}" if count > 1 else name)
+        summary = ", ".join(topic_parts)
+
+        extras = []
+        if tracked_count:
+            extras.append(f"\U0001f4cc {tracked_count} tracked")
+        escalating = [r for r in payload.geo_risks if r.is_escalating()]
+        if escalating:
+            extras.append(f"\u26a0\ufe0f {len(escalating)} risk alerts")
+        emerging = [t for t in payload.trends if t.is_emerging]
+        if emerging:
+            extras.append(f"\U0001f4c8 {len(emerging)} trending")
+
+        line = f"<b>{len(payload.items)} stories:</b> {summary}"
+        if extras:
+            dot_sep = " \u00b7 "
+            line += f" \u2014 {dot_sep.join(extras)}"
+        return line
+
+    def format_comparison(self, item: ReportItem,
+                          others: list, story_index: int) -> str:
+        """Format a multi-source comparison showing how different outlets cover the same story."""
+        lines: list[str] = []
+        c = item.candidate
+
+        lines.append(f"<b>\U0001f50e Source Comparison: Story #{story_index}</b>")
+        lines.append("")
+
+        # The selected story (what the user saw)
+        lines.append(f"<b>\u2500\u2500\u2500 {_esc(c.source)} (selected) \u2500\u2500\u2500</b>")
+        lines.append(f"<b>{_esc(c.title)}</b>")
+        if c.summary:
+            lines.append(_esc(_clean_summary(c.summary)))
+        lines.append("")
+
+        # Other sources covering the same story
+        if not others:
+            lines.append("<i>No other sources found covering this story.</i>")
+            lines.append("<i>This may be an exclusive or early-breaking report.</i>")
+        else:
+            for other in others[:5]:
+                lines.append(f"<b>\u2500\u2500\u2500 {_esc(other.source)} \u2500\u2500\u2500</b>")
+                lines.append(f"<b>{_esc(other.title)}</b>")
+                if other.summary:
+                    lines.append(_esc(_clean_summary(other.summary)))
+                if other.url and not other.url.startswith("https://example.com"):
+                    lines.append(f'<a href="{_esc_url(other.url)}">Read full article</a>')
+                lines.append("")
+
+        lines.append(f"<i>{1 + len(others)} sources covering this story</i>")
+
+        return "\n".join(lines).strip()
+
+    def format_tracked_update(self, candidate, tracked_headline: str) -> str:
+        """Format a proactive notification for a tracked story update."""
+        lines: list[str] = []
+        lines.append(f"<b>\U0001f4cc Tracked Story Update</b>")
+        lines.append(f"<i>You're tracking: {_esc(tracked_headline)}</i>")
+        lines.append("")
+        title_esc = _esc(candidate.title)
+        if candidate.url and not candidate.url.startswith("https://example.com"):
+            lines.append(
+                f'<b><a href="{_esc_url(candidate.url)}">{title_esc}</a></b>'
+            )
+        else:
+            lines.append(f"<b>{title_esc}</b>")
+        lines.append(f"<i>[{_esc(candidate.source)}]</i>")
+        if candidate.summary:
+            lines.append("")
+            lines.append(_esc(_clean_summary(candidate.summary)))
+        return "\n".join(lines).strip()
+
+    def format_recall(self, keyword: str, items: list[dict]) -> str:
+        """Format search results from past briefings."""
+        lines: list[str] = []
+        lines.append(f'<b>\U0001f50d Recall: "{_esc(keyword)}"</b>')
+        lines.append(f"<i>{len(items)} results from past briefings</i>")
+        lines.append("")
+
+        for i, item in enumerate(items[:10], 1):
+            title = _esc(item.get("title", ""))
+            source = _esc(item.get("source", ""))
+            topic = item.get("topic", "").replace("_", " ").title()
+            url = item.get("url", "")
+
+            if url and not url.startswith("https://example.com"):
+                lines.append(f'{i}. <a href="{_esc_url(url)}">{title}</a> <i>[{source}]</i>')
+            else:
+                lines.append(f"{i}. <b>{title}</b> <i>[{source}]</i>")
+
+            # Show why_it_matters if available, else summary snippet
+            context = item.get("why_it_matters") or item.get("summary", "")
+            if context:
+                lines.append(f"   {_esc(context[:150])}")
+
+            if topic:
+                lines.append(f"   <i>{topic}</i>")
+            lines.append("")
+
+        if not items:
+            lines.append("<i>No matching stories found in your briefing history.</i>")
 
         return "\n".join(lines).strip()
