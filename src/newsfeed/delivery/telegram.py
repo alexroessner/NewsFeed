@@ -42,6 +42,15 @@ def _esc(text: str) -> str:
     return html.escape(text, quote=False)
 
 
+def _esc_url(url: str) -> str:
+    """Escape a URL for use inside an href attribute.
+
+    Only escapes quotes and angle brackets — ampersands must stay literal
+    so URL query parameters work (Telegram's HTML parser handles this).
+    """
+    return url.replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def _human_time(dt) -> str:
     """Format datetime for human readability."""
     return dt.strftime("%b %d, %Y \u00b7 %H:%M UTC")
@@ -160,7 +169,7 @@ class TelegramFormatter:
             if c.url and not c.url.startswith("https://example.com"):
                 title_line = (
                     f'<b>{idx}. '
-                    f'<a href="{_esc(c.url)}">{title_esc}</a></b>'
+                    f'<a href="{_esc_url(c.url)}">{title_esc}</a></b>'
                 )
             else:
                 title_line = f"<b>{idx}. {title_esc}</b>"
@@ -282,7 +291,7 @@ class TelegramFormatter:
         if c.url and not c.url.startswith("https://example.com"):
             title_line = (
                 f'<b>{index}. '
-                f'<a href="{_esc(c.url)}">{title_esc}</a></b>'
+                f'<a href="{_esc_url(c.url)}">{title_esc}</a></b>'
             )
         else:
             title_line = f"<b>{index}. {title_esc}</b>"

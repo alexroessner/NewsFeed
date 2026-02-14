@@ -20,7 +20,7 @@ echo "Setting Telegram webhook..."
 echo "  URL: ${WORKER_URL}"
 echo "  Bot: ${BOT_TOKEN:0:10}..."
 
-PARAMS="url=${WORKER_URL}"
+PARAMS="url=${WORKER_URL}&allowed_updates=[\"message\",\"callback_query\"]"
 if [ -n "${WEBHOOK_SECRET}" ]; then
     PARAMS="${PARAMS}&secret_token=${WEBHOOK_SECRET}"
     echo "  Secret: (set)"

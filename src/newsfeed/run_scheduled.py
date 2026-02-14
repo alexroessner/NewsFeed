@@ -90,7 +90,7 @@ def _inject_env_secrets(config_dir: Path) -> None:
 
     secrets = {}
     for config_key, env_key in env_map.items():
-        val = os.environ.get(env_key, "")
+        val = os.environ.get(env_key, "").strip()
         if val:
             secrets[config_key] = val
 
