@@ -589,3 +589,178 @@ class TelegramFormatter:
             lines.append("<i>No matching stories found in your briefing history.</i>")
 
         return "\n".join(lines).strip()
+
+    def format_insights(self, insights: dict) -> str:
+        """Format preference learning insights for the user."""
+        lines: list[str] = []
+        lines.append("<b>\U0001f9e0 Your Intelligence Profile</b>")
+        lines.append(f"<i>Based on {insights['total_ratings']} ratings over {insights['days']} days</i>")
+        lines.append("")
+
+        if not insights["total_ratings"]:
+            lines.append("<i>Not enough data yet. Rate stories with \U0001f44d/\U0001f44e to build your profile.</i>")
+            return "\n".join(lines)
+
+        # Topic affinities
+        topics = insights.get("topics", [])
+        if topics:
+            lines.append("<b>Topic Affinities</b>")
+            for t in topics[:8]:
+                ups = t["ups"] or 0
+                downs = t["downs"] or 0
+                net = ups - downs
+                total = t["total"] or 1
+                pct = ups / total * 100
+                name = t["topic"].replace("_", " ").title()
+                if net > 0:
+                    indicator = "\u2191"
+                elif net < 0:
+                    indicator = "\u2193"
+                else:
+                    indicator = "\u2192"
+                lines.append(f"  {indicator} <b>{_esc(name)}</b>: {ups}\U0001f44d {downs}\U0001f44e ({pct:.0f}% positive)")
+            lines.append("")
+
+        # Source preferences
+        sources = insights.get("sources", [])
+        if sources:
+            lines.append("<b>Source Preferences</b>")
+            for s in sources[:8]:
+                ups = s["ups"] or 0
+                downs = s["downs"] or 0
+                total = s["total"] or 1
+                pct = ups / total * 100
+                src = _esc(s["source"])
+                if pct >= 70:
+                    indicator = "\u2705"
+                elif pct <= 30:
+                    indicator = "\u274c"
+                else:
+                    indicator = "\u2796"
+                lines.append(f"  {indicator} <b>{src}</b>: {pct:.0f}% approval ({total} ratings)")
+            lines.append("")
+
+        # Suggestions based on patterns
+        suggestions = insights.get("suggestions", [])
+        if suggestions:
+            lines.append("<b>Suggestions</b>")
+            for s in suggestions:
+                lines.append(f"  \u2022 {_esc(s)}")
+            lines.append("")
+
+        # Applied adjustments
+        applied = insights.get("applied", [])
+        if applied:
+            lines.append("<b>Auto-adjusted</b>")
+            for a in applied:
+                lines.append(f"  \u2022 {_esc(a)}")
+
+        return "\n".join(lines).strip()
+
+    def format_weekly(self, summary: dict) -> str:
+        """Format a weekly intelligence digest."""
+        lines: list[str] = []
+        days = summary.get("days", 7)
+        lines.append("<b>\U0001f4ca Weekly Intelligence Digest</b>")
+        lines.append(f"<i>Past {days} days</i>")
+        lines.append("")
+
+        briefings = summary.get("briefing_count", 0)
+        stories = summary.get("story_count", 0)
+        if not stories:
+            lines.append("<i>No briefings delivered this week. Run /briefing to get started.</i>")
+            return "\n".join(lines)
+
+        lines.append(f"<b>{briefings} briefings</b> delivered \u00b7 <b>{stories} stories</b> total")
+        lines.append("")
+
+        # Topic breakdown
+        topic_dist = summary.get("topic_distribution", [])
+        if topic_dist:
+            lines.append(_section("Coverage by Topic"))
+            for t in topic_dist[:8]:
+                name = t["topic"].replace("_", " ").title()
+                count = t["count"]
+                bar = "\u2588" * max(1, min(count, 15))
+                lines.append(f"  {_esc(name)}: {count} {bar}")
+            lines.append("")
+
+        # Source breakdown
+        source_dist = summary.get("source_distribution", [])
+        if source_dist:
+            lines.append(_section("Top Sources"))
+            for s in source_dist[:6]:
+                lines.append(f"  {_esc(s['source'])}: {s['count']} stories")
+            lines.append("")
+
+        # Engagement stats
+        rating_total = summary.get("rating_total", 0)
+        if rating_total:
+            ups = summary.get("rating_ups", 0)
+            downs = summary.get("rating_downs", 0)
+            lines.append(_section("Your Engagement"))
+            lines.append(f"  {rating_total} ratings: {ups} \U0001f44d {downs} \U0001f44e")
+            # Top rated stories
+            top_rated = summary.get("top_rated", [])
+            if top_rated:
+                lines.append("  <b>Your favorites:</b>")
+                for tr in top_rated[:3]:
+                    title = _esc(tr.get("title", "")[:60])
+                    lines.append(f"    \u2022 {title}")
+            lines.append("")
+
+        # Trends
+        trends = summary.get("trends", [])
+        if trends:
+            lines.append(_section("Trending This Week"))
+            for t in trends:
+                name = t["topic"].replace("_", " ").title()
+                score = t["anomaly_score"]
+                lines.append(f"  \U0001f4c8 <b>{_esc(name)}</b>: {score:.1f}x baseline")
+            lines.append("")
+
+        # Geo-risk summary
+        georisks = summary.get("georisks", [])
+        escalating = [g for g in georisks if g.get("escalation_delta", 0) > 0.05]
+        if escalating:
+            lines.append(_section("Geo Risk Watch"))
+            for g in escalating[:4]:
+                region = _format_region(g["region"])
+                level = g["risk_level"]
+                delta = g["escalation_delta"]
+                lines.append(f"  \u26a0\ufe0f <b>{_esc(region)}</b>: {level:.0%} (\u2191{delta:.0%})")
+            lines.append("")
+
+        lines.append("<i>Adjust coverage: /feedback more [topic] or less [topic]</i>")
+
+        return "\n".join(lines).strip()
+
+    def format_intelligence_alert(self, alert_type: str,
+                                  data: dict) -> str:
+        """Format a proactive intelligence alert (geo-risk or trend spike)."""
+        lines: list[str] = []
+
+        if alert_type == "georisk":
+            region = _format_region(data["region"])
+            level = data["risk_level"]
+            delta = data["escalation_delta"]
+            lines.append(f"<b>\U0001f6a8 Geo-Risk Alert: {_esc(region)}</b>")
+            lines.append(f"Risk level: <b>{level:.0%}</b> (\u2191{delta:.0%} change)")
+            drivers = data.get("drivers", [])
+            if drivers:
+                lines.append("")
+                lines.append("<b>Drivers:</b>")
+                for d in drivers[:3]:
+                    lines.append(f"  \u2022 {_esc(d)}")
+            lines.append("")
+            lines.append("<i>Run /briefing for full analysis</i>")
+
+        elif alert_type == "trend":
+            topic = data["topic"].replace("_", " ").title()
+            score = data["anomaly_score"]
+            lines.append(f"<b>\U0001f4c8 Trend Alert: {_esc(topic)}</b>")
+            lines.append(f"Activity at <b>{score:.1f}x</b> baseline")
+            lines.append("")
+            lines.append("<i>Run /briefing for full coverage</i>")
+
+        return "\n".join(lines).strip()

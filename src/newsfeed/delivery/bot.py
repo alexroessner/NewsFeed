@@ -48,6 +48,8 @@ BOT_COMMANDS = [
     {"command": "untrack", "description": "Stop tracking a story (e.g. /untrack 1)"},
     {"command": "compare", "description": "Compare sources on a story (e.g. /compare 2)"},
     {"command": "recall", "description": "Search past briefings (e.g. /recall AI regulation)"},
+    {"command": "insights", "description": "View your preference profile and auto-adjustments"},
+    {"command": "weekly", "description": "Weekly intelligence digest and coverage summary"},
     {"command": "help", "description": "Show available commands and usage"},
 ]
 
