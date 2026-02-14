@@ -812,6 +812,19 @@ class AnalyticsDB:
             (user_id, limit),
         )
 
+    def search_briefing_items(self, user_id: str, keyword: str,
+                              limit: int = 15) -> list[dict]:
+        """Search past briefing items by keyword in title, summary, or topic."""
+        pattern = f"%{keyword}%"
+        return self._query(
+            """SELECT title, source, topic, url, summary, why_it_matters,
+                      predictive_outlook, delivered_at
+               FROM briefing_items
+               WHERE user_id = ? AND (title LIKE ? OR summary LIKE ? OR topic LIKE ?)
+               ORDER BY delivered_at DESC LIMIT ?""",
+            (user_id, pattern, pattern, pattern, limit),
+        )
+
     def get_user_ratings(self, user_id: str, limit: int = 50) -> list[dict]:
         return self._query(
             """SELECT ts, item_index, direction, topic, source, title

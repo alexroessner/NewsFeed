@@ -200,6 +200,18 @@ class CandidateCache:
                 fresh.append(c)
         return fresh
 
+    def get_all_fresh(self, user_id: str) -> list[CandidateItem]:
+        """Get all fresh candidates across all topics for a user."""
+        now = datetime.now(timezone.utc)
+        prefix = f"{user_id}:"
+        fresh: list[CandidateItem] = []
+        for key, candidates in self._entries.items():
+            if key.startswith(prefix):
+                for c in candidates:
+                    if now - c.created_at <= self.stale_after:
+                        fresh.append(c)
+        return fresh
+
     def get_more(self, user_id: str, topic: str, already_seen_ids: set[str], limit: int) -> list[CandidateItem]:
         candidates = self.get_fresh(user_id, topic)
         unseen = [replace(c) for c in candidates if c.candidate_id not in already_seen_ids]

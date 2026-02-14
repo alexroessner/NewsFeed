@@ -206,6 +206,9 @@ class NewsFeedEngine:
         self._last_briefing_items: dict[str, list[dict]] = {}  # [{topic, source}, ...]
         # Track full ReportItem objects for per-story deep dive
         self._last_report_items: dict[str, list[ReportItem]] = {}  # user_id -> [ReportItem, ...]
+        # Track threads from last briefing for source comparison
+        from newsfeed.models.domain import NarrativeThread
+        self._last_threads: dict[str, list[NarrativeThread]] = {}  # user_id -> [NarrativeThread, ...]
 
         # State persistence — save and restore preferences, credibility, etc.
         persist_cfg = pipeline.get("persistence", {})
@@ -449,6 +452,8 @@ class NewsFeedEngine:
         ]
         # Track full ReportItems for per-story deep dive
         self._last_report_items[user_id] = list(report_items)
+        # Track threads for source comparison
+        self._last_threads[user_id] = list(threads)
 
         # Persist state if enabled
         if self._persistence:
@@ -609,6 +614,22 @@ class NewsFeedEngine:
         if 1 <= index <= len(items):
             return items[index - 1]
         return None
+
+    def get_story_thread(self, user_id: str, story_index: int) -> tuple[ReportItem | None, list[CandidateItem]]:
+        """Return a story and all candidates from its thread (for source comparison).
+
+        Returns (report_item, other_candidates_in_same_thread).
+        """
+        item = self.get_report_item(user_id, story_index)
+        if not item or not item.thread_id:
+            return item, []
+        threads = self._last_threads.get(user_id, [])
+        for thread in threads:
+            if thread.thread_id == item.thread_id:
+                # Return candidates from this thread that aren't the selected story
+                others = [c for c in thread.candidates if c.candidate_id != item.candidate.candidate_id]
+                return item, others
+        return item, []
 
     def show_more(self, user_id: str, topic: str, already_seen_ids: set[str], limit: int = 5) -> list[CandidateItem]:
         """Return cached candidates the user hasn't seen yet."""
