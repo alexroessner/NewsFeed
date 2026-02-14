@@ -199,6 +199,24 @@ class CommunicationAgent:
         if command == "untrack":
             return self._untrack_story(chat_id, user_id, args)
 
+        if command == "save":
+            return self._save_story(chat_id, user_id, args)
+
+        if command == "saved":
+            return self._show_saved(chat_id, user_id)
+
+        if command == "unsave":
+            return self._unsave_story(chat_id, user_id, args)
+
+        if command == "timeline":
+            return self._show_timeline(chat_id, user_id, args)
+
+        if command == "email":
+            return self._set_email(chat_id, user_id, args)
+
+        if command == "digest":
+            return self._send_email_digest(chat_id, user_id)
+
         if command == "reset":
             self._engine.preferences.reset(user_id)
             self._engine.apply_user_feedback(user_id, "reset preferences")
@@ -1036,6 +1054,204 @@ class CommunicationAgent:
                     sent += 1
 
         return sent
+
+    def _save_story(self, chat_id: int | str, user_id: str,
+                    args: str) -> dict[str, Any]:
+        """Bookmark a story from the last briefing."""
+        try:
+            story_num = int(args.strip())
+        except (ValueError, TypeError):
+            self._bot.send_message(chat_id, "Usage: tap the \U0001f516 Save button on a story card.")
+            return {"action": "save_help", "user_id": user_id}
+
+        items = self._last_items.get(user_id, [])
+        if story_num < 1 or story_num > len(items):
+            self._bot.send_message(chat_id, "That story is no longer available. Run /briefing first.")
+            return {"action": "save_expired", "user_id": user_id}
+
+        item = items[story_num - 1]
+        # Get URL from ReportItem if available
+        report_item = self._engine.get_report_item(user_id, story_num)
+        url = report_item.candidate.url if report_item else ""
+
+        self._engine.preferences.save_bookmark(
+            user_id,
+            title=item["title"],
+            source=item.get("source", ""),
+            url=url,
+            topic=item["topic"],
+        )
+        self._persist_prefs()
+
+        import html as html_mod
+        self._bot.send_message(
+            chat_id,
+            f"\U0001f516 Saved: <b>{html_mod.escape(item['title'][:80])}</b>\n"
+            f"View bookmarks: /saved"
+        )
+        return {"action": "save", "user_id": user_id, "story": story_num}
+
+    def _show_saved(self, chat_id: int | str, user_id: str) -> dict[str, Any]:
+        """Show all bookmarked stories."""
+        profile = self._engine.preferences.get_or_create(user_id)
+        formatter = self._engine.formatter
+        card = formatter.format_bookmarks(profile.bookmarks)
+        self._bot.send_message(chat_id, card)
+        return {"action": "saved", "user_id": user_id, "count": len(profile.bookmarks)}
+
+    def _unsave_story(self, chat_id: int | str, user_id: str,
+                      args: str) -> dict[str, Any]:
+        """Remove a bookmark by index."""
+        try:
+            index = int(args.strip())
+        except (ValueError, TypeError):
+            self._bot.send_message(chat_id, "Usage: /unsave [number] \u2014 see /saved for the list.")
+            return {"action": "unsave_help", "user_id": user_id}
+
+        profile = self._engine.preferences.get_or_create(user_id)
+        if index < 1 or index > len(profile.bookmarks):
+            self._bot.send_message(chat_id, f"No bookmark #{index}. See /saved for the list.")
+            return {"action": "unsave_invalid", "user_id": user_id}
+
+        removed = profile.bookmarks[index - 1]
+        self._engine.preferences.remove_bookmark(user_id, index)
+        self._persist_prefs()
+        self._bot.send_message(
+            chat_id,
+            f"Removed bookmark: <b>{removed['title'][:80]}</b>"
+        )
+        return {"action": "unsave", "user_id": user_id, "index": index}
+
+    def _show_timeline(self, chat_id: int | str, user_id: str,
+                       args: str) -> dict[str, Any]:
+        """Show timeline of a tracked story's evolution from analytics."""
+        try:
+            index = int(args.strip())
+        except (ValueError, TypeError):
+            self._bot.send_message(
+                chat_id,
+                "Usage: /timeline [number] \u2014 where number is from /tracked list."
+            )
+            return {"action": "timeline_help", "user_id": user_id}
+
+        profile = self._engine.preferences.get_or_create(user_id)
+        if index < 1 or index > len(profile.tracked_stories):
+            self._bot.send_message(chat_id, f"No tracked story #{index}. See /tracked for the list.")
+            return {"action": "timeline_invalid", "user_id": user_id}
+
+        tracked = profile.tracked_stories[index - 1]
+        items = self._engine.analytics.get_story_timeline(
+            user_id, tracked["topic"], tracked["keywords"],
+        )
+
+        formatter = self._engine.formatter
+        card = formatter.format_timeline(tracked["headline"], items)
+        self._bot.send_message(chat_id, card)
+        return {"action": "timeline", "user_id": user_id, "index": index,
+                "results": len(items)}
+
+    def _set_email(self, chat_id: int | str, user_id: str,
+                   args: str) -> dict[str, Any]:
+        """Set or show user email for digest delivery."""
+        import re as re_mod
+        email = args.strip()
+
+        if not email:
+            profile = self._engine.preferences.get_or_create(user_id)
+            current = profile.email or "not set"
+            self._bot.send_message(
+                chat_id,
+                f"Email: <code>{current}</code>\n"
+                f"Set with: /email user@example.com"
+            )
+            return {"action": "email_show", "user_id": user_id}
+
+        # Basic email validation
+        if not re_mod.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+            self._bot.send_message(chat_id, "That doesn't look like a valid email address.")
+            return {"action": "email_invalid", "user_id": user_id}
+
+        self._engine.preferences.set_email(user_id, email)
+        self._persist_prefs()
+        self._bot.send_message(
+            chat_id,
+            f"Email set to <code>{email}</code>\n"
+            f"Send a digest anytime: /digest"
+        )
+        return {"action": "email", "user_id": user_id, "email": email}
+
+    def _send_email_digest(self, chat_id: int | str, user_id: str) -> dict[str, Any]:
+        """Send an HTML email digest of the last briefing."""
+        profile = self._engine.preferences.get_or_create(user_id)
+        if not profile.email:
+            self._bot.send_message(
+                chat_id,
+                "No email configured. Set one with: /email user@example.com"
+            )
+            return {"action": "digest_no_email", "user_id": user_id}
+
+        # Get last report items to build a payload
+        report_items = self._engine._last_report_items.get(user_id, [])
+        if not report_items:
+            self._bot.send_message(
+                chat_id,
+                "No recent briefing to send. Run /briefing first."
+            )
+            return {"action": "digest_no_briefing", "user_id": user_id}
+
+        from datetime import datetime, timezone
+        from newsfeed.delivery.email_digest import EmailDigest
+        from newsfeed.models.domain import BriefingType, DeliveryPayload
+
+        # Reconstruct a lightweight payload from stored report items
+        payload = DeliveryPayload(
+            user_id=user_id,
+            generated_at=datetime.now(timezone.utc),
+            items=report_items,
+            briefing_type=BriefingType.MORNING_DIGEST,
+        )
+
+        # Compute tracked flags
+        tracked = profile.tracked_stories
+        tracked_flags = []
+        for item in report_items:
+            is_tracked = any(
+                match_tracked(item.candidate.topic, item.candidate.title, t)
+                for t in tracked
+            )
+            tracked_flags.append(is_tracked)
+
+        # Build weekly summary for inclusion
+        weekly = self._engine.analytics.get_weekly_summary(user_id)
+
+        smtp_cfg = self._engine.pipeline.get("smtp", {})
+        digest = EmailDigest(smtp_cfg)
+        html_body = digest.render(payload, tracked_flags, weekly)
+
+        if not digest.is_configured:
+            # Save HTML locally and notify
+            self._bot.send_message(
+                chat_id,
+                "SMTP not configured \u2014 email digest rendered but cannot send.\n"
+                "Configure SMTP_HOST, SMTP_FROM, SMTP_USER, SMTP_PASSWORD environment variables."
+            )
+            return {"action": "digest_no_smtp", "user_id": user_id}
+
+        subject = f"Intelligence Digest \u2014 {datetime.now(timezone.utc).strftime('%b %d, %Y')}"
+        success = digest.send(profile.email, subject, html_body)
+
+        if success:
+            self._bot.send_message(
+                chat_id,
+                f"\u2709\ufe0f Digest sent to <code>{profile.email}</code>"
+            )
+        else:
+            self._bot.send_message(
+                chat_id,
+                "Failed to send email. Check SMTP configuration."
+            )
+
+        return {"action": "digest", "user_id": user_id, "sent": success}
 
     def _deep_dive_story(self, chat_id: int | str, user_id: str,
                          story_num: int) -> dict[str, Any]:

@@ -146,6 +146,39 @@ class PreferenceStore:
             profile.tracked_stories.pop(index - 1)
         return profile
 
+    def save_bookmark(self, user_id: str, title: str, source: str,
+                      url: str, topic: str) -> UserProfile:
+        """Save a story bookmark."""
+        profile = self.get_or_create(user_id)
+        # Avoid exact title duplicates
+        for existing in profile.bookmarks:
+            if existing["title"] == title:
+                return profile
+        profile.bookmarks.append({
+            "title": title,
+            "source": source,
+            "url": url,
+            "topic": topic,
+            "saved_at": time.time(),
+        })
+        # Cap at 50 bookmarks
+        if len(profile.bookmarks) > 50:
+            profile.bookmarks = profile.bookmarks[-50:]
+        return profile
+
+    def remove_bookmark(self, user_id: str, index: int) -> UserProfile:
+        """Remove a bookmark by 1-based index."""
+        profile = self.get_or_create(user_id)
+        if 1 <= index <= len(profile.bookmarks):
+            profile.bookmarks.pop(index - 1)
+        return profile
+
+    def set_email(self, user_id: str, email: str) -> UserProfile:
+        """Set the user's email address for digest delivery."""
+        profile = self.get_or_create(user_id)
+        profile.email = email.strip()
+        return profile
+
     def reset(self, user_id: str) -> UserProfile:
         """Reset all user preferences to defaults."""
         profile = self.get_or_create(user_id)
@@ -158,7 +191,7 @@ class PreferenceStore:
         profile.max_items = 10
         profile.briefing_cadence = "on_demand"
         profile.timezone = "UTC"
-        # Keep watchlists and tracked stories on reset — those are data, not weights
+        # Keep watchlists, tracked stories, bookmarks, and email on reset — those are data, not weights
         return profile
 
     def snapshot(self) -> dict[str, dict]:
@@ -177,6 +210,8 @@ class PreferenceStore:
                 "timezone": p.timezone,
                 "muted_topics": list(p.muted_topics),
                 "tracked_stories": list(p.tracked_stories),
+                "bookmarks": list(p.bookmarks),
+                "email": p.email,
             }
         return result
 

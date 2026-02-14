@@ -764,3 +764,87 @@ class TelegramFormatter:
             lines.append("<i>Run /briefing for full coverage</i>")
 
         return "\n".join(lines).strip()
+
+    def format_timeline(self, headline: str, items: list[dict]) -> str:
+        """Format a chronological timeline for a tracked story."""
+        lines: list[str] = []
+        lines.append(f"<b>\U0001f4c5 Story Timeline</b>")
+        lines.append(f"<i>Tracking: {_esc(headline[:80])}</i>")
+        lines.append(f"<i>{len(items)} related stories found</i>")
+        lines.append("")
+
+        if not items:
+            lines.append("<i>No matching stories found in your briefing history yet.</i>")
+            lines.append("<i>Keep tracking \u2014 the timeline builds as you receive briefings.</i>")
+            return "\n".join(lines).strip()
+
+        for i, item in enumerate(items[:15], 1):
+            title = _esc(item.get("title", ""))
+            source = _esc(item.get("source", ""))
+            url = item.get("url", "")
+
+            # Date marker
+            delivered = item.get("delivered_at", "")
+            if delivered:
+                try:
+                    from datetime import datetime, timezone as tz
+                    if isinstance(delivered, (int, float)):
+                        dt = datetime.fromtimestamp(delivered, tz=tz.utc)
+                    else:
+                        dt = datetime.fromisoformat(str(delivered))
+                    date_str = dt.strftime("%b %d, %H:%M")
+                except (ValueError, TypeError):
+                    date_str = ""
+            else:
+                date_str = ""
+
+            # Timeline entry
+            if url and not url.startswith("https://example.com"):
+                lines.append(f'\u2502 <a href="{_esc_url(url)}">{title}</a>')
+            else:
+                lines.append(f"\u2502 <b>{title}</b>")
+            meta = f"<i>[{source}]</i>"
+            if date_str:
+                meta += f" <i>{date_str}</i>"
+            lines.append(f"\u2502 {meta}")
+
+            # Brief context
+            context = item.get("why_it_matters") or item.get("summary", "")
+            if context:
+                lines.append(f"\u2502 {_esc(context[:120])}")
+
+            # Connector
+            if i < len(items) and i < 15:
+                lines.append("\u2502")
+            lines.append("")
+
+        return "\n".join(lines).strip()
+
+    def format_bookmarks(self, bookmarks: list[dict]) -> str:
+        """Format saved bookmarks for display."""
+        lines: list[str] = []
+        lines.append(f"<b>\U0001f516 Saved Stories ({len(bookmarks)})</b>")
+        lines.append("")
+
+        if not bookmarks:
+            lines.append("<i>No saved stories yet.</i>")
+            lines.append("<i>Tap \U0001f516 Save on a story card to bookmark it.</i>")
+            return "\n".join(lines).strip()
+
+        for i, b in enumerate(bookmarks, 1):
+            title = _esc(b.get("title", "")[:80])
+            source = _esc(b.get("source", ""))
+            url = b.get("url", "")
+            topic = b.get("topic", "").replace("_", " ").title()
+
+            if url and not url.startswith("https://example.com"):
+                lines.append(f'{i}. <a href="{_esc_url(url)}">{title}</a> <i>[{source}]</i>')
+            else:
+                lines.append(f"{i}. <b>{title}</b> <i>[{source}]</i>")
+
+            if topic:
+                lines.append(f"   <i>{topic}</i>")
+            lines.append("")
+
+        lines.append("<i>Remove: /unsave [number]</i>")
+        return "\n".join(lines).strip()
