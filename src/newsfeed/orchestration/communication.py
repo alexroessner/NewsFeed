@@ -163,6 +163,12 @@ class CommunicationAgent:
             # Otherwise run a fuller briefing
             return self._run_briefing(chat_id, user_id, args, deep=True)
 
+        if command == "quick":
+            return self._run_quick_briefing(chat_id, user_id, args)
+
+        if command == "export":
+            return self._export_briefing(chat_id, user_id)
+
         if command == "compare":
             return self._compare_story(chat_id, user_id, args)
 
@@ -313,13 +319,18 @@ class CommunicationAgent:
             if is_tracked:
                 tracked_count += 1
 
+        # Compute delta tags (NEW / UPDATED / DEVELOPING)
+        delta_tags = self._compute_delta_tags(user_id, payload)
+
         # Message 1: Header (ticker + exec summary + geo risks + trends + threads)
         header = formatter.format_header(payload, ticker_bar, tracked_count=tracked_count)
         self._bot.send_message(chat_id, header)
 
         for idx, item in enumerate(payload.items, start=1):
             is_tracked = tracked_flags[idx - 1]
-            card = formatter.format_story_card(item, idx, is_tracked=is_tracked)
+            delta_tag = delta_tags[idx - 1] if idx - 1 < len(delta_tags) else ""
+            card = formatter.format_story_card(item, idx, is_tracked=is_tracked,
+                                                delta_tag=delta_tag)
             self._bot.send_story_card(chat_id, card, story_index=idx, is_tracked=is_tracked)
 
         if not payload.items:
@@ -1252,6 +1263,179 @@ class CommunicationAgent:
             )
 
         return {"action": "digest", "user_id": user_id, "sent": success}
+
+    def _compute_delta_tags(self, user_id: str,
+                            payload) -> list[str]:
+        """Compute delta tags (NEW/UPDATED/DEVELOPING) relative to last briefing.
+
+        Compares current payload items against the user's previous briefing
+        stored in analytics. Tags:
+        - "new": story not seen in any recent briefing
+        - "updated": same topic + similar title (keyword overlap)
+        - "developing": tracked story with new developments
+        - "": no change info (first briefing or no analytics data)
+        """
+        from newsfeed.memory.store import extract_keywords
+
+        # Get previous briefing items from analytics (last 24h)
+        prev_items = self._engine.analytics.search_briefing_items(
+            user_id, "", limit=50
+        )
+        if not prev_items:
+            return [""] * len(payload.items)
+
+        # Build keyword index from previous items
+        prev_by_topic: dict[str, list[set[str]]] = {}
+        for pi in prev_items:
+            topic = pi.get("topic", "")
+            title = pi.get("title", "")
+            kw = set(extract_keywords(title))
+            prev_by_topic.setdefault(topic, []).append(kw)
+
+        tags: list[str] = []
+        for item in payload.items:
+            c = item.candidate
+            current_kw = set(extract_keywords(c.title))
+            topic_prev = prev_by_topic.get(c.topic, [])
+
+            if not topic_prev:
+                tags.append("new")
+                continue
+
+            # Check for keyword overlap with previous items
+            best_overlap = 0
+            for prev_kw in topic_prev:
+                overlap = len(current_kw & prev_kw)
+                best_overlap = max(best_overlap, overlap)
+
+            if best_overlap >= 3:
+                tags.append("developing")
+            elif best_overlap >= 2:
+                tags.append("updated")
+            else:
+                tags.append("new")
+
+        return tags
+
+    def _run_quick_briefing(self, chat_id: int | str, user_id: str,
+                            topic_hint: str = "") -> dict[str, Any]:
+        """Run a quick headlines-only briefing — compact scan format."""
+        profile = self._engine.preferences.get_or_create(user_id)
+
+        topics = dict(profile.topic_weights) if profile.topic_weights else dict(self._default_topics)
+        if topic_hint:
+            topic_key = topic_hint.strip().lower().replace("_", " ")
+            topics[topic_key] = min(1.0, topics.get(topic_key, 0.5) + 0.3)
+
+        prompt = topic_hint or "Generate intelligence briefing"
+
+        payload = self._engine.handle_request_payload(
+            user_id=user_id,
+            prompt=prompt,
+            weighted_topics=topics,
+            max_items=profile.max_items,
+        )
+
+        # Build market ticker bar
+        ticker_bar = ""
+        try:
+            crypto_ids = profile.watchlist_crypto or None
+            stock_tickers = profile.watchlist_stocks or None
+            market_data = self._market.fetch_all(crypto_ids, stock_tickers)
+            all_quotes = market_data.get("crypto", []) + market_data.get("stocks", [])
+            if all_quotes:
+                ticker_bar = MarketTicker.format_ticker_bar(all_quotes)
+        except Exception:
+            log.debug("Market ticker fetch skipped", exc_info=True)
+
+        # Track items for downstream features
+        dominant_topic = max(topics, key=topics.get, default="general")
+        self._last_topic[user_id] = dominant_topic
+        self._last_items[user_id] = self._engine.last_briefing_items(user_id)
+
+        # Compute tracked flags
+        tracked = profile.tracked_stories
+        tracked_count = 0
+        tracked_flags: list[bool] = []
+        for item in payload.items:
+            is_tracked = any(
+                match_tracked(item.candidate.topic, item.candidate.title, t)
+                for t in tracked
+            )
+            tracked_flags.append(is_tracked)
+            if is_tracked:
+                tracked_count += 1
+
+        # Compute delta tags
+        delta_tags = self._compute_delta_tags(user_id, payload)
+
+        formatter = self._engine.formatter
+        card = formatter.format_quick_briefing(
+            payload, ticker_bar, tracked_flags, delta_tags, tracked_count,
+        )
+        self._bot.send_message(chat_id, card)
+
+        log.info(
+            "Quick briefing: user=%s chat=%s (%d items)",
+            user_id, chat_id, len(payload.items),
+        )
+        return {"action": "quick_briefing", "user_id": user_id,
+                "topic": dominant_topic, "items": len(payload.items)}
+
+    def _export_briefing(self, chat_id: int | str,
+                         user_id: str) -> dict[str, Any]:
+        """Export the last briefing as Markdown."""
+        report_items = self._engine._last_report_items.get(user_id, [])
+        if not report_items:
+            self._bot.send_message(
+                chat_id,
+                "No recent briefing to export. Run /briefing first."
+            )
+            return {"action": "export_empty", "user_id": user_id}
+
+        from datetime import datetime, timezone
+        from newsfeed.models.domain import BriefingType, DeliveryPayload
+
+        payload = DeliveryPayload(
+            user_id=user_id,
+            generated_at=datetime.now(timezone.utc),
+            items=report_items,
+            briefing_type=BriefingType.MORNING_DIGEST,
+        )
+
+        # Tracked flags
+        profile = self._engine.preferences.get_or_create(user_id)
+        tracked = profile.tracked_stories
+        tracked_flags = [
+            any(match_tracked(item.candidate.topic, item.candidate.title, t)
+                for t in tracked)
+            for item in report_items
+        ]
+
+        # Delta tags
+        delta_tags = self._compute_delta_tags(user_id, payload)
+
+        formatter = self._engine.formatter
+        markdown = formatter.format_markdown_export(payload, tracked_flags, delta_tags)
+
+        # Send as a code block (Telegram renders monospace in <pre>)
+        # Split into chunks if needed (Telegram 4096 char limit)
+        header = "<b>\U0001f4dd Markdown Export</b>\n\n"
+        header += "<i>Copy the text below into Obsidian, Notion, or any Markdown editor:</i>\n\n"
+        self._bot.send_message(chat_id, header)
+
+        # Send markdown in pre-formatted blocks
+        chunk_size = 3900  # Leave room for <pre> tags
+        for i in range(0, len(markdown), chunk_size):
+            chunk = markdown[i:i + chunk_size]
+            import html as html_mod
+            self._bot.send_message(
+                chat_id,
+                f"<pre>{html_mod.escape(chunk)}</pre>"
+            )
+
+        return {"action": "export", "user_id": user_id,
+                "length": len(markdown)}
 
     def _deep_dive_story(self, chat_id: int | str, user_id: str,
                          story_num: int) -> dict[str, Any]:

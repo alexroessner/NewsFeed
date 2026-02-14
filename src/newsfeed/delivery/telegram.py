@@ -247,18 +247,31 @@ class TelegramFormatter:
         return "\n".join(lines).strip()
 
     def format_story_card(self, item: ReportItem, index: int,
-                          is_tracked: bool = False) -> str:
+                          is_tracked: bool = False,
+                          delta_tag: str = "") -> str:
         """Format a single story as a rich, readable news card.
 
         Includes the full intelligence context: summary, why it matters,
         what changed, predictive outlook, confidence, and related reads.
         Each card is sent as a separate Telegram message (~4096 char limit).
+
+        delta_tag can be "new", "updated", or "developing" to show how
+        this story relates to the user's previous briefing.
         """
         lines: list[str] = []
         c = item.candidate
 
         # ── Tracked badge ──
         tracked_badge = "\U0001f4cc " if is_tracked else ""
+
+        # ── Delta tag ──
+        tag_str = ""
+        if delta_tag == "new":
+            tag_str = " <b>[NEW]</b>"
+        elif delta_tag == "updated":
+            tag_str = " <b>[UPDATED]</b>"
+        elif delta_tag == "developing":
+            tag_str = " <b>[DEVELOPING]</b>"
 
         # ── Title + source ──
         title_esc = _esc(c.title)
@@ -271,7 +284,7 @@ class TelegramFormatter:
             title_line = f"<b>{tracked_badge}{index}. {title_esc}</b>"
 
         source_tag = f"<i>[{_esc(c.source)}]</i>"
-        lines.append(f"{title_line} {source_tag}")
+        lines.append(f"{title_line} {source_tag}{tag_str}")
 
         # ── Summary ──
         body = c.summary.strip() if c.summary else ""
@@ -377,6 +390,204 @@ class TelegramFormatter:
         lines.append("<i>Sources: /feedback prefer [source] or demote [source]</i>")
 
         return "\n".join(lines).strip()
+
+    def format_quick_card(self, item: ReportItem, index: int,
+                          is_tracked: bool = False,
+                          delta_tag: str = "") -> str:
+        """Format a compact headline-only story card for /quick mode.
+
+        One-line title + source + optional delta tag. No summary, no analysis.
+        Designed for a fast scan before diving into specific stories.
+        """
+        c = item.candidate
+        tracked_badge = "\U0001f4cc " if is_tracked else ""
+
+        # Delta tag (NEW / UPDATED / DEVELOPING)
+        tag = ""
+        if delta_tag == "new":
+            tag = " <b>[NEW]</b>"
+        elif delta_tag == "updated":
+            tag = " <b>[UPDATED]</b>"
+        elif delta_tag == "developing":
+            tag = " <b>[DEVELOPING]</b>"
+
+        title_esc = _esc(c.title)
+        if c.url and not c.url.startswith("https://example.com"):
+            title_part = f'<a href="{_esc_url(c.url)}">{title_esc}</a>'
+        else:
+            title_part = title_esc
+
+        # Compact one-liner with metadata
+        urgency_icon = _URGENCY_ICON.get(c.urgency, "")
+        if urgency_icon:
+            urgency_icon += " "
+
+        # Build a one-line context (why_it_matters truncated to ~100 chars)
+        context = ""
+        if item.why_it_matters:
+            snippet = item.why_it_matters[:100]
+            if len(item.why_it_matters) > 100:
+                cut = snippet.rfind(" ")
+                snippet = snippet[:cut] + "..." if cut > 50 else snippet + "..."
+            context = f"\n   <i>{_esc(snippet)}</i>"
+
+        conf = _confidence_label(item)
+        source_tag = f"<i>[{_esc(c.source)}]</i>"
+        conf_tag = f" <i>\u00b7 {conf}</i>" if conf else ""
+
+        return (
+            f"{tracked_badge}{urgency_icon}<b>{index}.</b> {title_part}"
+            f" {source_tag}{tag}{conf_tag}{context}"
+        )
+
+    def format_quick_briefing(self, payload: DeliveryPayload,
+                               ticker_bar: str = "",
+                               tracked_flags: list[bool] | None = None,
+                               delta_tags: list[str] | None = None,
+                               tracked_count: int = 0) -> str:
+        """Format a complete quick-scan briefing as a single message.
+
+        Headline + one-liner for each story. Fits in one Telegram message
+        for up to ~15 stories.
+        """
+        if tracked_flags is None:
+            tracked_flags = [False] * len(payload.items)
+        if delta_tags is None:
+            delta_tags = [""] * len(payload.items)
+
+        lines: list[str] = []
+        icon = _BRIEFING_ICON.get(payload.briefing_type, "\U0001f4cb")
+        header = _BRIEFING_HEADER.get(payload.briefing_type, "NewsFeed Brief")
+        lines.append(f"<b>{icon} {header} \u2014 Quick Scan</b>")
+        lines.append(f"<i>{_human_time(payload.generated_at)}</i>")
+
+        if payload.items:
+            summary = self._build_exec_summary(payload, tracked_count)
+            lines.append("")
+            lines.append(summary)
+
+        if ticker_bar:
+            lines.append("")
+            lines.append(ticker_bar)
+
+        lines.append("")
+        for idx, item in enumerate(payload.items):
+            is_tracked = tracked_flags[idx] if idx < len(tracked_flags) else False
+            tag = delta_tags[idx] if idx < len(delta_tags) else ""
+            lines.append(self.format_quick_card(item, idx + 1, is_tracked, tag))
+            lines.append("")
+
+        if not payload.items:
+            lines.append("<i>No stories matched your current filters.</i>")
+
+        lines.append(f"<i>Tap /briefing for full analysis \u00b7 /deep_dive [N] for details</i>")
+
+        return "\n".join(lines).strip()
+
+    def format_markdown_export(self, payload: DeliveryPayload,
+                                tracked_flags: list[bool] | None = None,
+                                delta_tags: list[str] | None = None) -> str:
+        """Export the briefing as clean Markdown for note-taking apps."""
+        if tracked_flags is None:
+            tracked_flags = [False] * len(payload.items)
+        if delta_tags is None:
+            delta_tags = [""] * len(payload.items)
+
+        lines: list[str] = []
+
+        # Title
+        ts = payload.generated_at.strftime("%B %d, %Y %H:%M UTC")
+        lines.append(f"# Intelligence Digest")
+        lines.append(f"*{ts}*")
+        lines.append("")
+
+        # Executive summary
+        from collections import Counter
+        topics = Counter(item.candidate.topic for item in payload.items)
+        top = topics.most_common(5)
+        topic_parts = [
+            f"{count} {topic.replace('_', ' ')}" if count > 1 else topic.replace("_", " ")
+            for topic, count in top
+        ]
+        lines.append(f"**{len(payload.items)} stories:** {', '.join(topic_parts)}")
+        lines.append("")
+
+        # Geo-risk alerts
+        escalating = [r for r in payload.geo_risks if r.is_escalating()]
+        if escalating:
+            lines.append("## Geo-Risk Alerts")
+            for risk in escalating[:4]:
+                region = risk.region.replace("_", " ").title()
+                lines.append(f"- **{region}**: {risk.risk_level:.0%} risk (+{risk.escalation_delta:.0%})")
+            lines.append("")
+
+        # Trends
+        emerging = [t for t in payload.trends if t.is_emerging]
+        if emerging:
+            lines.append("## Emerging Trends")
+            for t in emerging[:4]:
+                lines.append(f"- **{t.topic}**: {t.anomaly_score:.1f}x baseline")
+            lines.append("")
+
+        # Stories
+        lines.append("## Stories")
+        lines.append("")
+
+        for idx, item in enumerate(payload.items):
+            c = item.candidate
+            is_tracked = tracked_flags[idx] if idx < len(tracked_flags) else False
+            tag = delta_tags[idx] if idx < len(delta_tags) else ""
+
+            # Title line
+            tracked_mark = " [TRACKED]" if is_tracked else ""
+            delta_mark = f" [{tag.upper()}]" if tag else ""
+            if c.url and not c.url.startswith("https://example.com"):
+                lines.append(f"### {idx + 1}. [{c.title}]({c.url}){tracked_mark}{delta_mark}")
+            else:
+                lines.append(f"### {idx + 1}. {c.title}{tracked_mark}{delta_mark}")
+
+            lines.append(f"*{c.source}*")
+            lines.append("")
+
+            # Summary
+            if c.summary:
+                summary = c.summary.strip()
+                if len(summary) > 800:
+                    cut = summary[:800].rfind(".")
+                    summary = summary[:cut + 1] if cut > 300 else summary[:797] + "..."
+                lines.append(summary)
+                lines.append("")
+
+            # Analysis
+            if item.why_it_matters:
+                lines.append(f"**Why it matters:** {item.why_it_matters}")
+                lines.append("")
+            if item.what_changed:
+                lines.append(f"**What changed:** {item.what_changed}")
+                lines.append("")
+            if item.predictive_outlook:
+                lines.append(f"> {item.predictive_outlook}")
+                lines.append("")
+
+            # Confidence
+            conf = _confidence_label(item)
+            meta = []
+            if conf:
+                meta.append(conf)
+            if c.regions:
+                meta.append(", ".join(r.replace("_", " ").title() for r in c.regions[:3]))
+            if c.corroborated_by:
+                meta.append(f"Verified by {', '.join(c.corroborated_by[:3])}")
+            if meta:
+                lines.append(f"*{' · '.join(meta)}*")
+                lines.append("")
+
+            lines.append("---")
+            lines.append("")
+
+        lines.append(f"*Generated by NewsFeed Intelligence*")
+
+        return "\n".join(lines)
 
     def format_deep_dive(self, item: ReportItem, index: int) -> str:
         """Format a full deep-dive analysis of a single story.
