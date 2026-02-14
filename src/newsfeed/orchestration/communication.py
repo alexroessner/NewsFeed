@@ -169,6 +169,12 @@ class CommunicationAgent:
         if command == "recall":
             return self._recall(chat_id, user_id, args)
 
+        if command == "insights":
+            return self._show_insights(chat_id, user_id)
+
+        if command == "weekly":
+            return self._show_weekly(chat_id, user_id)
+
         if command == "watchlist":
             return self._set_watchlist(chat_id, user_id, args)
 
@@ -596,6 +602,12 @@ class CommunicationAgent:
         except Exception:
             log.exception("Tracked story update check failed")
 
+        # Check for intelligence alerts (geo-risk, trend spikes)
+        try:
+            sent += self.check_intelligence_alerts()
+        except Exception:
+            log.exception("Intelligence alert check failed")
+
         return sent
 
     def _persist_prefs(self) -> None:
@@ -882,6 +894,146 @@ class CommunicationAgent:
                         self._shown_ids.setdefault(user_id, set()).add(candidate.candidate_id)
                         sent += 1
                         break  # Only notify once per candidate
+
+        return sent
+
+    def _show_insights(self, chat_id: int | str, user_id: str) -> dict[str, Any]:
+        """Show preference learning insights and apply auto-adjustments."""
+        insights = self._engine.analytics.get_rating_insights(user_id)
+
+        # Auto-tune: generate suggestions and apply small adjustments
+        suggestions: list[str] = []
+        applied: list[str] = []
+
+        for t in insights.get("topics", []):
+            ups = t["ups"] or 0
+            downs = t["downs"] or 0
+            total = t["total"] or 0
+            if total < 3:
+                continue  # Need minimum data
+            topic = t["topic"]
+            pct = ups / total * 100
+            name = topic.replace("_", " ").title()
+
+            if pct >= 80 and total >= 5:
+                # Strong positive signal — boost if not already high
+                profile = self._engine.preferences.get_or_create(user_id)
+                current = profile.topic_weights.get(topic, 0.5)
+                if current < 0.9:
+                    self._engine.preferences.apply_weight_adjustment(user_id, topic, 0.1)
+                    applied.append(f"Boosted {name} (+0.1) based on consistent positive ratings")
+                else:
+                    suggestions.append(f"{name} is already at max weight — you clearly love this topic")
+            elif pct <= 20 and total >= 5:
+                # Strong negative signal — reduce
+                profile = self._engine.preferences.get_or_create(user_id)
+                current = profile.topic_weights.get(topic, 0.5)
+                if current > -0.5:
+                    self._engine.preferences.apply_weight_adjustment(user_id, topic, -0.1)
+                    applied.append(f"Reduced {name} (-0.1) based on consistent negative ratings")
+                else:
+                    suggestions.append(f"Consider muting {name} entirely: /mute {topic}")
+
+        for s in insights.get("sources", []):
+            ups = s["ups"] or 0
+            downs = s["downs"] or 0
+            total = s["total"] or 0
+            if total < 3:
+                continue
+            source = s["source"]
+            pct = ups / total * 100
+
+            if pct >= 80 and total >= 5:
+                profile = self._engine.preferences.get_or_create(user_id)
+                current = profile.source_weights.get(source, 0.0)
+                if current < 1.5:
+                    self._engine.preferences.apply_source_weight(user_id, source, 0.2)
+                    applied.append(f"Boosted {source} source weight based on high approval")
+            elif pct <= 20 and total >= 5:
+                profile = self._engine.preferences.get_or_create(user_id)
+                current = profile.source_weights.get(source, 0.0)
+                if current > -1.5:
+                    self._engine.preferences.apply_source_weight(user_id, source, -0.2)
+                    applied.append(f"Reduced {source} source weight based on low approval")
+
+        if applied:
+            self._persist_prefs()
+
+        insights["suggestions"] = suggestions
+        insights["applied"] = applied
+
+        formatter = self._engine.formatter
+        card = formatter.format_insights(insights)
+        self._bot.send_message(chat_id, card)
+        return {"action": "insights", "user_id": user_id,
+                "applied": len(applied), "suggestions": len(suggestions)}
+
+    def _show_weekly(self, chat_id: int | str, user_id: str) -> dict[str, Any]:
+        """Show weekly intelligence digest."""
+        summary = self._engine.analytics.get_weekly_summary(user_id)
+        formatter = self._engine.formatter
+        card = formatter.format_weekly(summary)
+        self._bot.send_message(chat_id, card)
+        return {"action": "weekly", "user_id": user_id,
+                "briefings": summary.get("briefing_count", 0),
+                "stories": summary.get("story_count", 0)}
+
+    def check_intelligence_alerts(self) -> int:
+        """Check for geo-risk escalations and trend spikes, notify relevant users.
+
+        Runs against the last available intelligence data (from the most
+        recent briefing pipeline run). Sends alerts to users whose regions
+        or topics match the escalation.
+        Returns the number of alerts sent.
+        """
+        sent = 0
+        formatter = self._engine.formatter
+
+        # Check geo-risks from last pipeline run
+        last_georisks = self._engine.georisk.snapshot()
+        for region, risk_level in last_georisks.items():
+            # Detect escalation > 15%
+            if not isinstance(risk_level, (int, float)):
+                continue
+            if risk_level < 0.5:
+                continue
+
+            alert_data = {
+                "region": region,
+                "risk_level": risk_level,
+                "escalation_delta": 0.15,  # Threshold we're alerting on
+                "drivers": [],
+            }
+
+            # Find users interested in this region
+            for user_id, profile_data in self._engine.preferences.snapshot().items():
+                regions = profile_data.get("regions", [])
+                region_norm = {r.lower().replace(" ", "_") for r in regions}
+                if region.lower().replace(" ", "_") in region_norm:
+                    msg = formatter.format_intelligence_alert("georisk", alert_data)
+                    self._bot.send_message(user_id, msg)
+                    sent += 1
+
+        # Check trend spikes
+        last_trends = self._engine.trends.snapshot()
+        for topic, velocity in last_trends.items():
+            if not isinstance(velocity, (int, float)):
+                continue
+            if velocity < 3.0:  # Only alert on 3x+ baseline
+                continue
+
+            alert_data = {
+                "topic": topic,
+                "anomaly_score": velocity,
+            }
+
+            # Find users with positive weight for this topic
+            for user_id, profile_data in self._engine.preferences.snapshot().items():
+                weights = profile_data.get("topic_weights", {})
+                if weights.get(topic, 0) > 0.3:
+                    msg = formatter.format_intelligence_alert("trend", alert_data)
+                    self._bot.send_message(user_id, msg)
+                    sent += 1
 
         return sent
 
