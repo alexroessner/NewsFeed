@@ -32,6 +32,7 @@ _MAX_MESSAGE_LENGTH = 4096
 BOT_COMMANDS = [
     {"command": "start", "description": "Welcome message and quick-start guide"},
     {"command": "briefing", "description": "Get your personalized intelligence briefing"},
+    {"command": "quick", "description": "Quick headlines-only scan of current stories"},
     {"command": "deep_dive", "description": "Extended briefing with more items (e.g. /deep_dive AI)"},
     {"command": "more", "description": "Show more stories on a topic (e.g. /more geopolitics)"},
     {"command": "feedback", "description": "Adjust preferences (e.g. /feedback more AI, less crypto)"},
@@ -56,6 +57,7 @@ BOT_COMMANDS = [
     {"command": "unsave", "description": "Remove a bookmark (e.g. /unsave 1)"},
     {"command": "email", "description": "Set email for digest delivery (e.g. /email user@example.com)"},
     {"command": "digest", "description": "Send email digest of your latest briefing"},
+    {"command": "export", "description": "Export last briefing as Markdown"},
     {"command": "help", "description": "Show available commands and usage"},
 ]
 
