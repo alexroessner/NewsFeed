@@ -184,7 +184,8 @@ class TelegramFormatter:
 
     # ── Multi-message formatters ──────────────────────────────────
 
-    def format_header(self, payload: DeliveryPayload, ticker_bar: str = "") -> str:
+    def format_header(self, payload: DeliveryPayload, ticker_bar: str = "",
+                      tracked_count: int = 0) -> str:
         """Format the briefing header message (ticker + geo risks + trends + threads)."""
         lines: list[str] = []
 
@@ -192,6 +193,12 @@ class TelegramFormatter:
         header = _BRIEFING_HEADER.get(payload.briefing_type, "NewsFeed Brief")
         lines.append(f"<b>{icon} {header}</b>")
         lines.append(f"<i>{_human_time(payload.generated_at)}</i>")
+
+        # Executive summary — one-line scan of what's in this briefing
+        if payload.items:
+            summary = self._build_exec_summary(payload, tracked_count)
+            lines.append("")
+            lines.append(summary)
 
         if ticker_bar:
             lines.append("")
@@ -467,5 +474,118 @@ class TelegramFormatter:
                 lines.append(_section("Related"))
                 for read in reads[:5]:
                     lines.append(f"  \u2022 {read}")
+
+        return "\n".join(lines).strip()
+
+    def _build_exec_summary(self, payload: DeliveryPayload,
+                            tracked_count: int = 0) -> str:
+        """Build a one-line executive summary of the briefing."""
+        from collections import Counter
+        topics = Counter(item.candidate.topic for item in payload.items)
+        top = topics.most_common(3)
+        topic_parts = []
+        for topic, count in top:
+            name = topic.replace("_", " ")
+            topic_parts.append(f"{count} {name}" if count > 1 else name)
+        summary = ", ".join(topic_parts)
+
+        extras = []
+        if tracked_count:
+            extras.append(f"\U0001f4cc {tracked_count} tracked")
+        escalating = [r for r in payload.geo_risks if r.is_escalating()]
+        if escalating:
+            extras.append(f"\u26a0\ufe0f {len(escalating)} risk alerts")
+        emerging = [t for t in payload.trends if t.is_emerging]
+        if emerging:
+            extras.append(f"\U0001f4c8 {len(emerging)} trending")
+
+        line = f"<b>{len(payload.items)} stories:</b> {summary}"
+        if extras:
+            dot_sep = " \u00b7 "
+            line += f" \u2014 {dot_sep.join(extras)}"
+        return line
+
+    def format_comparison(self, item: ReportItem,
+                          others: list, story_index: int) -> str:
+        """Format a multi-source comparison showing how different outlets cover the same story."""
+        lines: list[str] = []
+        c = item.candidate
+
+        lines.append(f"<b>\U0001f50e Source Comparison: Story #{story_index}</b>")
+        lines.append("")
+
+        # The selected story (what the user saw)
+        lines.append(f"<b>\u2500\u2500\u2500 {_esc(c.source)} (selected) \u2500\u2500\u2500</b>")
+        lines.append(f"<b>{_esc(c.title)}</b>")
+        if c.summary:
+            lines.append(_esc(_clean_summary(c.summary)))
+        lines.append("")
+
+        # Other sources covering the same story
+        if not others:
+            lines.append("<i>No other sources found covering this story.</i>")
+            lines.append("<i>This may be an exclusive or early-breaking report.</i>")
+        else:
+            for other in others[:5]:
+                lines.append(f"<b>\u2500\u2500\u2500 {_esc(other.source)} \u2500\u2500\u2500</b>")
+                lines.append(f"<b>{_esc(other.title)}</b>")
+                if other.summary:
+                    lines.append(_esc(_clean_summary(other.summary)))
+                if other.url and not other.url.startswith("https://example.com"):
+                    lines.append(f'<a href="{_esc_url(other.url)}">Read full article</a>')
+                lines.append("")
+
+        lines.append(f"<i>{1 + len(others)} sources covering this story</i>")
+
+        return "\n".join(lines).strip()
+
+    def format_tracked_update(self, candidate, tracked_headline: str) -> str:
+        """Format a proactive notification for a tracked story update."""
+        lines: list[str] = []
+        lines.append(f"<b>\U0001f4cc Tracked Story Update</b>")
+        lines.append(f"<i>You're tracking: {_esc(tracked_headline)}</i>")
+        lines.append("")
+        title_esc = _esc(candidate.title)
+        if candidate.url and not candidate.url.startswith("https://example.com"):
+            lines.append(
+                f'<b><a href="{_esc_url(candidate.url)}">{title_esc}</a></b>'
+            )
+        else:
+            lines.append(f"<b>{title_esc}</b>")
+        lines.append(f"<i>[{_esc(candidate.source)}]</i>")
+        if candidate.summary:
+            lines.append("")
+            lines.append(_esc(_clean_summary(candidate.summary)))
+        return "\n".join(lines).strip()
+
+    def format_recall(self, keyword: str, items: list[dict]) -> str:
+        """Format search results from past briefings."""
+        lines: list[str] = []
+        lines.append(f'<b>\U0001f50d Recall: "{_esc(keyword)}"</b>')
+        lines.append(f"<i>{len(items)} results from past briefings</i>")
+        lines.append("")
+
+        for i, item in enumerate(items[:10], 1):
+            title = _esc(item.get("title", ""))
+            source = _esc(item.get("source", ""))
+            topic = item.get("topic", "").replace("_", " ").title()
+            url = item.get("url", "")
+
+            if url and not url.startswith("https://example.com"):
+                lines.append(f'{i}. <a href="{_esc_url(url)}">{title}</a> <i>[{source}]</i>')
+            else:
+                lines.append(f"{i}. <b>{title}</b> <i>[{source}]</i>")
+
+            # Show why_it_matters if available, else summary snippet
+            context = item.get("why_it_matters") or item.get("summary", "")
+            if context:
+                lines.append(f"   {_esc(context[:150])}")
+
+            if topic:
+                lines.append(f"   <i>{topic}</i>")
+            lines.append("")
+
+        if not items:
+            lines.append("<i>No matching stories found in your briefing history.</i>")
 
         return "\n".join(lines).strip()

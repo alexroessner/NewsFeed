@@ -46,6 +46,8 @@ BOT_COMMANDS = [
     {"command": "unmute", "description": "Unmute a topic (e.g. /unmute crypto)"},
     {"command": "tracked", "description": "View stories you're tracking"},
     {"command": "untrack", "description": "Stop tracking a story (e.g. /untrack 1)"},
+    {"command": "compare", "description": "Compare sources on a story (e.g. /compare 2)"},
+    {"command": "recall", "description": "Search past briefings (e.g. /recall AI regulation)"},
     {"command": "help", "description": "Show available commands and usage"},
 ]
 

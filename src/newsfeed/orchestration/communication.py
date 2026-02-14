@@ -163,6 +163,12 @@ class CommunicationAgent:
             # Otherwise run a fuller briefing
             return self._run_briefing(chat_id, user_id, args, deep=True)
 
+        if command == "compare":
+            return self._compare_story(chat_id, user_id, args)
+
+        if command == "recall":
+            return self._recall(chat_id, user_id, args)
+
         if command == "watchlist":
             return self._set_watchlist(chat_id, user_id, args)
 
@@ -270,17 +276,25 @@ class CommunicationAgent:
 
         formatter = self._engine.formatter
 
-        # Message 1: Header (ticker + geo risks + trends + threads)
-        header = formatter.format_header(payload, ticker_bar)
-        self._bot.send_message(chat_id, header)
-
         # Messages 2..N: Individual story cards with per-story feedback
         tracked = profile.tracked_stories
-        for idx, item in enumerate(payload.items, start=1):
+        tracked_count = 0
+        tracked_flags: list[bool] = []
+        for item in payload.items:
             is_tracked = any(
                 match_tracked(item.candidate.topic, item.candidate.title, t)
                 for t in tracked
             )
+            tracked_flags.append(is_tracked)
+            if is_tracked:
+                tracked_count += 1
+
+        # Message 1: Header (ticker + exec summary + geo risks + trends + threads)
+        header = formatter.format_header(payload, ticker_bar, tracked_count=tracked_count)
+        self._bot.send_message(chat_id, header)
+
+        for idx, item in enumerate(payload.items, start=1):
+            is_tracked = tracked_flags[idx - 1]
             card = formatter.format_story_card(item, idx, is_tracked=is_tracked)
             self._bot.send_story_card(chat_id, card, story_index=idx, is_tracked=is_tracked)
 
@@ -576,6 +590,12 @@ class CommunicationAgent:
             except Exception:
                 log.exception("Failed to deliver scheduled briefing to user=%s", user_id)
 
+        # Also check for proactive tracked story updates
+        try:
+            sent += self.check_tracked_updates()
+        except Exception:
+            log.exception("Tracked story update check failed")
+
         return sent
 
     def _persist_prefs(self) -> None:
@@ -786,6 +806,84 @@ class CommunicationAgent:
             f"Stopped tracking: <b>{removed['headline'][:80]}</b>"
         )
         return {"action": "untrack", "user_id": user_id, "index": index}
+
+    def _compare_story(self, chat_id: int | str, user_id: str,
+                       args: str) -> dict[str, Any]:
+        """Show how different sources cover the same story."""
+        try:
+            story_num = int(args.strip())
+        except (ValueError, TypeError):
+            self._bot.send_message(chat_id, "Usage: /compare [story number]")
+            return {"action": "compare_help", "user_id": user_id}
+
+        item, others = self._engine.get_story_thread(user_id, story_num)
+        if not item:
+            self._bot.send_message(
+                chat_id,
+                f"Story #{story_num} not found. Run /briefing first."
+            )
+            return {"action": "compare_not_found", "user_id": user_id}
+
+        formatter = self._engine.formatter
+        card = formatter.format_comparison(item, others, story_num)
+        self._bot.send_message(chat_id, card)
+        return {"action": "compare", "user_id": user_id, "story": story_num,
+                "source_count": 1 + len(others)}
+
+    def _recall(self, chat_id: int | str, user_id: str,
+                args: str) -> dict[str, Any]:
+        """Search past briefing history for a keyword."""
+        keyword = args.strip()
+        if not keyword:
+            self._bot.send_message(
+                chat_id,
+                "Usage: /recall [keyword]\n"
+                "Example: /recall AI regulation"
+            )
+            return {"action": "recall_help", "user_id": user_id}
+
+        items = self._engine.analytics.search_briefing_items(user_id, keyword)
+        formatter = self._engine.formatter
+        card = formatter.format_recall(keyword, items)
+        self._bot.send_message(chat_id, card)
+        return {"action": "recall", "user_id": user_id, "keyword": keyword,
+                "results": len(items)}
+
+    def check_tracked_updates(self) -> int:
+        """Check for proactive tracked story updates across all users.
+
+        Scans cached candidates against each user's tracked stories.
+        Sends notifications for matches the user hasn't seen yet.
+        Returns the number of notifications sent.
+        """
+        sent = 0
+        for user_id, profile_data in self._engine.preferences.snapshot().items():
+            tracked = profile_data.get("tracked_stories", [])
+            if not tracked:
+                continue
+
+            # Get all fresh candidates from cache
+            fresh = self._engine.cache.get_all_fresh(user_id)
+            if not fresh:
+                continue
+
+            # Check for matches not already seen
+            seen = self._shown_ids.get(user_id, set())
+            formatter = self._engine.formatter
+
+            for candidate in fresh:
+                if candidate.candidate_id in seen:
+                    continue
+                for t in tracked:
+                    if match_tracked(candidate.topic, candidate.title, t):
+                        # Send proactive notification
+                        msg = formatter.format_tracked_update(candidate, t["headline"])
+                        self._bot.send_message(user_id, msg)
+                        self._shown_ids.setdefault(user_id, set()).add(candidate.candidate_id)
+                        sent += 1
+                        break  # Only notify once per candidate
+
+        return sent
 
     def _deep_dive_story(self, chat_id: int | str, user_id: str,
                          story_num: int) -> dict[str, Any]:
