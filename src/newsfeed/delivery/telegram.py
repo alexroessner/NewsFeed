@@ -366,3 +366,102 @@ class TelegramFormatter:
         lines.append("<i>Sources: /feedback prefer [source] or demote [source]</i>")
 
         return "\n".join(lines).strip()
+
+    def format_deep_dive(self, item: ReportItem, index: int) -> str:
+        """Format a full deep-dive analysis of a single story.
+
+        Shows everything the pipeline knows: full summary, analysis context,
+        confidence band with key assumptions, evidence breakdown, discovery
+        source, lifecycle stage, and related reads.
+        """
+        lines: list[str] = []
+        c = item.candidate
+
+        # Header
+        lines.append(f"<b>\U0001f50d Deep Dive: Story #{index}</b>")
+        lines.append("")
+
+        # Title + source
+        title_esc = _esc(c.title)
+        if c.url and not c.url.startswith("https://example.com"):
+            lines.append(
+                f'<b><a href="{_esc_url(c.url)}">{title_esc}</a></b>'
+            )
+        else:
+            lines.append(f"<b>{title_esc}</b>")
+        lines.append(f"<i>[{_esc(c.source)}]</i>")
+
+        # Full summary — no truncation for deep dive
+        body = c.summary.strip() if c.summary else ""
+        if body:
+            body = body.replace("\xa0", " ")
+            lines.append("")
+            lines.append(_esc(body))
+
+        # Analysis section
+        lines.append("")
+        lines.append(_section("Analysis"))
+
+        if item.why_it_matters:
+            lines.append("")
+            lines.append(f"<b>Why it matters:</b> {_esc(item.why_it_matters)}")
+
+        if item.what_changed:
+            lines.append("")
+            lines.append(f"<b>What changed:</b> {_esc(item.what_changed)}")
+
+        if item.predictive_outlook:
+            lines.append("")
+            lines.append(f"\U0001f52e <b>Outlook:</b> {_esc(item.predictive_outlook)}")
+
+        if item.contrarian_note:
+            lines.append("")
+            lines.append(f"\u26a1 <b>Contrarian signal:</b> {_esc(item.contrarian_note)}")
+
+        # Confidence assessment
+        if item.confidence:
+            lines.append("")
+            lines.append(_section("Confidence"))
+            band = item.confidence
+            label = _confidence_label(item)
+            lines.append(
+                f"{label} ({band.low:.0%} \u2013 {band.mid:.0%} \u2013 {band.high:.0%})"
+            )
+            if band.key_assumptions:
+                lines.append("")
+                lines.append("<b>Key assumptions:</b>")
+                for assumption in band.key_assumptions[:4]:
+                    lines.append(f"  \u2022 {_esc(assumption)}")
+
+        # Source intelligence
+        lines.append("")
+        lines.append(_section("Source Intelligence"))
+
+        if c.discovered_by:
+            lines.append(f"Discovered by: {_esc(c.discovered_by)}")
+
+        if c.corroborated_by:
+            corr_list = ", ".join(c.corroborated_by)
+            lines.append(f"Corroborated by: {_esc(corr_list)}")
+
+        lines.append(f"Story stage: {c.lifecycle.value.title()}")
+        lines.append(
+            f"Scores: evidence {c.evidence_score:.0%} "
+            f"\u00b7 novelty {c.novelty_score:.0%} "
+            f"\u00b7 relevance {c.preference_fit:.0%}"
+        )
+
+        if c.regions:
+            region_list = ", ".join(_format_region(r) for r in c.regions)
+            lines.append(f"\U0001f4cd {region_list}")
+
+        # Related reads
+        if item.adjacent_reads:
+            reads = [_esc(r) for r in item.adjacent_reads if r]
+            if reads:
+                lines.append("")
+                lines.append(_section("Related"))
+                for read in reads[:5]:
+                    lines.append(f"  \u2022 {read}")
+
+        return "\n".join(lines).strip()

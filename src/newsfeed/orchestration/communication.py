@@ -153,6 +153,13 @@ class CommunicationAgent:
             return {"action": "help", "user_id": user_id}
 
         if command == "deep_dive":
+            # If args is a story number, deep dive on that specific story
+            try:
+                story_num = int(args.strip())
+                return self._deep_dive_story(chat_id, user_id, story_num)
+            except (ValueError, TypeError):
+                pass
+            # Otherwise run a fuller briefing
             return self._run_briefing(chat_id, user_id, args, deep=True)
 
         if command == "watchlist":
@@ -528,6 +535,10 @@ class CommunicationAgent:
             )
             return {"action": "schedule_help", "user_id": user_id}
 
+        # Ensure scheduler has the user's timezone for local-time scheduling
+        profile = self._engine.preferences.get_or_create(user_id)
+        self._scheduler.set_user_timezone(user_id, profile.timezone)
+
         msg = self._scheduler.set_schedule(user_id, schedule_type, time_str)
         self._bot.send_message(chat_id, msg)
         return {"action": "schedule", "user_id": user_id, "type": schedule_type}
@@ -618,7 +629,10 @@ class CommunicationAgent:
 
         self._engine.preferences.set_timezone(user_id, tz)
         self._persist_prefs()
-        self._bot.send_message(chat_id, f"Timezone set to <code>{tz}</code>")
+        # Sync timezone to scheduler so scheduled briefings fire at user-local time
+        if self._scheduler:
+            self._scheduler.set_user_timezone(user_id, tz)
+        self._bot.send_message(chat_id, f"Timezone set to <code>{tz}</code>. Scheduled briefings now use your local time.")
         return {"action": "timezone", "user_id": user_id, "tz": tz}
 
     def _mute_topic(self, chat_id: int | str, user_id: str,
@@ -681,6 +695,35 @@ class CommunicationAgent:
         keyboard = {"inline_keyboard": rows}
         self._bot.send_message(chat_id, "\n".join(lines), reply_markup=keyboard)
         return {"action": "rate_prompt", "user_id": user_id}
+
+    def _deep_dive_story(self, chat_id: int | str, user_id: str,
+                         story_num: int) -> dict[str, Any]:
+        """Deep dive into a specific story from the last briefing.
+
+        Shows full analysis: confidence band, key assumptions,
+        evidence/novelty breakdown, discovery agent, lifecycle stage.
+        """
+        item = self._engine.get_report_item(user_id, story_num)
+        if not item:
+            self._bot.send_message(
+                chat_id,
+                f"Story #{story_num} not found. Run /briefing first, then tap Dive deeper."
+            )
+            return {"action": "deep_dive_not_found", "user_id": user_id}
+
+        formatter = self._engine.formatter
+        card = formatter.format_deep_dive(item, story_num)
+        self._bot.send_message(chat_id, card)
+
+        self._engine.analytics.record_interaction(
+            user_id=user_id, chat_id=chat_id,
+            interaction_type="deep_dive", command="deep_dive",
+            args=str(story_num), raw_text="",
+            result_action="deep_dive_story",
+            result_data={"story": story_num, "title": item.candidate.title},
+        )
+
+        return {"action": "deep_dive_story", "user_id": user_id, "story": story_num}
 
     # ──────────────────────────────────────────────────────────────
     # ADMIN COMMANDS — owner-only analytics dashboard via Telegram
