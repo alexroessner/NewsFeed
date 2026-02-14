@@ -971,6 +971,37 @@ class AnalyticsDB:
             "days": days,
         }
 
+    def get_story_timeline(self, user_id: str, topic: str,
+                           keywords: list[str],
+                           limit: int = 20) -> list[dict]:
+        """Find past briefing items matching a tracked story's topic + keywords.
+
+        Returns items sorted chronologically (oldest first) to show
+        how the story evolved over time.
+        """
+        items = self._query(
+            """SELECT title, source, topic, url, summary, why_it_matters,
+                      predictive_outlook, delivered_at
+               FROM briefing_items
+               WHERE user_id = ? AND topic = ?
+               ORDER BY delivered_at ASC""",
+            (user_id, topic),
+        )
+
+        # Filter: title must share at least 2 keywords with tracked story
+        keyword_set = set(keywords)
+        import re as _re
+        matched = []
+        for item in items:
+            title = item.get("title", "")
+            title_words = set(_re.findall(r"[a-zA-Z]+", title.lower()))
+            if len(title_words & keyword_set) >= 2:
+                matched.append(item)
+            if len(matched) >= limit:
+                break
+
+        return matched
+
     def get_weekly_summary(self, user_id: str, days: int = 7) -> dict[str, Any]:
         """Build a weekly intelligence digest from analytics data.
 

@@ -50,6 +50,12 @@ BOT_COMMANDS = [
     {"command": "recall", "description": "Search past briefings (e.g. /recall AI regulation)"},
     {"command": "insights", "description": "View your preference profile and auto-adjustments"},
     {"command": "weekly", "description": "Weekly intelligence digest and coverage summary"},
+    {"command": "timeline", "description": "Story evolution timeline (e.g. /timeline 1)"},
+    {"command": "save", "description": "Bookmark a story (e.g. /save 2)"},
+    {"command": "saved", "description": "View your bookmarked stories"},
+    {"command": "unsave", "description": "Remove a bookmark (e.g. /unsave 1)"},
+    {"command": "email", "description": "Set email for digest delivery (e.g. /email user@example.com)"},
+    {"command": "digest", "description": "Send email digest of your latest briefing"},
     {"command": "help", "description": "Show available commands and usage"},
 ]
 
@@ -193,7 +199,11 @@ class TelegramBot:
                 {"text": "\U0001f44d", "callback_data": f"rate:{story_index}:up"},
                 {"text": "\U0001f44e", "callback_data": f"rate:{story_index}:down"},
                 {"text": "\U0001f50d Dive deeper", "callback_data": f"dive:{story_index}"},
+            ],
+            [
                 {"text": track_label, "callback_data": f"track:{story_index}"},
+                {"text": "\U0001f516 Save", "callback_data": f"save:{story_index}"},
+                {"text": "\U0001f50e Compare", "callback_data": f"compare:{story_index}"},
             ],
         ]
         keyboard = {"inline_keyboard": rows}
@@ -320,6 +330,24 @@ class TelegramBot:
                     "user_id": user_id,
                     "command": "track",
                     "args": data[6:],  # story index number
+                    "text": "",
+                }
+            if data.startswith("save:"):
+                return {
+                    "type": "command",
+                    "chat_id": chat_id,
+                    "user_id": user_id,
+                    "command": "save",
+                    "args": data[5:],  # story index number
+                    "text": "",
+                }
+            if data.startswith("compare:"):
+                return {
+                    "type": "command",
+                    "chat_id": chat_id,
+                    "user_id": user_id,
+                    "command": "compare",
+                    "args": data[8:],  # story index number
                     "text": "",
                 }
             return None

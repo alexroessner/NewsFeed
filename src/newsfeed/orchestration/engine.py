@@ -790,6 +790,10 @@ class NewsFeedEngine:
                     profile.muted_topics = list(pdata["muted_topics"])
                 if isinstance(pdata.get("tracked_stories"), list):
                     profile.tracked_stories = list(pdata["tracked_stories"])
+                if isinstance(pdata.get("bookmarks"), list):
+                    profile.bookmarks = list(pdata["bookmarks"])
+                if pdata.get("email"):
+                    profile.email = pdata["email"]
             log.info("Restored preferences for %d users from disk", len(prefs_data))
 
         log.info("State loaded from %s", self._persistence.state_dir)
