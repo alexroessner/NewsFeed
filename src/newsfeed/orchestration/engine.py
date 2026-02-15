@@ -806,6 +806,8 @@ class NewsFeedEngine:
                     profile.alert_trend_threshold = float(pdata["alert_trend_threshold"])
                 if isinstance(pdata.get("presets"), dict):
                     profile.presets = dict(pdata["presets"])
+                if pdata.get("webhook_url"):
+                    profile.webhook_url = str(pdata["webhook_url"])
             log.info("Restored preferences for %d users from disk", len(prefs_data))
 
         log.info("State loaded from %s", self._persistence.state_dir)

@@ -117,6 +117,8 @@ class UserProfile:
     #   "confidence_min": float, "urgency_min": str, "max_per_source": int,
     #   "muted_topics": list}
     presets: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Outbound webhook URL for pushing briefings/alerts as structured JSON
+    webhook_url: str = ""
 
 
 @dataclass(slots=True)

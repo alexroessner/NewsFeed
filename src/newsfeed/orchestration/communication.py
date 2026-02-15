@@ -223,8 +223,14 @@ class CommunicationAgent:
         if command == "digest":
             return self._send_email_digest(chat_id, user_id)
 
+        if command == "stats":
+            return self._show_stats(chat_id, user_id)
+
         if command == "sources":
             return self._show_sources(chat_id, user_id)
+
+        if command == "webhook":
+            return self._set_webhook(chat_id, user_id, args)
 
         if command == "filter":
             return self._set_filter(chat_id, user_id, args)
@@ -345,11 +351,24 @@ class CommunicationAgent:
         # Compute delta tags (NEW / UPDATED / DEVELOPING)
         delta_tags = self._compute_delta_tags(user_id, payload)
 
+        # Build thread-to-story mapping for grouping
+        thread_map = self._build_thread_map(payload)
+
         # Message 1: Header (ticker + exec summary + geo risks + trends + threads)
         header = formatter.format_header(payload, ticker_bar, tracked_count=tracked_count)
         self._bot.send_message(chat_id, header)
 
+        # Send story cards grouped by narrative thread
+        shown_threads: set[str] = set()
         for idx, item in enumerate(payload.items, start=1):
+            # Insert thread separator before first story of each new thread
+            thread_info = thread_map.get(idx)
+            if thread_info and thread_info["thread_id"] not in shown_threads:
+                shown_threads.add(thread_info["thread_id"])
+                if thread_info["story_count"] > 1:
+                    sep = formatter.format_thread_separator(thread_info)
+                    self._bot.send_message(chat_id, sep)
+
             is_tracked = tracked_flags[idx - 1]
             delta_tag = delta_tags[idx - 1] if idx - 1 < len(delta_tags) else ""
             card = formatter.format_story_card(item, idx, is_tracked=is_tracked,
@@ -370,6 +389,9 @@ class CommunicationAgent:
                 source_weights=dict(profile.source_weights) if profile.source_weights else None,
             )
             self._bot.send_closing(chat_id, closing)
+
+        # Push to webhook if configured
+        self._auto_webhook_briefing(user_id, payload.items)
 
         log.info(
             "Multi-message briefing: user=%s chat=%s (%d cards)",
@@ -1147,6 +1169,7 @@ class CommunicationAgent:
                 if region.lower().replace(" ", "_") in region_norm:
                     msg = formatter.format_intelligence_alert("georisk", alert_data)
                     self._bot.send_message(user_id, msg)
+                    self._auto_webhook_alert(user_id, "georisk", alert_data)
                     sent += 1
 
         # Check trend spikes
@@ -1169,6 +1192,7 @@ class CommunicationAgent:
                 if weights.get(topic, 0) > 0.3:
                     msg = formatter.format_intelligence_alert("trend", alert_data)
                     self._bot.send_message(user_id, msg)
+                    self._auto_webhook_alert(user_id, "trend", alert_data)
                     sent += 1
 
         return sent
@@ -1300,6 +1324,68 @@ class CommunicationAgent:
         )
         return {"action": "email", "user_id": user_id, "email": email}
 
+    def _set_webhook(self, chat_id: int | str, user_id: str,
+                     args: str) -> dict[str, Any]:
+        """Set, show, test, or clear outbound webhook URL."""
+        from newsfeed.delivery.webhook import validate_webhook_url, send_webhook
+
+        url = args.strip()
+        profile = self._engine.preferences.get_or_create(user_id)
+
+        if not url:
+            current = profile.webhook_url or "not set"
+            self._bot.send_message(
+                chat_id,
+                "<b>\U0001f517 Webhook Delivery</b>\n\n"
+                f"URL: <code>{current}</code>\n\n"
+                "Briefings and alerts are pushed as structured JSON.\n"
+                "Compatible with Slack, Discord, and custom endpoints.\n\n"
+                "<b>Commands:</b>\n"
+                "/webhook https://hooks.slack.com/... \u2014 Set URL\n"
+                "/webhook test \u2014 Send test payload\n"
+                "/webhook off \u2014 Disable webhook"
+            )
+            return {"action": "webhook_show", "user_id": user_id}
+
+        if url.lower() == "off":
+            profile.webhook_url = ""
+            self._persist_prefs()
+            self._bot.send_message(chat_id, "Webhook delivery disabled.")
+            return {"action": "webhook_off", "user_id": user_id}
+
+        if url.lower() == "test":
+            if not profile.webhook_url:
+                self._bot.send_message(chat_id, "No webhook URL set. Use /webhook [url] first.")
+                return {"action": "webhook_test_nourl", "user_id": user_id}
+            test_payload = {
+                "type": "test",
+                "message": "NewsFeed webhook connected successfully",
+                "user_id": user_id,
+            }
+            success = send_webhook(profile.webhook_url, test_payload)
+            if success:
+                self._bot.send_message(chat_id, "\u2705 Test payload delivered successfully.")
+            else:
+                self._bot.send_message(chat_id, "\u274c Delivery failed. Check your webhook URL.")
+            return {"action": "webhook_test", "user_id": user_id, "success": success}
+
+        # Validate and set URL
+        valid, error = validate_webhook_url(url)
+        if not valid:
+            self._bot.send_message(chat_id, f"Invalid webhook URL: {error}")
+            return {"action": "webhook_invalid", "user_id": user_id}
+
+        profile.webhook_url = url
+        self._persist_prefs()
+        self._bot.send_message(
+            chat_id,
+            f"\U0001f517 Webhook set.\n"
+            f"URL: <code>{url[:60]}...</code>\n\n"
+            "Briefings and alerts will be pushed automatically.\n"
+            "Test it: /webhook test"
+        )
+        return {"action": "webhook", "user_id": user_id}
+
     def _send_email_digest(self, chat_id: int | str, user_id: str) -> dict[str, Any]:
         """Send an HTML email digest of the last briefing."""
         profile = self._engine.preferences.get_or_create(user_id)
@@ -1419,6 +1505,70 @@ class CommunicationAgent:
             log.info("Auto-sent email digest to user=%s", user_id)
         except Exception:
             log.debug("Auto email digest failed for user=%s", user_id, exc_info=True)
+
+    def _build_thread_map(self, payload) -> dict[int, dict]:
+        """Map 1-based story indices to their narrative thread info.
+
+        Returns dict: {story_index -> {"thread_id", "headline", "source_count",
+                                        "story_count", "urgency", "lifecycle"}}
+        """
+        if not payload.threads:
+            return {}
+
+        # Build candidate_id -> thread lookup
+        candidate_to_thread: dict[str, dict] = {}
+        for thread in payload.threads:
+            thread_info = {
+                "thread_id": thread.thread_id,
+                "headline": thread.headline,
+                "source_count": thread.source_count,
+                "story_count": len(thread.candidates),
+                "urgency": thread.urgency.value if hasattr(thread.urgency, "value") else str(thread.urgency),
+                "lifecycle": thread.lifecycle.value if hasattr(thread.lifecycle, "value") else str(thread.lifecycle),
+            }
+            for candidate in thread.candidates:
+                candidate_to_thread[candidate.candidate_id] = thread_info
+
+        # Map story indices to thread info
+        result: dict[int, dict] = {}
+        for idx, item in enumerate(payload.items, start=1):
+            cid = item.candidate.candidate_id
+            if cid in candidate_to_thread:
+                result[idx] = candidate_to_thread[cid]
+
+        return result
+
+    def _auto_webhook_briefing(self, user_id: str, items: list) -> None:
+        """Push briefing to user's webhook if configured."""
+        profile = self._engine.preferences.get_or_create(user_id)
+        if not profile.webhook_url or not items:
+            return
+        try:
+            from newsfeed.delivery.webhook import (
+                _detect_platform, format_briefing_payload, send_webhook,
+            )
+            platform = _detect_platform(profile.webhook_url)
+            payload = format_briefing_payload(user_id, items, platform)
+            send_webhook(profile.webhook_url, payload)
+            log.info("Webhook briefing pushed for user=%s", user_id)
+        except Exception:
+            log.debug("Webhook briefing failed for user=%s", user_id, exc_info=True)
+
+    def _auto_webhook_alert(self, user_id: str, alert_type: str,
+                            alert_data: dict) -> None:
+        """Push an intelligence alert to user's webhook if configured."""
+        profile = self._engine.preferences.get_or_create(user_id)
+        if not profile.webhook_url:
+            return
+        try:
+            from newsfeed.delivery.webhook import (
+                _detect_platform, format_alert_payload, send_webhook,
+            )
+            platform = _detect_platform(profile.webhook_url)
+            payload = format_alert_payload(alert_type, alert_data, platform)
+            send_webhook(profile.webhook_url, payload)
+        except Exception:
+            log.debug("Webhook alert failed for user=%s", user_id, exc_info=True)
 
     def _compute_delta_tags(self, user_id: str,
                             payload) -> list[str]:
@@ -1626,6 +1776,117 @@ class CommunicationAgent:
         )
 
         return {"action": "deep_dive_story", "user_id": user_id, "story": story_num}
+
+    def _show_stats(self, chat_id: int | str,
+                    user_id: str) -> dict[str, Any]:
+        """Show personal analytics dashboard with engagement metrics."""
+        import html as html_mod
+        from collections import Counter
+
+        analytics = self._engine.analytics
+        lines: list[str] = []
+        lines.append("<b>\U0001f4ca Personal Analytics Dashboard</b>")
+        lines.append("")
+
+        # Briefing history
+        briefings = analytics.get_user_briefings(user_id, limit=100)
+        total_briefings = len(briefings)
+        if briefings:
+            first_date = briefings[-1].get("delivered_at", "")[:10]
+            last_date = briefings[0].get("delivered_at", "")[:10]
+            total_stories = sum(b.get("item_count", 0) for b in briefings)
+            lines.append("<b>\U0001f4e8 Briefing History</b>")
+            lines.append(f"  Total briefings: <b>{total_briefings}</b>")
+            lines.append(f"  Stories delivered: <b>{total_stories}</b>")
+            lines.append(f"  Active since: {first_date}")
+            if total_briefings > 1:
+                lines.append(f"  Last briefing: {last_date}")
+            lines.append("")
+
+        # Rating engagement
+        ratings = analytics.get_user_ratings(user_id, limit=200)
+        if ratings:
+            ups = sum(1 for r in ratings if r.get("direction") == "up")
+            downs = sum(1 for r in ratings if r.get("direction") == "down")
+            total_ratings = len(ratings)
+            approval_rate = ups / total_ratings if total_ratings else 0
+
+            # Most rated topics
+            topic_counts = Counter(r.get("topic", "unknown") for r in ratings)
+            top_topics = topic_counts.most_common(3)
+
+            # Most rated sources
+            source_counts = Counter(r.get("source", "unknown") for r in ratings)
+            top_sources = source_counts.most_common(3)
+
+            lines.append("<b>\u2b50 Rating Activity</b>")
+            lines.append(f"  Total ratings: <b>{total_ratings}</b>")
+            lines.append(f"  Approval rate: <b>{approval_rate:.0%}</b> ({ups}\u2191 / {downs}\u2193)")
+            if top_topics:
+                topic_str = ", ".join(
+                    f"{t.replace('_', ' ')} ({c})" for t, c in top_topics
+                )
+                lines.append(f"  Top rated topics: {topic_str}")
+            if top_sources:
+                src_str = ", ".join(f"{s} ({c})" for s, c in top_sources)
+                lines.append(f"  Top rated sources: {src_str}")
+            lines.append("")
+
+        # Command usage patterns
+        interactions = analytics.get_user_interactions(user_id, limit=200)
+        if interactions:
+            cmd_counts = Counter(
+                i.get("command", i.get("interaction_type", "unknown"))
+                for i in interactions
+            )
+            total_interactions = len(interactions)
+            top_cmds = cmd_counts.most_common(5)
+
+            lines.append("<b>\u2699\ufe0f Interaction Patterns</b>")
+            lines.append(f"  Total interactions: <b>{total_interactions}</b>")
+            if top_cmds:
+                for cmd, count in top_cmds:
+                    pct = count / total_interactions * 100
+                    bar_len = round(pct / 10)
+                    bar = "\u2588" * bar_len + "\u2591" * (10 - bar_len)
+                    lines.append(f"  {bar} /{html_mod.escape(cmd)} ({count})")
+            lines.append("")
+
+        # Preference evolution
+        pref_changes = analytics.get_user_preference_history(user_id, limit=50)
+        if pref_changes:
+            change_types = Counter(p.get("change_type", "unknown") for p in pref_changes)
+            lines.append("<b>\U0001f504 Preference Evolution</b>")
+            lines.append(f"  Total adjustments: <b>{len(pref_changes)}</b>")
+            for ct, count in change_types.most_common(5):
+                lines.append(f"  \u2022 {html_mod.escape(ct)}: {count}")
+            # Show last 3 changes
+            lines.append("  <i>Recent changes:</i>")
+            for p in pref_changes[:3]:
+                field = p.get("field", "?")
+                source = p.get("source", "manual")
+                lines.append(f"    \u2022 {html_mod.escape(field)} ({source})")
+            lines.append("")
+
+        # Feedback effectiveness
+        feedback = analytics.get_user_feedback_history(user_id, limit=20)
+        if feedback:
+            lines.append("<b>\U0001f4ac Feedback Effectiveness</b>")
+            lines.append(f"  Total feedback given: <b>{len(feedback)}</b>")
+            for f in feedback[:3]:
+                text = (f.get("feedback_text", "") or "")[:40]
+                changes = f.get("changes_applied", "")
+                if text:
+                    lines.append(f'  \u2022 "{html_mod.escape(text)}"')
+                    if changes:
+                        lines.append(f"    \u2192 {html_mod.escape(str(changes)[:60])}")
+            lines.append("")
+
+        if not briefings and not ratings and not interactions:
+            lines.append("<i>No analytics data yet. Use /briefing to get started.</i>")
+
+        self._bot.send_message(chat_id, "\n".join(lines).strip())
+        return {"action": "stats", "user_id": user_id}
 
     def _handle_preset(self, chat_id: int | str, user_id: str,
                        args: str) -> dict[str, Any]:

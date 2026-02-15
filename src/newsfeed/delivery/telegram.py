@@ -246,6 +246,35 @@ class TelegramFormatter:
 
         return "\n".join(lines).strip()
 
+    def format_thread_separator(self, thread_info: dict) -> str:
+        """Format a narrative thread separator inserted before grouped stories."""
+        headline = _esc(thread_info.get("headline", "Related Stories"))
+        sources = thread_info.get("source_count", 1)
+        count = thread_info.get("story_count", 1)
+        urgency = thread_info.get("urgency", "routine")
+        lifecycle = thread_info.get("lifecycle", "developing")
+
+        urgency_icon = {
+            "critical": "\U0001f534", "breaking": "\U0001f7e0",
+            "elevated": "\U0001f7e1", "routine": "\u26aa",
+        }.get(urgency, "\u26aa")
+
+        lifecycle_label = {
+            "breaking": "\u26a1 Breaking", "developing": "\U0001f504 Developing",
+            "ongoing": "\u27a1\ufe0f Ongoing", "waning": "\U0001f4c9 Waning",
+            "resolved": "\u2705 Resolved",
+        }.get(lifecycle, lifecycle)
+
+        parts = [f"{count} stories"]
+        if sources > 1:
+            parts.append(f"{sources} sources")
+
+        detail = " \u00b7 ".join(parts)
+        return (
+            f"{urgency_icon} <b>\U0001f517 {headline}</b>\n"
+            f"<i>{lifecycle_label} \u00b7 {detail}</i>"
+        )
+
     def format_story_card(self, item: ReportItem, index: int,
                           is_tracked: bool = False,
                           delta_tag: str = "") -> str:
