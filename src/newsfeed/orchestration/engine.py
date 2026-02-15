@@ -19,6 +19,12 @@ from newsfeed.intelligence.credibility import (
     detect_cross_corroboration,
     enforce_source_diversity,
 )
+from newsfeed.intelligence.narrative import (
+    generate_adjacent_reads,
+    generate_outlook,
+    generate_what_changed,
+    generate_why,
+)
 from newsfeed.intelligence.georisk import GeoRiskIndex
 from newsfeed.intelligence.trends import TrendDetector
 from newsfeed.intelligence.urgency import BreakingDetector
@@ -450,7 +456,7 @@ class NewsFeedEngine:
         # Stage 7: Report assembly with editorial review
         lifecycle.advance(RequestStage.EDITORIAL_REVIEW)
         t0 = time.monotonic()
-        report_items = self._assemble_report(selected, threads, profile, request_id)
+        report_items = self._assemble_report(selected, threads, profile, request_id, reserve=reserve)
         review_ms = (time.monotonic() - t0) * 1000
         self.optimizer.record_stage_run("editorial_review", review_ms)
 
@@ -462,6 +468,24 @@ class NewsFeedEngine:
             "credibility", "corroboration", "urgency",
             "diversity", "clustering", "georisk", "trends",
         ] if s in self._enabled_stages]
+
+        # Pipeline trace metadata — powers /transparency command
+        pipeline_trace = {
+            "total_candidates_researched": len(all_candidates),
+            "valid_candidates": len(valid_candidates) if 'valid_candidates' in dir() else len(all_candidates),
+            "research_time_ms": round(research_ms),
+            "intelligence_time_ms": round(intel_ms),
+            "expert_time_ms": round(expert_ms),
+            "enrichment_time_ms": round(enrich_ms),
+            "review_time_ms": round(review_ms),
+            "agents_contributing": dict(by_agent),
+            "expert_votes_total": len(debate.votes),
+            "expert_agreements": sum(1 for v in debate.votes if v.keep),
+            "expert_rejections": sum(1 for v in debate.votes if not v.keep),
+            "arbitrated_votes": sum(1 for v in debate.votes if "arbitration" in v.rationale.lower()),
+            "credibility_filtered": 0,
+            "source_diversity_applied": "diversity" in self._enabled_stages,
+        }
 
         payload = DeliveryPayload(
             user_id=user_id,
@@ -478,6 +502,7 @@ class NewsFeedEngine:
                 "emerging_trends": sum(1 for t in trend_snapshots if t.is_emerging),
                 "intelligence_stages": active_stages,
                 "expert_influence": {eid: f"{inf:.2f}" for eid, inf, _ in self.experts.chair.rankings()},
+                "pipeline_trace": pipeline_trace,
             },
             briefing_type=briefing_type,
             threads=threads,
@@ -571,7 +596,8 @@ class NewsFeedEngine:
 
     def _assemble_report(self, selected: list[CandidateItem], threads: list,
                          profile: UserProfile | None = None,
-                         request_id: str = "") -> list[ReportItem]:
+                         request_id: str = "",
+                         reserve: list[CandidateItem] | None = None) -> list[ReportItem]:
         """Assemble report items from selected candidates, then apply editorial review."""
         report_items = []
         adjacent_bounds = self.pipeline.get("limits", {}).get("adjacent_reads_per_item", {"min": 2, "max": 3})
@@ -583,13 +609,16 @@ class NewsFeedEngine:
                 thread_map[c.candidate_id] = thread.thread_id
 
         for c in selected:
-            reads = [f"Context read {i + 1} for {c.topic}" for i in range(adjacent_count)]
+            # Generate smart, metadata-driven narrative text
             why = self.review_stack.refine_why(
-                f"Aligned with your weighted interest in {c.topic} and strong source quality."
+                generate_why(c, self.credibility, profile)
             )
             outlook = self.review_stack.refine_outlook(
-                "Market and narrative signals suggest elevated watch priority."
+                generate_outlook(c, self.credibility)
             )
+
+            # Real adjacent reads from thread siblings and reserve cache
+            reads = generate_adjacent_reads(c, threads, reserve, limit=adjacent_count)
 
             cred_score = self.credibility.score_candidate(c)
             offset = self._confidence_offset
@@ -610,7 +639,7 @@ class NewsFeedEngine:
                 ReportItem(
                     candidate=c,
                     why_it_matters=why,
-                    what_changed="New cross-source confirmation and discussion momentum since last cycle.",
+                    what_changed=generate_what_changed(c, self.credibility),
                     predictive_outlook=outlook,
                     adjacent_reads=reads,
                     confidence=confidence,

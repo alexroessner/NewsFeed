@@ -399,6 +399,32 @@ class TelegramFormatter:
                 lines.append(f"<i>{sep.join(parts)}</i>")
         return "\n".join(lines).strip()
 
+    def format_topic_discovery(self, emerging_topics: list[str],
+                               user_topic_weights: dict[str, float]) -> str:
+        """Format topic discovery suggestions for trends the user doesn't track.
+
+        Surfaces emerging trends in topics the user hasn't explicitly weighted,
+        making the system feel alive and proactive.
+        """
+        # Find emerging topics the user doesn't actively track
+        untracked = [
+            t for t in emerging_topics
+            if t not in user_topic_weights or user_topic_weights.get(t, 0) < 0.2
+        ]
+        if not untracked:
+            return ""
+
+        lines: list[str] = []
+        lines.append("")
+        lines.append("<b>Topics you might care about:</b>")
+        for topic in untracked[:3]:
+            name = _esc(topic.replace("_", " ").title())
+            lines.append(
+                f"  \u2022 <b>{name}</b> is trending \u2014 "
+                f"<i>/feedback more {_esc(topic)} to add it</i>"
+            )
+        return "\n".join(lines)
+
     def format_closing(self, payload: DeliveryPayload,
                        topic_weights: dict[str, float] | None = None,
                        source_weights: dict[str, float] | None = None) -> str:
@@ -431,10 +457,12 @@ class TelegramFormatter:
 
     def format_quick_card(self, item: ReportItem, index: int,
                           is_tracked: bool = False,
-                          delta_tag: str = "") -> str:
+                          delta_tag: str = "",
+                          headlines_only: bool = False) -> str:
         """Format a compact headline-only story card for /quick mode.
 
-        One-line title + source + optional delta tag. No summary, no analysis.
+        When headlines_only=True: pure single-line headline + source.
+        When headlines_only=False: headline + one-line context (legacy behavior).
         Designed for a fast scan before diving into specific stories.
         """
         c = item.candidate
@@ -460,7 +488,16 @@ class TelegramFormatter:
         if urgency_icon:
             urgency_icon += " "
 
-        # Build a one-line context (why_it_matters truncated to ~100 chars)
+        source_tag = f"<i>[{_esc(c.source)}]</i>"
+
+        # Headlines-only mode: pure one-liner, no context, no confidence
+        if headlines_only:
+            return (
+                f"{tracked_badge}{urgency_icon}<b>{index}.</b> {title_part}"
+                f" {source_tag}{tag}"
+            )
+
+        # Standard quick mode: include context snippet and confidence
         context = ""
         if item.why_it_matters:
             snippet = item.why_it_matters[:100]
@@ -470,7 +507,6 @@ class TelegramFormatter:
             context = f"\n   <i>{_esc(snippet)}</i>"
 
         conf = _confidence_label(item)
-        source_tag = f"<i>[{_esc(c.source)}]</i>"
         conf_tag = f" <i>\u00b7 {conf}</i>" if conf else ""
 
         return (
@@ -482,11 +518,13 @@ class TelegramFormatter:
                                ticker_bar: str = "",
                                tracked_flags: list[bool] | None = None,
                                delta_tags: list[str] | None = None,
-                               tracked_count: int = 0) -> str:
+                               tracked_count: int = 0,
+                               headlines_only: bool = True) -> str:
         """Format a complete quick-scan briefing as a single message.
 
-        Headline + one-liner for each story. Fits in one Telegram message
-        for up to ~15 stories.
+        When headlines_only=True (default): pure headline list that fits in
+        one Telegram message for 15+ stories. True quick scan.
+        When headlines_only=False: includes one-line context per story.
         """
         if tracked_flags is None:
             tracked_flags = [False] * len(payload.items)
@@ -512,13 +550,16 @@ class TelegramFormatter:
         for idx, item in enumerate(payload.items):
             is_tracked = tracked_flags[idx] if idx < len(tracked_flags) else False
             tag = delta_tags[idx] if idx < len(delta_tags) else ""
-            lines.append(self.format_quick_card(item, idx + 1, is_tracked, tag))
-            lines.append("")
+            lines.append(self.format_quick_card(
+                item, idx + 1, is_tracked, tag, headlines_only=headlines_only))
+            if not headlines_only:
+                lines.append("")
 
         if not payload.items:
             lines.append("<i>No stories matched your current filters.</i>")
 
-        lines.append(f"<i>Tap /briefing for full analysis \u00b7 /deep_dive [N] for details</i>")
+        lines.append("")
+        lines.append(f"<i>/briefing for full analysis \u00b7 /deep_dive [N] for details</i>")
 
         return "\n".join(lines).strip()
 
