@@ -1368,6 +1368,10 @@ class CommunicationAgent:
         self._scheduler.set_user_timezone(user_id, profile.timezone)
 
         msg = self._scheduler.set_schedule(user_id, schedule_type, time_str)
+        # Sync cadence to user profile so it survives persistence
+        cadence = schedule_type if schedule_type != "off" else "on_demand"
+        self._engine.preferences.apply_cadence(user_id, cadence)
+        self._persist_prefs(chat_id)
         self._bot.send_message(chat_id, msg)
         return {"action": "schedule", "user_id": user_id, "type": schedule_type}
 
@@ -1390,6 +1394,16 @@ class CommunicationAgent:
                 self._auto_email_digest(user_id)
             except Exception:
                 log.exception("Failed to deliver scheduled briefing to user=%s", user_id)
+                # Notify the user so they know their briefing didn't arrive
+                try:
+                    self._bot.send_message(
+                        user_id,
+                        "\u26a0\ufe0f Your scheduled briefing could not be generated "
+                        "due to a temporary issue. You can run /briefing manually, "
+                        "or wait for your next scheduled delivery."
+                    )
+                except Exception:
+                    pass  # If we can't even notify, log already captured it
 
         # Also check for proactive tracked story updates
         try:

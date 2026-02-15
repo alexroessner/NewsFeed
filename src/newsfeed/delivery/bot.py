@@ -710,5 +710,28 @@ class BriefingScheduler:
     def snapshot(self) -> dict:
         return {
             "schedules": dict(self._schedules),
+            "timezones": dict(self._user_timezones),
             "muted": {uid: until for uid, until in self._muted_until.items() if time.time() < until},
         }
+
+    def restore(self, data: dict) -> int:
+        """Restore scheduler state from a persisted snapshot.
+
+        Returns the number of schedules restored.
+        """
+        restored = 0
+        schedules = data.get("schedules")
+        if isinstance(schedules, dict):
+            for uid, sched in schedules.items():
+                if isinstance(uid, str) and isinstance(sched, dict):
+                    stype = sched.get("type", "")
+                    stime = sched.get("time", "")
+                    if stype in ("morning", "evening", "realtime"):
+                        self._schedules[uid] = {"type": stype, "time": stime}
+                        restored += 1
+        timezones = data.get("timezones")
+        if isinstance(timezones, dict):
+            for uid, tz in timezones.items():
+                if isinstance(uid, str) and isinstance(tz, str) and len(tz) <= 40:
+                    self._user_timezones[uid] = tz
+        return restored
