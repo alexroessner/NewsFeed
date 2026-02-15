@@ -79,6 +79,21 @@ class CredibilityTracker:
         corroboration_bonus = min(self._bonus_cap, self._bonus_per * len(item.corroborated_by))
         return min(1.0, item.composite_score() * self._w_composite + trust * self._w_trust + corroboration_bonus + self._w_evidence * item.evidence_score)
 
+    def get_all_sources_by_tier(self) -> dict[str, list[str]]:
+        """Return all known source IDs grouped by tier."""
+        result: dict[str, list[str]] = {
+            "tier_1": sorted(self._tier1_sources),
+            "tier_1b": sorted(self._tier1b_sources),
+            "tier_academic": sorted(self._academic_sources),
+            "tier_2": sorted(self._tier2_sources),
+        }
+        # Include any sources seen that aren't in a known tier
+        known = self._tier1_sources | self._tier1b_sources | self._academic_sources | self._tier2_sources
+        unknown = sorted(set(self._sources.keys()) - known)
+        if unknown:
+            result["unknown"] = unknown
+        return result
+
     def snapshot(self) -> dict[str, dict]:
         return {sid: {"reliability": sr.reliability_score, "accuracy": sr.historical_accuracy,
                        "corroboration": sr.corroboration_rate, "seen": sr.total_items_seen}

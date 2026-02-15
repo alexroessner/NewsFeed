@@ -812,6 +812,15 @@ class AnalyticsDB:
             (user_id, limit),
         )
 
+    def get_briefing_items_by_request(self, request_id: str) -> list[dict]:
+        """Get all briefing items for a specific request."""
+        return self._query(
+            """SELECT title, source, topic, url, summary, urgency
+               FROM briefing_items WHERE request_id = ?
+               ORDER BY item_index""",
+            (request_id,),
+        )
+
     def search_briefing_items(self, user_id: str, keyword: str,
                               limit: int = 15) -> list[dict]:
         """Search past briefing items by keyword in title, summary, or topic."""
