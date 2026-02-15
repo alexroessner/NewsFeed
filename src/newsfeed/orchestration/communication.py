@@ -223,8 +223,14 @@ class CommunicationAgent:
         if command == "digest":
             return self._send_email_digest(chat_id, user_id)
 
+        if command == "sources":
+            return self._show_sources(chat_id, user_id)
+
         if command == "filter":
             return self._set_filter(chat_id, user_id, args)
+
+        if command == "preset":
+            return self._handle_preset(chat_id, user_id, args)
 
         if command == "reset":
             self._engine.preferences.reset(user_id)
@@ -625,6 +631,9 @@ class CommunicationAgent:
             "confidence_min": profile.confidence_min,
             "urgency_min": profile.urgency_min,
             "max_per_source": profile.max_per_source,
+            "alert_georisk_threshold": profile.alert_georisk_threshold,
+            "alert_trend_threshold": profile.alert_trend_threshold,
+            "presets": {k: {} for k in profile.presets},  # names only for display
         }
         self._bot.send_message(chat_id, self._bot.format_settings(profile_dict))
         return {"action": "settings", "user_id": user_id}
@@ -715,6 +724,8 @@ class CommunicationAgent:
                 # Use user_id as chat_id for direct messages
                 self._run_briefing(user_id, user_id)
                 sent += 1
+                # Auto-send email digest if user has email configured
+                self._auto_email_digest(user_id)
             except Exception:
                 log.exception("Failed to deliver scheduled briefing to user=%s", user_id)
 
@@ -1116,21 +1127,21 @@ class CommunicationAgent:
         # Check geo-risks from last pipeline run
         last_georisks = self._engine.georisk.snapshot()
         for region, risk_level in last_georisks.items():
-            # Detect escalation > 15%
             if not isinstance(risk_level, (int, float)):
-                continue
-            if risk_level < 0.5:
                 continue
 
             alert_data = {
                 "region": region,
                 "risk_level": risk_level,
-                "escalation_delta": 0.15,  # Threshold we're alerting on
+                "escalation_delta": 0.15,
                 "drivers": [],
             }
 
-            # Find users interested in this region
+            # Find users interested in this region, respecting per-user thresholds
             for user_id, profile_data in self._engine.preferences.snapshot().items():
+                user_threshold = profile_data.get("alert_georisk_threshold", 0.5)
+                if risk_level < user_threshold:
+                    continue
                 regions = profile_data.get("regions", [])
                 region_norm = {r.lower().replace(" ", "_") for r in regions}
                 if region.lower().replace(" ", "_") in region_norm:
@@ -1143,16 +1154,17 @@ class CommunicationAgent:
         for topic, velocity in last_trends.items():
             if not isinstance(velocity, (int, float)):
                 continue
-            if velocity < 3.0:  # Only alert on 3x+ baseline
-                continue
 
             alert_data = {
                 "topic": topic,
                 "anomaly_score": velocity,
             }
 
-            # Find users with positive weight for this topic
+            # Find users with positive weight for this topic, respecting per-user thresholds
             for user_id, profile_data in self._engine.preferences.snapshot().items():
+                user_threshold = profile_data.get("alert_trend_threshold", 3.0)
+                if velocity < user_threshold:
+                    continue
                 weights = profile_data.get("topic_weights", {})
                 if weights.get(topic, 0) > 0.3:
                     msg = formatter.format_intelligence_alert("trend", alert_data)
@@ -1361,6 +1373,53 @@ class CommunicationAgent:
 
         return {"action": "digest", "user_id": user_id, "sent": success}
 
+    def _auto_email_digest(self, user_id: str) -> None:
+        """Silently send an email digest after a scheduled briefing.
+
+        Only sends if the user has email configured and SMTP is available.
+        Does not notify via Telegram on failure — this is a background task.
+        """
+        profile = self._engine.preferences.get_or_create(user_id)
+        if not profile.email:
+            return
+
+        report_items = self._engine._last_report_items.get(user_id, [])
+        if not report_items:
+            return
+
+        try:
+            from datetime import datetime, timezone
+            from newsfeed.delivery.email_digest import EmailDigest
+            from newsfeed.models.domain import BriefingType, DeliveryPayload
+
+            payload = DeliveryPayload(
+                user_id=user_id,
+                generated_at=datetime.now(timezone.utc),
+                items=report_items,
+                briefing_type=BriefingType.MORNING_DIGEST,
+            )
+
+            tracked = profile.tracked_stories
+            tracked_flags = [
+                any(match_tracked(item.candidate.topic, item.candidate.title, t)
+                    for t in tracked)
+                for item in report_items
+            ]
+
+            weekly = self._engine.analytics.get_weekly_summary(user_id)
+            smtp_cfg = self._engine.pipeline.get("smtp", {})
+            digest = EmailDigest(smtp_cfg)
+
+            if not digest.is_configured:
+                return
+
+            html_body = digest.render(payload, tracked_flags, weekly)
+            subject = f"Intelligence Digest \u2014 {datetime.now(timezone.utc).strftime('%b %d, %Y')}"
+            digest.send(profile.email, subject, html_body)
+            log.info("Auto-sent email digest to user=%s", user_id)
+        except Exception:
+            log.debug("Auto email digest failed for user=%s", user_id, exc_info=True)
+
     def _compute_delta_tags(self, user_id: str,
                             payload) -> list[str]:
         """Compute delta tags (NEW/UPDATED/DEVELOPING) relative to last briefing.
@@ -1568,6 +1627,152 @@ class CommunicationAgent:
 
         return {"action": "deep_dive_story", "user_id": user_id, "story": story_num}
 
+    def _handle_preset(self, chat_id: int | str, user_id: str,
+                       args: str) -> dict[str, Any]:
+        """Save, load, list, or delete briefing presets."""
+        import html as html_mod
+        profile = self._engine.preferences.get_or_create(user_id)
+
+        parts = args.strip().split(maxsplit=1)
+        action = parts[0].lower() if parts else ""
+        name = parts[1].strip() if len(parts) > 1 else ""
+
+        if not action or action == "list":
+            # Show saved presets
+            presets = profile.presets
+            if not presets:
+                self._bot.send_message(
+                    chat_id,
+                    "<b>\U0001f4be Briefing Presets</b>\n\n"
+                    "<i>No presets saved yet.</i>\n\n"
+                    "<b>Save current settings:</b>\n"
+                    "/preset save Work\n"
+                    "/preset save Weekend\n\n"
+                    "<b>Then switch:</b>\n"
+                    "/preset load Work"
+                )
+                return {"action": "preset_list", "user_id": user_id}
+
+            lines = ["<b>\U0001f4be Briefing Presets</b>", ""]
+            for pname, pdata in presets.items():
+                topics = pdata.get("topic_weights", {})
+                top3 = sorted(topics, key=topics.get, reverse=True)[:3]
+                topic_str = ", ".join(t.replace("_", " ") for t in top3) if top3 else "default"
+                tone = pdata.get("tone", "concise")
+                items = pdata.get("max_items", 10)
+                conf = pdata.get("confidence_min", 0)
+                extras = []
+                if conf:
+                    extras.append(f"conf\u2265{conf:.0%}")
+                urg = pdata.get("urgency_min", "")
+                if urg:
+                    extras.append(f"urg\u2265{urg}")
+                extra_str = f" \u00b7 {', '.join(extras)}" if extras else ""
+                lines.append(
+                    f"\u2022 <b>{html_mod.escape(pname)}</b>: {topic_str} \u00b7 "
+                    f"{tone} \u00b7 {items} items{extra_str}"
+                )
+            lines.append("")
+            lines.append(
+                "<b>Commands:</b>\n"
+                "/preset load [name] \u2014 Switch to preset\n"
+                "/preset save [name] \u2014 Save current settings\n"
+                "/preset delete [name] \u2014 Remove preset"
+            )
+            self._bot.send_message(chat_id, "\n".join(lines))
+            return {"action": "preset_list", "user_id": user_id}
+
+        if action == "save":
+            if not name:
+                self._bot.send_message(chat_id, "Usage: /preset save [name]")
+                return {"action": "preset_save_help", "user_id": user_id}
+            self._engine.preferences.save_preset(user_id, name)
+            self._persist_prefs()
+            self._bot.send_message(
+                chat_id,
+                f"\U0001f4be Preset <b>{html_mod.escape(name)}</b> saved.\n"
+                f"Switch to it anytime: /preset load {html_mod.escape(name)}"
+            )
+            return {"action": "preset_save", "user_id": user_id, "name": name}
+
+        if action == "load":
+            if not name:
+                self._bot.send_message(chat_id, "Usage: /preset load [name]")
+                return {"action": "preset_load_help", "user_id": user_id}
+            result = self._engine.preferences.load_preset(user_id, name)
+            if result is None:
+                available = ", ".join(profile.presets.keys()) if profile.presets else "none"
+                self._bot.send_message(
+                    chat_id,
+                    f"Preset <b>{html_mod.escape(name)}</b> not found.\n"
+                    f"Available: {html_mod.escape(available)}"
+                )
+                return {"action": "preset_not_found", "user_id": user_id}
+            self._persist_prefs()
+            self._bot.send_message(
+                chat_id,
+                f"\u2705 Switched to preset <b>{html_mod.escape(name)}</b>.\n"
+                f"Run /briefing or /quick to see the difference."
+            )
+            return {"action": "preset_load", "user_id": user_id, "name": name}
+
+        if action == "delete":
+            if not name:
+                self._bot.send_message(chat_id, "Usage: /preset delete [name]")
+                return {"action": "preset_delete_help", "user_id": user_id}
+            deleted = self._engine.preferences.delete_preset(user_id, name)
+            self._persist_prefs()
+            if deleted:
+                self._bot.send_message(chat_id, f"Preset <b>{html_mod.escape(name)}</b> deleted.")
+            else:
+                self._bot.send_message(chat_id, f"Preset <b>{html_mod.escape(name)}</b> not found.")
+            return {"action": "preset_delete", "user_id": user_id}
+
+        self._bot.send_message(
+            chat_id,
+            "Usage: /preset [save|load|delete|list] [name]\n"
+            "Example: /preset save Work"
+        )
+        return {"action": "preset_help", "user_id": user_id}
+
+    def _show_sources(self, chat_id: int | str,
+                     user_id: str) -> dict[str, Any]:
+        """Show source credibility dashboard with reliability, bias, and trust."""
+        credibility = self._engine.credibility
+        profile = self._engine.preferences.get_or_create(user_id)
+
+        # Build source data list
+        tier_map = {}
+        for sid in credibility._tier1_sources:
+            tier_map[sid] = "tier_1"
+        for sid in credibility._tier1b_sources:
+            tier_map[sid] = "tier_1b"
+        for sid in credibility._academic_sources:
+            tier_map[sid] = "tier_academic"
+        for sid in credibility._tier2_sources:
+            tier_map[sid] = "tier_2"
+
+        # Get all known sources (initialized + tracked)
+        all_source_ids = set(tier_map.keys()) | set(credibility._sources.keys())
+
+        sources_data: list[dict] = []
+        for sid in sorted(all_source_ids):
+            sr = credibility.get_source(sid)
+            sources_data.append({
+                "source_id": sid,
+                "tier": tier_map.get(sid, "unknown"),
+                "reliability": sr.reliability_score,
+                "bias": sr.bias_rating,
+                "trust_factor": sr.trust_factor(),
+                "corroboration_rate": sr.corroboration_rate,
+                "items_seen": sr.total_items_seen,
+            })
+
+        formatter = self._engine.formatter
+        msg = formatter.format_sources(sources_data, profile.source_weights)
+        self._bot.send_message(chat_id, msg)
+        return {"action": "sources", "user_id": user_id}
+
     def _set_filter(self, chat_id: int | str, user_id: str,
                     args: str) -> dict[str, Any]:
         """Set or show advanced briefing filters."""
@@ -1579,16 +1784,24 @@ class CommunicationAgent:
             conf = f"{profile.confidence_min:.0%}" if profile.confidence_min > 0 else "off"
             urg = profile.urgency_min or "off"
             mps = str(profile.max_per_source) if profile.max_per_source > 0 else "off"
+            geo_t = f"{profile.alert_georisk_threshold:.0%}"
+            trend_t = f"{profile.alert_trend_threshold:.1f}x"
             self._bot.send_message(
                 chat_id,
-                "<b>\U0001f527 Briefing Filters</b>\n\n"
+                "<b>\U0001f527 Briefing Filters &amp; Alert Sensitivity</b>\n\n"
+                "<b>Story Filters:</b>\n"
                 f"\u2022 Confidence threshold: <code>{conf}</code>\n"
                 f"\u2022 Minimum urgency: <code>{urg}</code>\n"
                 f"\u2022 Max stories per source: <code>{mps}</code>\n\n"
+                "<b>Alert Thresholds:</b>\n"
+                f"\u2022 Geo-risk alert at: <code>{geo_t}</code>\n"
+                f"\u2022 Trend spike alert at: <code>{trend_t}</code>\n\n"
                 "<b>Set with:</b>\n"
                 "/filter confidence 0.7 \u2014 Only high-confidence stories\n"
                 "/filter urgency elevated \u2014 Skip routine stories\n"
                 "/filter max_per_source 2 \u2014 Limit source repetition\n"
+                "/filter georisk 0.3 \u2014 More sensitive geo-risk alerts\n"
+                "/filter trend 2.0 \u2014 More sensitive trend alerts\n"
                 "/filter off \u2014 Remove all filters"
             )
             return {"action": "filter_show", "user_id": user_id}
@@ -1598,12 +1811,14 @@ class CommunicationAgent:
         value = parts[1].strip() if len(parts) > 1 else ""
 
         if field == "off":
-            # Clear all filters
+            # Clear all filters, reset alert thresholds to defaults
             profile.confidence_min = 0.0
             profile.urgency_min = ""
             profile.max_per_source = 0
+            profile.alert_georisk_threshold = 0.5
+            profile.alert_trend_threshold = 3.0
             self._persist_prefs()
-            self._bot.send_message(chat_id, "All briefing filters removed.")
+            self._bot.send_message(chat_id, "All briefing filters and alert thresholds reset to defaults.")
             return {"action": "filter_off", "user_id": user_id}
 
         if field == "confidence":
@@ -1652,6 +1867,34 @@ class CommunicationAgent:
             except ValueError:
                 self._bot.send_message(chat_id, "Usage: /filter max_per_source 2 (1-10 or off)")
             return {"action": "filter_source_limit", "user_id": user_id}
+
+        if field == "georisk":
+            try:
+                val = float(value)
+                self._engine.preferences.set_filter(user_id, "georisk", str(val))
+                self._persist_prefs()
+                self._bot.send_message(
+                    chat_id,
+                    f"Geo-risk alert threshold set to <code>{val:.0%}</code>.\n"
+                    f"{'Lower = more sensitive.' if val < 0.5 else 'Higher = fewer alerts.'}"
+                )
+            except ValueError:
+                self._bot.send_message(chat_id, "Usage: /filter georisk 0.3 (0.1-1.0)")
+            return {"action": "filter_georisk", "user_id": user_id}
+
+        if field == "trend":
+            try:
+                val = float(value)
+                self._engine.preferences.set_filter(user_id, "trend", str(val))
+                self._persist_prefs()
+                self._bot.send_message(
+                    chat_id,
+                    f"Trend alert threshold set to <code>{val:.1f}x</code> baseline.\n"
+                    f"{'Lower = more alerts.' if val < 3.0 else 'Higher = only extreme spikes.'}"
+                )
+            except ValueError:
+                self._bot.send_message(chat_id, "Usage: /filter trend 2.0 (1.5-10.0)")
+            return {"action": "filter_trend", "user_id": user_id}
 
         self._bot.send_message(
             chat_id,
