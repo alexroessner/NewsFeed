@@ -258,11 +258,82 @@ class PreferenceStore:
             profile.alert_trend_threshold = max(1.5, min(float(value), 10.0))
         return profile
 
+    # ── Keyword alert management ────────────────────────────────
+
+    _MAX_ALERT_KEYWORDS = 20
+    _MAX_KEYWORD_LEN = 50
+
+    def add_alert_keyword(self, user_id: str, keyword: str) -> tuple[UserProfile, str]:
+        """Add a keyword alert. Returns (profile, error_message)."""
+        profile = self.get_or_create(user_id)
+        keyword = keyword.strip().lower()[:self._MAX_KEYWORD_LEN]
+        if not keyword or len(keyword) < 2:
+            return profile, "Keyword must be at least 2 characters."
+        if keyword in profile.alert_keywords:
+            return profile, f"Already alerting on '{keyword}'."
+        if len(profile.alert_keywords) >= self._MAX_ALERT_KEYWORDS:
+            return profile, f"Maximum {self._MAX_ALERT_KEYWORDS} alert keywords reached."
+        profile.alert_keywords.append(keyword)
+        return profile, ""
+
+    def remove_alert_keyword(self, user_id: str, keyword: str) -> tuple[UserProfile, bool]:
+        """Remove a keyword alert. Returns (profile, was_removed)."""
+        profile = self.get_or_create(user_id)
+        keyword = keyword.strip().lower()
+        if keyword in profile.alert_keywords:
+            profile.alert_keywords.remove(keyword)
+            return profile, True
+        return profile, False
+
     def set_email(self, user_id: str, email: str) -> UserProfile:
         """Set the user's email address for digest delivery."""
         profile = self.get_or_create(user_id)
         profile.email = email.strip()
         return profile
+
+    # ── Custom source management ──────────────────────────────────
+
+    _MAX_CUSTOM_SOURCES = 10
+
+    def add_custom_source(self, user_id: str, name: str, feed_url: str,
+                          site_url: str = "", feed_title: str = "",
+                          topics: list[str] | None = None) -> tuple[UserProfile, str]:
+        """Add a custom RSS source. Returns (profile, error_message)."""
+        profile = self.get_or_create(user_id)
+        if len(profile.custom_sources) >= self._MAX_CUSTOM_SOURCES:
+            return profile, f"Maximum {self._MAX_CUSTOM_SOURCES} custom sources reached."
+        # Check for duplicate names
+        for src in profile.custom_sources:
+            if src["name"].lower() == name.lower():
+                return profile, f"Source '{name}' already exists."
+        # Check for duplicate feed URLs
+        for src in profile.custom_sources:
+            if src["feed_url"] == feed_url:
+                return profile, f"Feed URL already added as '{src['name']}'."
+        profile.custom_sources.append({
+            "name": name,
+            "feed_url": feed_url,
+            "site_url": site_url,
+            "feed_title": feed_title,
+            "topics": topics or ["general"],
+            "added_at": time.time(),
+            "items_seen": 0,
+        })
+        return profile, ""
+
+    def remove_custom_source(self, user_id: str, name: str) -> tuple[UserProfile, bool]:
+        """Remove a custom source by name. Returns (profile, was_removed)."""
+        profile = self.get_or_create(user_id)
+        for i, src in enumerate(profile.custom_sources):
+            if src["name"].lower() == name.lower():
+                profile.custom_sources.pop(i)
+                return profile, True
+        return profile, False
+
+    def get_custom_sources(self, user_id: str) -> list[dict]:
+        """Get all custom sources for a user."""
+        profile = self.get_or_create(user_id)
+        return list(profile.custom_sources)
 
     def reset(self, user_id: str) -> UserProfile:
         """Reset all user preferences to defaults."""
@@ -309,6 +380,8 @@ class PreferenceStore:
                 "alert_trend_threshold": p.alert_trend_threshold,
                 "presets": dict(p.presets),
                 "webhook_url": p.webhook_url,
+                "custom_sources": list(p.custom_sources),
+                "alert_keywords": list(p.alert_keywords),
             }
         return result
 

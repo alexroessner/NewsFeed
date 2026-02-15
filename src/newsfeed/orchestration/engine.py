@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from newsfeed.agents.base import ResearchAgent
+from newsfeed.agents.dynamic_sources import create_custom_agent
 from newsfeed.agents.experts import ExpertCouncil
 from newsfeed.agents.registry import create_agent
 from newsfeed.db.analytics import AnalyticsDB, create_analytics_db
@@ -230,7 +231,7 @@ class NewsFeedEngine:
             ",".join(sorted(self._enabled_stages)),
         )
 
-    def _research_agents(self) -> list[ResearchAgent]:
+    def _research_agents(self, user_id: str | None = None) -> list[ResearchAgent]:
         api_keys = self.pipeline.get("api_keys", {})
         agents = []
         for a in self.config.get("research_agents", []):
@@ -240,10 +241,25 @@ class NewsFeedEngine:
                 continue
             agent = create_agent(a, api_keys)
             agents.append(agent)
+
+        # Inject per-user custom source agents
+        if user_id:
+            for src in self.preferences.get_custom_sources(user_id):
+                try:
+                    agent = create_custom_agent(
+                        name=src["name"],
+                        feed_url=src["feed_url"],
+                        user_id=user_id,
+                        topics=src.get("topics"),
+                    )
+                    agents.append(agent)
+                except Exception:
+                    log.debug("Failed to create custom agent %s", src.get("name"), exc_info=True)
+
         return agents
 
     async def _run_research_async(self, task: ResearchTask, top_k: int) -> list:
-        coros = [agent.run_async(task, top_k=top_k) for agent in self._research_agents()]
+        coros = [agent.run_async(task, top_k=top_k) for agent in self._research_agents(task.user_id)]
         batch = await asyncio.gather(*coros)
         flattened = []
         for chunk in batch:
@@ -322,6 +338,14 @@ class NewsFeedEngine:
                 candidate_regions = {r.lower().replace(" ", "_") for r in c.regions}
                 if candidate_regions & roi_set:
                     c.preference_fit = round(min(1.0, c.preference_fit + 0.15), 3)
+
+        # Boost stories matching keyword alerts — cross-topic priority boosting
+        if profile.alert_keywords:
+            for c in all_candidates:
+                text = f"{c.title} {c.summary}".lower()
+                if any(kw in text for kw in profile.alert_keywords):
+                    c.preference_fit = round(min(1.0, c.preference_fit + 0.25), 3)
+                    c.novelty_score = round(min(1.0, c.novelty_score + 0.10), 3)
 
         # Stage 2: Intelligence enrichment (conditionally enabled, with error isolation)
         t0 = time.monotonic()
