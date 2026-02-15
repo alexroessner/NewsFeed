@@ -124,7 +124,7 @@ def main() -> None:
         )
     except Exception as e:
         log.exception("Engine initialization failed")
-        _send_error_to_chat(update, token, f"Engine init: {e}")
+        _send_error_to_chat(update, token, "Service temporarily unavailable. Please try again later.")
         sys.exit(1)
 
     if engine._comm_agent is None:
@@ -138,7 +138,7 @@ def main() -> None:
         result = engine._comm_agent.handle_update(update)
     except Exception as e:
         log.exception("handle_update failed")
-        _send_error_to_chat(update, token, f"handle_update: {e}")
+        _send_error_to_chat(update, token, "Something went wrong. Please try again.")
         sys.exit(1)
 
     if result:

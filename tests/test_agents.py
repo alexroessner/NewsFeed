@@ -1473,7 +1473,7 @@ class CommunicationAgentTests(unittest.TestCase):
         }
         result = self.agent.handle_update({})
         self.assertEqual(result["action"], "feedback")
-        self.mock_engine.apply_user_feedback.assert_called_with("u1", "more geopolitics")
+        self.mock_engine.apply_user_feedback.assert_called_with("u1", "more geopolitics", is_admin=False)
 
     def test_handle_preference_more_similar(self) -> None:
         self.agent._last_topic["u1"] = "technology"
@@ -2302,8 +2302,14 @@ class EngineIntegrationTests(unittest.TestCase):
 
     def test_config_change_via_feedback(self) -> None:
         engine = self._make_engine()
-        results = engine.apply_user_feedback("u-cfg", "set evidence weight to 0.4")
+        # Config changes require is_admin=True (non-admins cannot modify global pipeline)
+        results = engine.apply_user_feedback("u-cfg", "set evidence weight to 0.4", is_admin=True)
         self.assertIn("scoring.composite_weights.evidence", results)
+
+    def test_config_change_blocked_for_non_admin(self) -> None:
+        engine = self._make_engine()
+        results = engine.apply_user_feedback("u-cfg", "set evidence weight to 0.4")
+        self.assertNotIn("scoring.composite_weights.evidence", results)
 
     def test_engine_status_includes_new_fields(self) -> None:
         engine = self._make_engine()

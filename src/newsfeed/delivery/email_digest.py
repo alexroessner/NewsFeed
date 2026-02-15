@@ -27,6 +27,15 @@ def _esc(text: str) -> str:
     return html.escape(text, quote=False)
 
 
+_SAFE_SCHEMES = frozenset({"http", "https", "ftp"})
+
+
+def _safe_url(url: str) -> bool:
+    """Reject javascript:, data:, and other dangerous URI schemes."""
+    scheme = url.split(":", 1)[0].lower().strip() if ":" in url else ""
+    return scheme in _SAFE_SCHEMES
+
+
 def _confidence_label(item: ReportItem) -> str:
     if not item.confidence:
         return ""
@@ -197,7 +206,7 @@ class EmailDigest:
         top = topics.most_common(3)
         topic_parts = []
         for topic, count in top:
-            name = topic.replace("_", " ")
+            name = _esc(topic.replace("_", " "))
             topic_parts.append(f"{count} {name}" if count > 1 else name)
         summary = ", ".join(topic_parts)
 
@@ -246,7 +255,7 @@ class EmailDigest:
         # Title
         tracked_badge = '<span class="tracked-badge">TRACKED</span>' if is_tracked else ""
         title_esc = _esc(c.title)
-        if c.url and not c.url.startswith("https://example.com"):
+        if c.url and not c.url.startswith("https://example.com") and _safe_url(c.url):
             title_html = (
                 f'<div class="story-title">{tracked_badge}'
                 f'{index}. <a href="{_esc(c.url)}">{title_esc}</a></div>'
@@ -288,10 +297,10 @@ class EmailDigest:
 
         meta_line_parts = []
         if c.regions:
-            region_str = ", ".join(r.replace("_", " ").title() for r in c.regions[:3])
+            region_str = ", ".join(_esc(r.replace("_", " ").title()) for r in c.regions[:3])
             meta_line_parts.append(region_str)
         if c.corroborated_by:
-            corr = ", ".join(c.corroborated_by[:3])
+            corr = ", ".join(_esc(s) for s in c.corroborated_by[:3])
             meta_line_parts.append(f"Verified by {corr}")
         if meta_line_parts:
             footer_parts.append(

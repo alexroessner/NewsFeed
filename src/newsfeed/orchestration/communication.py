@@ -58,6 +58,9 @@ class CommunicationAgent:
         self._last_topic: dict[str, str] = {}
         # Track last briefing items per user for per-item feedback
         self._last_items: dict[str, list[dict]] = {}  # user_id -> [{topic, source}, ...]
+        # Per-user rate limiting for resource-intensive commands
+        self._rate_limits: dict[str, float] = {}  # user_id -> last_expensive_command_ts
+        self._RATE_LIMIT_SECONDS = 15  # Min seconds between briefing/sitrep/quick
 
     def handle_update(self, update: dict) -> dict[str, Any] | None:
         """Process a single Telegram update end-to-end.
@@ -113,12 +116,35 @@ class CommunicationAgent:
 
         return result
 
+    def _check_rate_limit(self, chat_id: int | str, user_id: str) -> bool:
+        """Check if user is rate-limited for expensive commands.
+
+        Returns True if the request should be BLOCKED (rate limited).
+        """
+        import time
+        now = time.time()
+        last = self._rate_limits.get(user_id, 0)
+        if now - last < self._RATE_LIMIT_SECONDS:
+            remaining = int(self._RATE_LIMIT_SECONDS - (now - last))
+            self._bot.send_message(
+                chat_id,
+                f"Please wait {remaining}s before requesting another briefing."
+            )
+            return True
+        self._rate_limits[user_id] = now
+        return False
+
     def _handle_command(self, chat_id: int | str, user_id: str,
                         command: str, args: str) -> dict[str, Any]:
         """Route a slash command to the appropriate handler."""
 
         if command == "start":
             return self._onboard(chat_id, user_id)
+
+        # Rate-limit expensive commands that trigger external API calls
+        if command in ("briefing", "deep_dive", "quick", "sitrep"):
+            if self._check_rate_limit(chat_id, user_id):
+                return {"action": "rate_limited", "user_id": user_id}
 
         if command == "briefing":
             return self._run_briefing(chat_id, user_id, args)
@@ -668,7 +694,9 @@ class CommunicationAgent:
     def _handle_feedback(self, chat_id: int | str, user_id: str,
                          text: str) -> dict[str, Any]:
         """Apply user feedback to preferences, or detect conversational intent."""
-        results = self._engine.apply_user_feedback(user_id, text)
+        results = self._engine.apply_user_feedback(
+            user_id, text, is_admin=self._is_admin(user_id)
+        )
 
         if results:
             import html as html_mod
@@ -2495,7 +2523,7 @@ class CommunicationAgent:
             target = subargs.strip()
             summary = db.get_user_summary(target)
             if not summary:
-                self._bot.send_message(chat_id, f"User {target} not found.")
+                self._bot.send_message(chat_id, f"User {html_mod.escape(target)} not found.")
                 return {"action": "admin_user_notfound", "user_id": user_id}
             first = datetime.fromtimestamp(summary["first_seen_at"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
             last = datetime.fromtimestamp(summary["last_active_at"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
@@ -2531,7 +2559,7 @@ class CommunicationAgent:
             target = subargs.strip() if subargs else user_id
             interactions = db.get_user_interactions(target, limit=30)
             if not interactions:
-                self._bot.send_message(chat_id, f"No interactions for {target}.")
+                self._bot.send_message(chat_id, f"No interactions for {html_mod.escape(target)}.")
                 return {"action": "admin_interactions", "user_id": user_id}
             lines = [f"<b>Interactions: {html_mod.escape(target)}</b> (last 30)", ""]
             for i in interactions:
@@ -2546,14 +2574,14 @@ class CommunicationAgent:
             target = subargs.strip() if subargs else user_id
             ratings = db.get_user_ratings(target, limit=30)
             if not ratings:
-                self._bot.send_message(chat_id, f"No ratings for {target}.")
+                self._bot.send_message(chat_id, f"No ratings for {html_mod.escape(target)}.")
                 return {"action": "admin_ratings", "user_id": user_id}
             lines = [f"<b>Ratings: {html_mod.escape(target)}</b> (last 30)", ""]
             for r in ratings:
                 ts = datetime.fromtimestamp(r["ts"], tz=timezone.utc).strftime("%m-%d %H:%M")
                 icon = "\U0001f44d" if r["direction"] == "up" else "\U0001f44e"
                 title = html_mod.escape((r["title"] or r["topic"] or "?")[:50])
-                lines.append(f"  {ts} {icon} #{r['item_index']} {title} [{r['source']}]")
+                lines.append(f"  {ts} {icon} #{r['item_index']} {title} [{html_mod.escape(r['source'] or '')}]")
             self._bot.send_message(chat_id, "\n".join(lines))
             return {"action": "admin_ratings", "user_id": user_id}
 
@@ -2561,7 +2589,7 @@ class CommunicationAgent:
             target = subargs.strip() if subargs else user_id
             feedback = db.get_user_feedback_history(target, limit=20)
             if not feedback:
-                self._bot.send_message(chat_id, f"No feedback for {target}.")
+                self._bot.send_message(chat_id, f"No feedback for {html_mod.escape(target)}.")
                 return {"action": "admin_feedback", "user_id": user_id}
             lines = [f"<b>Feedback: {html_mod.escape(target)}</b> (last 20)", ""]
             for f in feedback:
@@ -2577,14 +2605,14 @@ class CommunicationAgent:
             target = subargs.strip() if subargs else user_id
             prefs = db.get_user_preference_history(target, limit=30)
             if not prefs:
-                self._bot.send_message(chat_id, f"No preference changes for {target}.")
+                self._bot.send_message(chat_id, f"No preference changes for {html_mod.escape(target)}.")
                 return {"action": "admin_prefs", "user_id": user_id}
             lines = [f"<b>Preference History: {html_mod.escape(target)}</b> (last 30)", ""]
             for p in prefs:
                 ts = datetime.fromtimestamp(p["ts"], tz=timezone.utc).strftime("%m-%d %H:%M")
                 lines.append(
-                    f"  {ts} [{p['change_type']}] {p['field']}: "
-                    f"{p['old_value']} -> {p['new_value']} ({p['source']})"
+                    f"  {ts} [{html_mod.escape(p['change_type'] or '')}] {html_mod.escape(p['field'] or '')}: "
+                    f"{html_mod.escape(str(p['old_value'] or ''))} -> {html_mod.escape(str(p['new_value'] or ''))} ({html_mod.escape(p['source'] or '')})"
                 )
             self._bot.send_message(chat_id, "\n".join(lines))
             return {"action": "admin_prefs", "user_id": user_id}
@@ -2613,7 +2641,7 @@ class CommunicationAgent:
             detail = db.get_request_detail(subargs.strip())
             req = detail["request"]
             if not req:
-                self._bot.send_message(chat_id, f"Request {subargs} not found.")
+                self._bot.send_message(chat_id, f"Request {html_mod.escape(subargs)} not found.")
                 return {"action": "admin_request_notfound", "user_id": user_id}
             lines = [
                 f"<b>Request: {html_mod.escape(req['request_id'][:30])}</b>",
@@ -2635,7 +2663,7 @@ class CommunicationAgent:
                 lines.append("<b>Selected Stories:</b>")
                 for c in selected[:10]:
                     lines.append(
-                        f"  [{c['source']}] {html_mod.escape((c['title'] or '')[:60])} "
+                        f"  [{html_mod.escape(c['source'] or '')}] {html_mod.escape((c['title'] or '')[:60])} "
                         f"(score:{c['composite_score']:.3f})"
                     )
             self._bot.send_message(chat_id, "\n".join(lines))
@@ -2649,7 +2677,7 @@ class CommunicationAgent:
             lines = ["<b>Top Topics (30 days)</b>", ""]
             for t in topics:
                 lines.append(
-                    f"  {t['topic']}: {t['count']} candidates, "
+                    f"  {html_mod.escape(t['topic'] or '')}: {t['count']} candidates, "
                     f"{t['times_selected']} selected, "
                     f"avg score: {t['avg_score']:.3f}"
                 )
@@ -2665,7 +2693,7 @@ class CommunicationAgent:
             for s in sources:
                 sel_rate = (s["times_selected"] / s["total_candidates"] * 100) if s["total_candidates"] else 0
                 lines.append(
-                    f"  {s['source']}: {s['total_candidates']} cand, "
+                    f"  {html_mod.escape(s['source'] or '')}: {s['total_candidates']} cand, "
                     f"{s['times_selected']} sel ({sel_rate:.0f}%), "
                     f"avg: {s['avg_score']:.3f}"
                 )
@@ -2676,7 +2704,7 @@ class CommunicationAgent:
             target = subargs.strip() if subargs else user_id
             briefings = db.get_user_briefings(target, limit=15)
             if not briefings:
-                self._bot.send_message(chat_id, f"No briefings for {target}.")
+                self._bot.send_message(chat_id, f"No briefings for {html_mod.escape(target)}.")
                 return {"action": "admin_briefings", "user_id": user_id}
             lines = [f"<b>Briefings: {html_mod.escape(target)}</b> (last 15)", ""]
             for b in briefings:
@@ -2689,5 +2717,5 @@ class CommunicationAgent:
             self._bot.send_message(chat_id, "\n".join(lines))
             return {"action": "admin_briefings", "user_id": user_id}
 
-        self._bot.send_message(chat_id, f"Unknown admin command: {subcmd}. Try /admin help")
+        self._bot.send_message(chat_id, f"Unknown admin command: {html_mod.escape(subcmd)}. Try /admin help")
         return {"action": "admin_unknown", "user_id": user_id}
