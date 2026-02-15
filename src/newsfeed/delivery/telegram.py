@@ -353,6 +353,12 @@ class TelegramFormatter:
         # ── Metadata footer ──
         meta_parts: list[str] = []
 
+        # Reading time estimate from card word count
+        word_count = len((c.summary or "").split()) + len((item.why_it_matters or "").split())
+        if word_count > 20:
+            read_min = max(1, round(word_count / 200))
+            meta_parts.append(f"{read_min} min read")
+
         conf = _confidence_label(item)
         if conf:
             meta_parts.append(conf)
@@ -382,21 +388,46 @@ class TelegramFormatter:
         return "\n".join(lines).strip()
 
     def format_footer(self, payload: DeliveryPayload) -> str:
-        """Format the footer stats message."""
+        """Format the footer with topic distribution, source count, and reading time."""
+        from collections import Counter
+
         lines: list[str] = []
         lines.append(f"<b>{_SECTION_LINE}</b>")
+
+        # Topic distribution — what this briefing covered
+        if payload.items:
+            topics = Counter(item.candidate.topic for item in payload.items)
+            sources = set(item.candidate.source for item in payload.items)
+            topic_parts = [
+                f"{_esc(topic.replace('_', ' '))}: {count}"
+                for topic, count in topics.most_common(4)
+            ]
+            sep = " \u2502 "
+            lines.append(f"<i>{sep.join(topic_parts)}</i>")
+            lines.append(
+                f"<i>{len(payload.items)} stories from {len(sources)} sources</i>"
+            )
+
+            # Total reading time estimate
+            total_words = sum(
+                len((item.candidate.summary or "").split())
+                + len((item.why_it_matters or "").split())
+                for item in payload.items
+            )
+            total_min = max(1, round(total_words / 200))
+            lines.append(f"<i>~{total_min} min total read time</i>")
+
         meta = payload.metadata
         if meta:
             parts: list[str] = []
-            if "selected_count" in meta:
-                parts.append(f"{meta['selected_count']} items")
-            if "thread_count" in meta:
+            if "thread_count" in meta and meta["thread_count"]:
                 parts.append(f"{meta['thread_count']} threads")
             if meta.get("emerging_trends", 0) > 0:
                 parts.append(f"{meta['emerging_trends']} emerging")
             if parts:
                 sep = " \u2502 "
                 lines.append(f"<i>{sep.join(parts)}</i>")
+
         return "\n".join(lines).strip()
 
     def format_topic_discovery(self, emerging_topics: list[str],

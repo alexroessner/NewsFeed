@@ -441,9 +441,19 @@ class CommunicationAgent:
             # Clean up onboarding state
             self._onboarding.pop(user_id, None)
 
+            # Auto-trigger first briefing — don't make user type /briefing
+            self._bot.send_message(
+                chat_id,
+                "<i>Generating your first personalized briefing...</i>"
+            )
+            self._run_briefing(chat_id, user_id)
+
             return {"action": "onboard_complete", "user_id": user_id,
                     "topics": state.selected_topics, "role": state.role,
                     "detail": state.detail_level}
+
+        # Unrecognized onboarding callback
+        return {"action": "onboard_unknown", "user_id": user_id}
 
     def _run_sitrep(self, chat_id: int | str, user_id: str,
                     args: str = "") -> dict[str, Any]:
@@ -696,8 +706,13 @@ class CommunicationAgent:
         # Build thread-to-story mapping for grouping
         thread_map = self._build_thread_map(payload)
 
+        # Build continuity summary from delta tags
+        continuity = self._build_continuity_summary(delta_tags, tracked_count)
+
         # Message 1: Header (ticker + exec summary + geo risks + trends + threads)
         header = formatter.format_header(payload, ticker_bar, tracked_count=tracked_count)
+        if continuity:
+            header += f"\n{continuity}"
         self._bot.send_message(chat_id, header)
 
         # Send story cards grouped by narrative thread
@@ -751,32 +766,53 @@ class CommunicationAgent:
 
     def _show_more(self, chat_id: int | str, user_id: str,
                    topic_hint: str = "") -> dict[str, Any]:
-        """Show more items from cache with HTML formatting, or run a fresh cycle."""
+        """Show more items from reserve cache with context, or signal caught-up state."""
         import html as html_mod
         topic = topic_hint.strip().lower().replace(" ", "_") if topic_hint else self._last_topic.get(user_id, "general")
+        topic_name = html_mod.escape(topic.replace("_", " ").title())
         seen = self._shown_ids.get(user_id, set())
 
         more = self._engine.show_more(user_id, topic, seen, limit=5)
 
         if more:
-            lines = [f"<b>More on {html_mod.escape(topic)}:</b>", ""]
+            # Context label — these are reserve items below the briefing threshold
+            lines = [
+                f"<b>More on {topic_name}</b> "
+                f"<i>(reserve stories \u2014 slightly below briefing threshold)</i>",
+                "",
+            ]
             for c in more:
                 title_esc = html_mod.escape(c.title)
+                score = c.composite_score()
+                conf_label = f" <i>({score:.0%} confidence)</i>"
                 if c.url and not c.url.startswith("https://example.com"):
-                    lines.append(f'\u2022 <a href="{html_mod.escape(c.url)}">{title_esc}</a> [{html_mod.escape(c.source)}]')
+                    lines.append(
+                        f'\u2022 <a href="{html_mod.escape(c.url)}">{title_esc}</a> '
+                        f'[{html_mod.escape(c.source)}]{conf_label}'
+                    )
                 else:
-                    lines.append(f"\u2022 {title_esc} [{html_mod.escape(c.source)}]")
+                    lines.append(
+                        f"\u2022 {title_esc} [{html_mod.escape(c.source)}]{conf_label}"
+                    )
                 if c.summary:
                     lines.append(f"  <i>{html_mod.escape(c.summary[:120])}</i>")
-                # Track as seen
                 self._shown_ids.setdefault(user_id, set()).add(c.candidate_id)
             self._bot.send_message(chat_id, "\n".join(lines))
             return {"action": "show_more", "user_id": user_id, "count": len(more)}
 
-        # Cache empty — run a fresh mini-cycle
-        import html as html_mod
-        self._bot.send_message(chat_id, f"Searching for more on {html_mod.escape(topic)}...")
-        return self._run_briefing(chat_id, user_id, topic_hint=topic)
+        # Cache exhausted — "all caught up" moment
+        total_seen = len(seen)
+        self._bot.send_message(
+            chat_id,
+            f"\u2705 <b>You're all caught up on {topic_name}!</b>\n\n"
+            f"You've seen {total_seen} stories on this topic today.\n"
+            f"No new high-confidence items since your last briefing.\n\n"
+            "<i>Check back in a few hours for new developments, or:\n"
+            "\u2022 /briefing \u2014 Full briefing on all topics\n"
+            "\u2022 /quick \u2014 Quick headline scan\n"
+            "\u2022 /filter confidence 0.5 \u2014 Lower threshold to see more</i>"
+        )
+        return {"action": "show_more_caught_up", "user_id": user_id, "seen": total_seen}
 
     def _detect_intent(self, text: str) -> tuple[str, str]:
         """Detect conversational intent from natural language text.
@@ -996,18 +1032,34 @@ class CommunicationAgent:
         item = items[item_num - 1]
         topic = item["topic"]
 
+        import html as html_mod
+        source = item.get("source", "")
+        topic_name = html_mod.escape(topic.replace("_", " ").title())
+        source_name = html_mod.escape(source) if source else ""
+
         if direction == "up":
             self._engine.apply_user_feedback(user_id, f"more {topic}")
-            if item.get("source"):
-                self._engine.preferences.apply_source_weight(user_id, item["source"], 0.3)
-            import html as html_mod
-            self._bot.send_message(chat_id, f"\U0001f44d Boosted {html_mod.escape(topic)} (story #{item_num})")
+            if source:
+                self._engine.preferences.apply_source_weight(user_id, source, 0.3)
+            # Show specific impact — make the learning feel immediate
+            profile = self._engine.preferences.get_or_create(user_id)
+            weight = profile.topic_weights.get(topic, 0.5)
+            msg = f"\U0001f44d Got it \u2014 more <b>{topic_name}</b>"
+            if source_name:
+                msg += f" from {source_name}"
+            msg += f"\n<i>Topic weight now {weight:.0%}. Next briefing will reflect this.</i>"
+            self._bot.send_message(chat_id, msg)
         elif direction == "down":
             self._engine.apply_user_feedback(user_id, f"less {topic}")
-            if item.get("source"):
-                self._engine.preferences.apply_source_weight(user_id, item["source"], -0.3)
-            import html as html_mod
-            self._bot.send_message(chat_id, f"\U0001f44e Reduced {html_mod.escape(topic)} (story #{item_num})")
+            if source:
+                self._engine.preferences.apply_source_weight(user_id, source, -0.3)
+            profile = self._engine.preferences.get_or_create(user_id)
+            weight = profile.topic_weights.get(topic, 0.5)
+            msg = f"\U0001f44e Got it \u2014 less <b>{topic_name}</b>"
+            if source_name:
+                msg += f" from {source_name}"
+            msg += f"\n<i>Topic weight now {weight:.0%}. Next briefing will reflect this.</i>"
+            self._bot.send_message(chat_id, msg)
         else:
             return {"action": "rate_error", "user_id": user_id}
 
@@ -2095,6 +2147,34 @@ class CommunicationAgent:
             send_webhook(profile.webhook_url, payload)
         except Exception:
             log.debug("Webhook alert failed for user=%s", user_id, exc_info=True)
+
+    @staticmethod
+    def _build_continuity_summary(delta_tags: list[str], tracked_count: int) -> str:
+        """Build a one-line continuity header from delta tags.
+
+        Returns something like: "Since last briefing: 6 new, 3 developing, 1 tracked"
+        This is the #1 thing a returning user scans for — what changed?
+        """
+        from collections import Counter
+        counts = Counter(delta_tags)
+        new = counts.get("new", 0)
+        developing = counts.get("developing", 0)
+        updated = counts.get("updated", 0)
+
+        if not any([new, developing, updated]):
+            return ""
+
+        parts: list[str] = []
+        if new:
+            parts.append(f"{new} new")
+        if developing:
+            parts.append(f"{developing} developing")
+        if updated:
+            parts.append(f"{updated} updated")
+        if tracked_count:
+            parts.append(f"{tracked_count} tracked")
+
+        return f"<i>Since last briefing: {', '.join(parts)}</i>"
 
     def _compute_delta_tags(self, user_id: str,
                             payload) -> list[str]:
