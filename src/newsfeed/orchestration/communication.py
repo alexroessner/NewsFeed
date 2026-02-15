@@ -486,7 +486,7 @@ class CommunicationAgent:
         """Show entity intelligence map across last briefing stories."""
         from newsfeed.intelligence.entities import format_entity_dashboard
 
-        items = self._engine._last_report_items.get(user_id, [])
+        items = self._engine.last_report_items(user_id)
         if not items:
             self._bot.send_message(
                 chat_id,
@@ -1001,11 +1001,10 @@ class CommunicationAgent:
 
     def _persist_prefs(self) -> None:
         """Persist preferences immediately."""
-        if self._engine._persistence:
-            try:
-                self._engine._persistence.save("preferences", self._engine.preferences.snapshot())
-            except Exception:
-                log.exception("Failed to persist preferences")
+        try:
+            self._engine.persist_preferences()
+        except Exception:
+            log.exception("Failed to persist preferences")
 
     def _set_watchlist(self, chat_id: int | str, user_id: str,
                        args: str) -> dict[str, Any]:
@@ -1645,7 +1644,7 @@ class CommunicationAgent:
             return {"action": "digest_no_email", "user_id": user_id}
 
         # Get last report items to build a payload
-        report_items = self._engine._last_report_items.get(user_id, [])
+        report_items = self._engine.last_report_items(user_id)
         if not report_items:
             self._bot.send_message(
                 chat_id,
@@ -1718,7 +1717,7 @@ class CommunicationAgent:
         if not profile.email:
             return
 
-        report_items = self._engine._last_report_items.get(user_id, [])
+        report_items = self._engine.last_report_items(user_id)
         if not report_items:
             return
 
@@ -1945,7 +1944,7 @@ class CommunicationAgent:
     def _export_briefing(self, chat_id: int | str,
                          user_id: str) -> dict[str, Any]:
         """Export the last briefing as Markdown."""
-        report_items = self._engine._last_report_items.get(user_id, [])
+        report_items = self._engine.last_report_items(user_id)
         if not report_items:
             self._bot.send_message(
                 chat_id,

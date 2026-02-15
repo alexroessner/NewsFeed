@@ -82,21 +82,26 @@ def match_tracked(story_topic: str, story_title: str,
 
 
 class PreferenceStore:
+    # Cap total user profiles to prevent unbounded memory growth.
+    # Higher limit than other per-user dicts because preferences are
+    # the most important per-user state to preserve.
+    MAX_USERS = 5000
+
     def __init__(self) -> None:
-        self._profiles: dict[str, UserProfile] = {}
+        self._profiles: BoundedUserDict[UserProfile] = BoundedUserDict(maxlen=self.MAX_USERS)
 
     def get_or_create(self, user_id: str) -> UserProfile:
         if user_id not in self._profiles:
             self._profiles[user_id] = UserProfile(user_id=user_id)
         return self._profiles[user_id]
 
-    _MAX_WEIGHTS = 100  # Max distinct topic/source weight entries per user
+    MAX_WEIGHTS = 100  # Max distinct topic/source weight entries per user
 
     def apply_weight_adjustment(self, user_id: str, topic: str, delta: float) -> UserProfile:
         profile = self.get_or_create(user_id)
         current = profile.topic_weights.get(topic, 0.0)
         # Reject new entries if at cap (updates to existing keys are always allowed)
-        if topic not in profile.topic_weights and len(profile.topic_weights) >= self._MAX_WEIGHTS:
+        if topic not in profile.topic_weights and len(profile.topic_weights) >= self.MAX_WEIGHTS:
             return profile
         profile.topic_weights[topic] = round(max(min(current + delta, 1.0), -1.0), 3)
         return profile
@@ -128,7 +133,7 @@ class PreferenceStore:
     def apply_source_weight(self, user_id: str, source: str, delta: float) -> UserProfile:
         profile = self.get_or_create(user_id)
         current = profile.source_weights.get(source, 0.0)
-        if source not in profile.source_weights and len(profile.source_weights) >= self._MAX_WEIGHTS:
+        if source not in profile.source_weights and len(profile.source_weights) >= self.MAX_WEIGHTS:
             return profile
         profile.source_weights[source] = round(max(min(current + delta, 2.0), -2.0), 3)
         return profile
@@ -139,15 +144,15 @@ class PreferenceStore:
             profile.regions_of_interest.remove(region)
         return profile
 
-    _MAX_WATCHLIST_SIZE = 50  # Prevent resource exhaustion via unbounded lists
+    MAX_WATCHLIST_SIZE = 50  # Prevent resource exhaustion via unbounded lists
 
     def set_watchlist(self, user_id: str, crypto: list[str] | None = None,
                      stocks: list[str] | None = None) -> UserProfile:
         profile = self.get_or_create(user_id)
         if crypto is not None:
-            profile.watchlist_crypto = crypto[:self._MAX_WATCHLIST_SIZE]
+            profile.watchlist_crypto = crypto[:self.MAX_WATCHLIST_SIZE]
         if stocks is not None:
-            profile.watchlist_stocks = stocks[:self._MAX_WATCHLIST_SIZE]
+            profile.watchlist_stocks = stocks[:self.MAX_WATCHLIST_SIZE]
         return profile
 
     _MAX_TIMEZONE_LEN = 50  # Longest IANA tz is ~32 chars (e.g. "America/Argentina/Buenos_Aires")
@@ -158,12 +163,12 @@ class PreferenceStore:
         profile.timezone = tz
         return profile
 
-    _MAX_MUTED_TOPICS = 50
+    MAX_MUTED_TOPICS = 50
 
     def mute_topic(self, user_id: str, topic: str) -> UserProfile:
         profile = self.get_or_create(user_id)
         if topic not in profile.muted_topics:
-            if len(profile.muted_topics) >= self._MAX_MUTED_TOPICS:
+            if len(profile.muted_topics) >= self.MAX_MUTED_TOPICS:
                 return profile
             profile.muted_topics.append(topic)
         return profile

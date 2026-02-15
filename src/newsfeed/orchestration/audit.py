@@ -239,15 +239,22 @@ class AuditTrail:
         }
 
     def _trim(self) -> None:
-        """Keep only the most recent N requests."""
-        if len(self._request_index) <= self._max_requests:
-            return
+        """Keep only the most recent N requests.
+
+        Optimized to batch eviction: only triggers when 20% over capacity
+        to amortize the cost of the index rebuild.  Without batching, the
+        full O(n) rebuild would run on every record() call at capacity.
+        """
+        overshoot = len(self._request_index) - self._max_requests
+        if overshoot < max(1, self._max_requests // 5):
+            return  # Wait until 20% over before trimming (amortize cost)
+
         # Find oldest requests to drop
         requests_by_first = sorted(
             self._request_index.keys(),
             key=lambda r: self._request_index[r][0] if self._request_index[r] else 0,
         )
-        to_drop = set(requests_by_first[:len(requests_by_first) - self._max_requests])
+        to_drop = set(requests_by_first[:overshoot])
         drop_indices = set()
         for rid in to_drop:
             drop_indices.update(self._request_index.pop(rid))
@@ -255,7 +262,7 @@ class AuditTrail:
         if drop_indices:
             old_events = self._events
             self._events = [e for i, e in enumerate(old_events) if i not in drop_indices]
-            # Rebuild index
+            # Rebuild index (amortized — runs infrequently due to batch threshold)
             self._request_index.clear()
             for i, event in enumerate(self._events):
                 self._request_index[event.request_id].append(i)

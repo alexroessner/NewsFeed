@@ -784,15 +784,48 @@ class NewsFeedEngine:
             "agent_count": len(self.config.get("research_agents", [])),
             "expert_count": len(self.experts.expert_ids),
             "stage_count": len(self._enabled_stages),
-            "llm_backed": bool(self.experts._use_llm),
-            "telegram_connected": self._bot is not None,
-            "cache_entries": sum(len(v) for v in self.cache._entries.values()),
+            "llm_backed": self.is_llm_backed(),
+            "telegram_connected": self.is_telegram_connected(),
+            "cache_entries": self.cache_entry_count(),
             "orchestrator_metrics": self.orchestrator.metrics(),
             "optimizer_health": self.optimizer.health_report(),
             "audit_stats": self.audit.stats(),
             "expert_influence": self.experts.chair.snapshot(),
             "config_changes": len(self.configurator.history()),
         }
+
+    # ──────────────────────────────────────────────────────────────
+    # Public API — avoid private attribute access across modules
+    # ──────────────────────────────────────────────────────────────
+
+    def last_report_items(self, user_id: str) -> list[ReportItem]:
+        """Return the full ReportItem list from the user's last briefing."""
+        return self._last_report_items.get(user_id, [])
+
+    def is_telegram_connected(self) -> bool:
+        """Check if the Telegram bot and communication agent are initialized."""
+        return self._bot is not None and self._comm_agent is not None
+
+    def get_comm_agent(self):
+        """Return the communication agent (or None if not initialized)."""
+        return self._comm_agent
+
+    def get_bot(self):
+        """Return the Telegram bot (or None if not initialized)."""
+        return self._bot
+
+    def is_llm_backed(self) -> bool:
+        """Check if the expert council is using LLM-based evaluation."""
+        return bool(self.experts._use_llm)
+
+    def cache_entry_count(self) -> int:
+        """Return the total number of cached candidate entries."""
+        return sum(len(v) for v in self.cache._entries.values())
+
+    def persist_preferences(self) -> None:
+        """Persist current preferences to disk (if persistence is enabled)."""
+        if self._persistence:
+            self._persistence.save("preferences", self.preferences.snapshot())
 
     def _save_state(self) -> None:
         if not self._persistence:
@@ -820,9 +853,9 @@ class NewsFeedEngine:
         if not self._persistence:
             return
 
-        _MAX_WEIGHTS = self.preferences._MAX_WEIGHTS
-        _MAX_WATCHLIST = self.preferences._MAX_WATCHLIST_SIZE
-        _MAX_MUTED = self.preferences._MAX_MUTED_TOPICS
+        _MAX_WEIGHTS = self.preferences.MAX_WEIGHTS
+        _MAX_WATCHLIST = self.preferences.MAX_WATCHLIST_SIZE
+        _MAX_MUTED = self.preferences.MAX_MUTED_TOPICS
 
         # Restore user preferences
         prefs_data = self._persistence.load("preferences")
@@ -893,5 +926,50 @@ class NewsFeedEngine:
                     if valid:
                         profile.webhook_url = url
             log.info("Restored preferences for %d users from disk", len(prefs_data))
+
+        # Restore optimizer state (disabled agents, weight overrides, agent stats)
+        opt_data = self._persistence.load("optimizer")
+        if opt_data and isinstance(opt_data, dict):
+            if isinstance(opt_data.get("disabled"), list):
+                for aid in opt_data["disabled"]:
+                    if isinstance(aid, str) and len(aid) <= 100:
+                        self.optimizer._disabled_agents.add(aid)
+            if isinstance(opt_data.get("weights"), dict):
+                for aid, w in opt_data["weights"].items():
+                    if isinstance(aid, str) and len(aid) <= 100:
+                        self.optimizer._weight_overrides[str(aid)] = max(0.1, min(float(w), 2.0))
+            log.info("Restored optimizer state: %d disabled, %d weight overrides",
+                     len(self.optimizer._disabled_agents), len(self.optimizer._weight_overrides))
+
+        # Restore credibility baselines
+        cred_data = self._persistence.load("credibility")
+        if cred_data and isinstance(cred_data, dict):
+            for source_id, sdata in cred_data.items():
+                if not isinstance(source_id, str) or not isinstance(sdata, dict):
+                    continue
+                sr = self.credibility.get_source(source_id)
+                if isinstance(sdata.get("reliability_score"), (int, float)):
+                    sr.reliability_score = max(0.0, min(1.0, float(sdata["reliability_score"])))
+                if isinstance(sdata.get("corroboration_rate"), (int, float)):
+                    sr.corroboration_rate = max(0.0, min(1.0, float(sdata["corroboration_rate"])))
+                if isinstance(sdata.get("total_items_seen"), int):
+                    sr.total_items_seen = max(0, sdata["total_items_seen"])
+            log.info("Restored credibility data for %d sources", len(cred_data))
+
+        # Restore georisk baselines
+        geo_data = self._persistence.load("georisk")
+        if geo_data and isinstance(geo_data, dict):
+            for region, level in geo_data.items():
+                if isinstance(region, str) and isinstance(level, (int, float)):
+                    self.georisk._history[region] = max(0.0, min(1.0, float(level)))
+            log.info("Restored georisk baselines for %d regions", len(geo_data))
+
+        # Restore trend baselines
+        trend_data = self._persistence.load("trends")
+        if trend_data and isinstance(trend_data, dict):
+            for topic, velocity in trend_data.items():
+                if isinstance(topic, str) and isinstance(velocity, (int, float)):
+                    self.trends._baseline[topic] = max(0.0, min(1.0, float(velocity)))
+            log.info("Restored trend baselines for %d topics", len(trend_data))
 
         log.info("State loaded from %s", self._persistence.state_dir)
