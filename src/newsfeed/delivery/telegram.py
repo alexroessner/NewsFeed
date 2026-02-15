@@ -1157,3 +1157,336 @@ class TelegramFormatter:
 
         lines.append("<i>Adjust: /feedback prefer [source] or demote [source]</i>")
         return "\n".join(lines).strip()
+
+    def format_sitrep(self, payload: DeliveryPayload,
+                      entity_map: dict[str, list[int]] | None = None,
+                      ticker_bar: str = "") -> str:
+        """Format a structured Situation Report (SITREP).
+
+        Organizes all briefing items into a single cohesive intelligence
+        document with sections by urgency/priority, rather than individual
+        story cards.
+        """
+        lines: list[str] = []
+
+        # ── Header ──
+        lines.append(f"<b>{_HEAVY_LINE}</b>")
+        lines.append("<b>\U0001f4dc SITUATION REPORT (SITREP)</b>")
+        lines.append(f"<i>{_human_time(payload.generated_at)}</i>")
+        lines.append(f"<b>{_HEAVY_LINE}</b>")
+
+        if ticker_bar:
+            lines.append("")
+            lines.append(ticker_bar)
+
+        items = payload.items
+        if not items:
+            lines.append("")
+            lines.append("<i>No intelligence items to report.</i>")
+            return "\n".join(lines).strip()
+
+        # ── Situation Overview ──
+        topics = {}
+        sources = set()
+        regions = set()
+        for item in items:
+            c = item.candidate
+            topics[c.topic] = topics.get(c.topic, 0) + 1
+            sources.add(c.source)
+            for r in (c.regions or []):
+                regions.add(r)
+
+        lines.append("")
+        lines.append(_section("Situation Overview"))
+        lines.append(
+            f"  {len(items)} developments across {len(topics)} domains "
+            f"from {len(sources)} sources"
+        )
+        if regions:
+            region_str = ", ".join(_format_region(r) for r in sorted(regions)[:6])
+            lines.append(f"  Affected regions: {region_str}")
+
+        # ── Geo-Risk Status ──
+        if payload.geo_risks:
+            escalating = [r for r in payload.geo_risks if r.is_escalating()]
+            if escalating:
+                lines.append("")
+                lines.append(_section("Geo-Risk Status"))
+                for risk in escalating[:5]:
+                    arrow = "\u2191" if risk.escalation_delta > 0 else "\u2193"
+                    lines.append(
+                        f"  \u2022 <b>{_esc(_format_region(risk.region))}</b>: "
+                        f"{risk.risk_level:.0%} ({arrow}{abs(risk.escalation_delta):.0%})"
+                    )
+
+        # ── Section 1: Critical/Breaking ──
+        critical = [i for i in items if i.candidate.urgency.value in ("critical", "breaking")]
+        if critical:
+            lines.append("")
+            lines.append(_section("\U0001f534 Critical Developments"))
+            for item in critical:
+                lines.append(self._sitrep_entry(item))
+
+        # ── Section 2: Elevated ──
+        elevated = [i for i in items if i.candidate.urgency.value == "elevated"]
+        if elevated:
+            lines.append("")
+            lines.append(_section("\U0001f7e1 Elevated Priority"))
+            for item in elevated:
+                lines.append(self._sitrep_entry(item))
+
+        # ── Section 3: Routine / Monitoring ──
+        routine = [i for i in items if i.candidate.urgency.value == "routine"]
+        if routine:
+            lines.append("")
+            lines.append(_section("\u26aa Monitoring"))
+            for item in routine:
+                lines.append(self._sitrep_entry(item, brief=True))
+
+        # ── Emerging Trends ──
+        if payload.trends:
+            emerging = [t for t in payload.trends if t.is_emerging]
+            if emerging:
+                lines.append("")
+                lines.append(_section("\U0001f4c8 Trend Signals"))
+                for trend in emerging[:5]:
+                    lines.append(
+                        f"  \u2022 <b>{_esc(trend.topic.replace('_', ' ').title())}</b>: "
+                        f"{trend.anomaly_score:.1f}x baseline velocity"
+                    )
+
+        # ── Entity Connections ──
+        if entity_map:
+            lines.append("")
+            lines.append(_section("\U0001f465 Key Entities"))
+            for entity, indices in sorted(entity_map.items(),
+                                          key=lambda x: -len(x[1]))[:8]:
+                story_refs = ", ".join(f"#{i}" for i in indices)
+                lines.append(f"  \u2022 <b>{_esc(entity)}</b> \u2192 {story_refs}")
+
+        # ── Outlook ──
+        outlooks = [i.predictive_outlook for i in items if i.predictive_outlook]
+        if outlooks:
+            lines.append("")
+            lines.append(_section("\U0001f52e Outlook"))
+            for outlook in outlooks[:4]:
+                lines.append(f"  \u2022 {_esc(outlook[:150])}")
+
+        # ── Narrative Threads ──
+        if payload.threads:
+            multi_source = [t for t in payload.threads if t.source_count > 1]
+            if multi_source:
+                lines.append("")
+                lines.append(_section("\U0001f517 Active Narratives"))
+                for thread in multi_source[:5]:
+                    lines.append(
+                        f"  \u2022 <b>{_esc(thread.headline[:80])}</b> "
+                        f"({thread.source_count} sources, "
+                        f"{thread.lifecycle.value})"
+                    )
+
+        lines.append("")
+        lines.append(f"<b>{_SECTION_LINE}</b>")
+        lines.append(
+            f"<i>{len(items)} items \u00b7 {len(sources)} sources \u00b7 "
+            f"Generated {_human_time(payload.generated_at)}</i>"
+        )
+        lines.append(
+            "<i>Individual cards: /briefing \u00b7 "
+            "Deep dive: /deep [#] \u00b7 Export: /export</i>"
+        )
+
+        return "\n".join(lines).strip()
+
+    def _sitrep_entry(self, item: ReportItem, brief: bool = False) -> str:
+        """Format a single story as a compact SITREP line item."""
+        c = item.candidate
+        title = _esc(c.title[:100])
+        source = _esc(c.source)
+        conf = _confidence_label(item)
+
+        entry_lines = []
+        if c.url and not c.url.startswith("https://example.com"):
+            entry_lines.append(
+                f'  \u2022 <a href="{_esc_url(c.url)}">{title}</a> '
+                f"<i>[{source}]</i>"
+            )
+        else:
+            entry_lines.append(f"  \u2022 <b>{title}</b> <i>[{source}]</i>")
+
+        if not brief:
+            if item.why_it_matters:
+                entry_lines.append(f"    {_esc(item.why_it_matters[:120])}")
+            if item.what_changed:
+                entry_lines.append(f"    <i>Changed: {_esc(item.what_changed[:100])}</i>")
+
+        meta = []
+        if conf:
+            meta.append(conf)
+        if c.corroborated_by:
+            meta.append(f"Corr: {', '.join(c.corroborated_by[:2])}")
+        if c.regions:
+            meta.append(", ".join(_format_region(r) for r in c.regions[:2]))
+        if meta:
+            meta_str = " \u00b7 ".join(meta)
+            entry_lines.append(f"    <i>{meta_str}</i>")
+
+        return "\n".join(entry_lines)
+
+    def format_briefing_diff(self, diff_data: dict) -> str:
+        """Format a briefing-vs-briefing comparison showing holistic changes."""
+        lines: list[str] = []
+        lines.append("<b>\U0001f504 Briefing Diff</b>")
+        lines.append(f"<i>Comparing last two briefings</i>")
+        lines.append("")
+
+        new_stories = diff_data.get("new_stories", [])
+        resolved = diff_data.get("resolved_stories", [])
+        escalated = diff_data.get("escalated", [])
+        deescalated = diff_data.get("deescalated", [])
+        continuing = diff_data.get("continuing", [])
+        topic_shifts = diff_data.get("topic_shifts", {})
+        source_changes = diff_data.get("source_changes", {})
+
+        # Summary bar
+        total_changes = len(new_stories) + len(resolved) + len(escalated) + len(deescalated)
+        if total_changes == 0:
+            lines.append("<i>No significant changes between briefings.</i>")
+            return "\n".join(lines).strip()
+
+        lines.append(
+            f"<b>{total_changes} changes detected:</b> "
+            f"{len(new_stories)} new, {len(resolved)} resolved, "
+            f"{len(escalated)} escalated, {len(deescalated)} de-escalated"
+        )
+
+        # New stories
+        if new_stories:
+            lines.append("")
+            lines.append(_section("\U0001f7e2 New Developments"))
+            for story in new_stories[:5]:
+                title = _esc(story.get("title", "")[:80])
+                source = story.get("source", "")
+                topic = story.get("topic", "").replace("_", " ")
+                lines.append(f"  + <b>{title}</b> <i>[{_esc(source)}]</i>")
+                if topic:
+                    lines.append(f"    <i>{topic}</i>")
+
+        # Escalated
+        if escalated:
+            lines.append("")
+            lines.append(_section("\u2191 Escalated"))
+            for story in escalated[:5]:
+                title = _esc(story.get("title", "")[:80])
+                reason = story.get("reason", "urgency increased")
+                lines.append(f"  \u2191 <b>{title}</b>")
+                lines.append(f"    <i>{_esc(reason)}</i>")
+
+        # Resolved/Dropped
+        if resolved:
+            lines.append("")
+            lines.append(_section("\u2705 No Longer Trending"))
+            for story in resolved[:5]:
+                title = _esc(story.get("title", "")[:80])
+                lines.append(f"  \u2212 {title}")
+
+        # De-escalated
+        if deescalated:
+            lines.append("")
+            lines.append(_section("\u2193 De-escalated"))
+            for story in deescalated[:3]:
+                title = _esc(story.get("title", "")[:80])
+                lines.append(f"  \u2193 {title}")
+
+        # Topic distribution shift
+        if topic_shifts:
+            lines.append("")
+            lines.append(_section("\U0001f4ca Topic Shift"))
+            for topic, change in sorted(topic_shifts.items(),
+                                        key=lambda x: abs(x[1]), reverse=True)[:5]:
+                arrow = "\u2191" if change > 0 else "\u2193"
+                label = topic.replace("_", " ").title()
+                lines.append(f"  {arrow} {label}: {change:+d} stories")
+
+        # Continuing stories
+        if continuing:
+            lines.append("")
+            lines.append(f"<i>{len(continuing)} stories continuing from previous briefing</i>")
+
+        lines.append("")
+        lines.append("<i>Full briefing: /briefing \u00b7 SITREP: /sitrep</i>")
+
+        return "\n".join(lines).strip()
+
+    def format_entity_dashboard(self, entity_data: dict,
+                                items: list) -> str:
+        """Format entity cross-reference dashboard showing connections."""
+        lines: list[str] = []
+        lines.append("<b>\U0001f465 Entity Intelligence Map</b>")
+        lines.append(f"<i>{entity_data.get('total_entities', 0)} entities detected</i>")
+        lines.append("")
+
+        people = entity_data.get("people", {})
+        organizations = entity_data.get("organizations", {})
+        countries = entity_data.get("countries", {})
+        connections = entity_data.get("connections", [])
+
+        if not people and not organizations and not countries:
+            lines.append("<i>No cross-story entities found. Run /briefing first.</i>")
+            return "\n".join(lines).strip()
+
+        # Key People
+        if people:
+            lines.append(_section("\U0001f464 Key People"))
+            for name, indices in sorted(people.items(),
+                                        key=lambda x: -len(x[1]))[:6]:
+                refs = ", ".join(f"#{i}" for i in indices)
+                # Show topic context from first story
+                topic = ""
+                if indices and indices[0] - 1 < len(items):
+                    topic = items[indices[0] - 1].candidate.topic.replace("_", " ")
+                lines.append(
+                    f"  \u2022 <b>{_esc(name)}</b> \u2192 stories {refs}"
+                )
+                if topic:
+                    lines.append(f"    <i>{topic}</i>")
+            lines.append("")
+
+        # Organizations
+        if organizations:
+            lines.append(_section("\U0001f3e2 Organizations"))
+            for name, indices in sorted(organizations.items(),
+                                        key=lambda x: -len(x[1]))[:6]:
+                refs = ", ".join(f"#{i}" for i in indices)
+                lines.append(
+                    f"  \u2022 <b>{_esc(name)}</b> \u2192 stories {refs}"
+                )
+            lines.append("")
+
+        # Countries/Regions
+        if countries:
+            lines.append(_section("\U0001f30d Countries &amp; Regions"))
+            for name, indices in sorted(countries.items(),
+                                        key=lambda x: -len(x[1]))[:6]:
+                refs = ", ".join(f"#{i}" for i in indices)
+                lines.append(
+                    f"  \u2022 <b>{_esc(name)}</b> \u2192 stories {refs}"
+                )
+            lines.append("")
+
+        # Entity Connections (co-occurrence)
+        if connections:
+            lines.append(_section("\U0001f517 Entity Connections"))
+            for entity_a, entity_b, shared in connections[:5]:
+                lines.append(
+                    f"  \u2022 <b>{_esc(entity_a)}</b> \u2194 "
+                    f"<b>{_esc(entity_b)}</b> ({shared} shared stories)"
+                )
+            lines.append("")
+
+        lines.append(
+            "<i>SITREP: /sitrep \u00b7 "
+            "Deep dive: /deep [#] \u00b7 Compare: /compare [#]</i>"
+        )
+
+        return "\n".join(lines).strip()

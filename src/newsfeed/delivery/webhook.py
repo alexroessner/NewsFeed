@@ -33,12 +33,20 @@ def validate_webhook_url(url: str) -> tuple[bool, str]:
         return False, "Only HTTPS URLs are allowed"
     if not parsed.hostname:
         return False, "URL must include a hostname"
-    # Block localhost/private IPs
+    # Block localhost/private IPs (RFC1918 + loopback + link-local)
     hostname = parsed.hostname.lower()
-    if hostname in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
+    if hostname in ("localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]"):
         return False, "Localhost URLs are not allowed"
     if hostname.startswith("10.") or hostname.startswith("192.168."):
         return False, "Private network URLs are not allowed"
+    # 172.16.0.0/12 (172.16.x.x through 172.31.x.x)
+    if hostname.startswith("172."):
+        parts = hostname.split(".")
+        if len(parts) >= 2 and parts[1].isdigit() and 16 <= int(parts[1]) <= 31:
+            return False, "Private network URLs are not allowed"
+    # 169.254.x.x link-local
+    if hostname.startswith("169.254."):
+        return False, "Link-local URLs are not allowed"
     return True, ""
 
 

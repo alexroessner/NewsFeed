@@ -169,6 +169,15 @@ class CommunicationAgent:
         if command == "export":
             return self._export_briefing(chat_id, user_id)
 
+        if command == "sitrep":
+            return self._run_sitrep(chat_id, user_id, args)
+
+        if command == "diff":
+            return self._briefing_diff(chat_id, user_id)
+
+        if command == "entities":
+            return self._show_entities(chat_id, user_id)
+
         if command == "compare":
             return self._compare_story(chat_id, user_id, args)
 
@@ -278,6 +287,182 @@ class CommunicationAgent:
             "\u2022 /help \u2014 Full command list"
         )
         return {"action": "onboard", "user_id": user_id}
+
+    def _run_sitrep(self, chat_id: int | str, user_id: str,
+                    args: str = "") -> dict[str, Any]:
+        """Generate a structured Situation Report (SITREP).
+
+        Runs the same pipeline as /briefing but renders output as a single
+        cohesive intelligence document organized by priority sections.
+        """
+        from newsfeed.intelligence.entities import build_entity_map
+
+        profile = self._engine.preferences.get_or_create(user_id)
+        topics = dict(profile.topic_weights) if profile.topic_weights else dict(self._default_topics)
+
+        prompt = args.strip() or "Generate situation report"
+        payload = self._engine.handle_request_payload(
+            user_id=user_id,
+            prompt=prompt,
+            weighted_topics=topics,
+            max_items=profile.max_items,
+        )
+
+        # Apply user filters
+        has_filters = profile.confidence_min > 0 or profile.urgency_min or profile.max_per_source > 0
+        if has_filters and payload.items:
+            payload.items = self._apply_user_filters(payload.items, profile)
+
+        # Build market ticker
+        ticker_bar = ""
+        try:
+            crypto_ids = profile.watchlist_crypto or None
+            stock_tickers = profile.watchlist_stocks or None
+            market_data = self._market.fetch_all(crypto_ids, stock_tickers)
+            all_quotes = market_data.get("crypto", []) + market_data.get("stocks", [])
+            if all_quotes:
+                ticker_bar = MarketTicker.format_ticker_bar(all_quotes)
+        except Exception:
+            log.debug("Market ticker fetch skipped", exc_info=True)
+
+        # Build entity cross-reference map
+        entity_map = build_entity_map(payload.items) if payload.items else {}
+
+        # Store items for follow-up commands
+        self._last_items[user_id] = self._engine.last_briefing_items(user_id)
+
+        # Render SITREP
+        formatter = self._engine.formatter
+        sitrep = formatter.format_sitrep(payload, entity_map, ticker_bar)
+        self._bot.send_message(chat_id, sitrep)
+
+        # Push to webhook if configured
+        self._auto_webhook_briefing(user_id, payload.items)
+
+        log.info("SITREP delivered: user=%s (%d items)", user_id, len(payload.items))
+        return {"action": "sitrep", "user_id": user_id, "items": len(payload.items)}
+
+    def _briefing_diff(self, chat_id: int | str,
+                       user_id: str) -> dict[str, Any]:
+        """Compare current briefing against the previous one holistically."""
+        from newsfeed.memory.store import extract_keywords
+
+        analytics = self._engine.analytics
+
+        # Get the two most recent briefings
+        briefings = analytics.get_user_briefings(user_id, limit=2)
+        if len(briefings) < 2:
+            self._bot.send_message(
+                chat_id,
+                "Need at least two briefings to compare. "
+                "Run /briefing again to generate a second one."
+            )
+            return {"action": "diff_insufficient", "user_id": user_id}
+
+        current_id = briefings[0].get("request_id", "")
+        previous_id = briefings[1].get("request_id", "")
+
+        # Get items from both briefings via public API
+        current_items = analytics.get_briefing_items_by_request(current_id) if current_id else []
+        previous_items = analytics.get_briefing_items_by_request(previous_id) if previous_id else []
+
+        if not current_items and not previous_items:
+            self._bot.send_message(chat_id, "No briefing item data available for comparison.")
+            return {"action": "diff_no_data", "user_id": user_id}
+
+        # Build keyword indices for matching
+        prev_kw_index: dict[str, dict] = {}
+        for item in previous_items:
+            kws = extract_keywords(item.get("title", ""))
+            key = f"{item.get('topic', '')}:{':'.join(sorted(kws))}"
+            prev_kw_index[key] = item
+
+        curr_kw_index: dict[str, dict] = {}
+        for item in current_items:
+            kws = extract_keywords(item.get("title", ""))
+            key = f"{item.get('topic', '')}:{':'.join(sorted(kws))}"
+            curr_kw_index[key] = item
+
+        # Classify changes
+        new_stories = []
+        continuing = []
+        escalated = []
+        deescalated = []
+        resolved = []
+
+        urgency_rank = {"critical": 4, "breaking": 3, "elevated": 2, "routine": 1}
+
+        for key, item in curr_kw_index.items():
+            if key in prev_kw_index:
+                prev_item = prev_kw_index[key]
+                curr_urg = urgency_rank.get(item.get("urgency", "routine"), 1)
+                prev_urg = urgency_rank.get(prev_item.get("urgency", "routine"), 1)
+                if curr_urg > prev_urg:
+                    escalated.append({
+                        **item,
+                        "reason": f"{prev_item.get('urgency', 'routine')} \u2192 {item.get('urgency', 'routine')}",
+                    })
+                elif curr_urg < prev_urg:
+                    deescalated.append(item)
+                else:
+                    continuing.append(item)
+            else:
+                new_stories.append(item)
+
+        for key, item in prev_kw_index.items():
+            if key not in curr_kw_index:
+                resolved.append(item)
+
+        # Topic shifts
+        prev_topics: dict[str, int] = {}
+        for item in previous_items:
+            t = item.get("topic", "unknown")
+            prev_topics[t] = prev_topics.get(t, 0) + 1
+
+        curr_topics: dict[str, int] = {}
+        for item in current_items:
+            t = item.get("topic", "unknown")
+            curr_topics[t] = curr_topics.get(t, 0) + 1
+
+        all_topics = set(prev_topics) | set(curr_topics)
+        topic_shifts = {
+            t: curr_topics.get(t, 0) - prev_topics.get(t, 0)
+            for t in all_topics
+            if curr_topics.get(t, 0) != prev_topics.get(t, 0)
+        }
+
+        diff_data = {
+            "new_stories": new_stories,
+            "resolved_stories": resolved,
+            "escalated": escalated,
+            "deescalated": deescalated,
+            "continuing": continuing,
+            "topic_shifts": topic_shifts,
+        }
+
+        formatter = self._engine.formatter
+        msg = formatter.format_briefing_diff(diff_data)
+        self._bot.send_message(chat_id, msg)
+        return {"action": "diff", "user_id": user_id}
+
+    def _show_entities(self, chat_id: int | str,
+                       user_id: str) -> dict[str, Any]:
+        """Show entity intelligence map across last briefing stories."""
+        from newsfeed.intelligence.entities import format_entity_dashboard
+
+        items = self._engine._last_report_items.get(user_id, [])
+        if not items:
+            self._bot.send_message(
+                chat_id,
+                "No briefing data available. Run /briefing or /sitrep first."
+            )
+            return {"action": "entities_empty", "user_id": user_id}
+
+        entity_data = format_entity_dashboard(items)
+        formatter = self._engine.formatter
+        msg = formatter.format_entity_dashboard(entity_data, items)
+        self._bot.send_message(chat_id, msg)
+        return {"action": "entities", "user_id": user_id}
 
     def _run_briefing(self, chat_id: int | str, user_id: str,
                       topic_hint: str = "", deep: bool = False) -> dict[str, Any]:
@@ -650,6 +835,8 @@ class CommunicationAgent:
             "watchlist_crypto": list(profile.watchlist_crypto),
             "watchlist_stocks": list(profile.watchlist_stocks),
             "muted_topics": list(profile.muted_topics),
+            "email": profile.email,
+            "webhook_url": profile.webhook_url,
             "confidence_min": profile.confidence_min,
             "urgency_min": profile.urgency_min,
             "max_per_source": profile.max_per_source,
@@ -2002,19 +2189,12 @@ class CommunicationAgent:
         credibility = self._engine.credibility
         profile = self._engine.preferences.get_or_create(user_id)
 
-        # Build source data list
+        # Build source data list using public API
         tier_map = {}
-        for sid in credibility._tier1_sources:
-            tier_map[sid] = "tier_1"
-        for sid in credibility._tier1b_sources:
-            tier_map[sid] = "tier_1b"
-        for sid in credibility._academic_sources:
-            tier_map[sid] = "tier_academic"
-        for sid in credibility._tier2_sources:
-            tier_map[sid] = "tier_2"
-
-        # Get all known sources (initialized + tracked)
-        all_source_ids = set(tier_map.keys()) | set(credibility._sources.keys())
+        for tier_name, source_ids in credibility.get_all_sources_by_tier().items():
+            for sid in source_ids:
+                tier_map[sid] = tier_name
+        all_source_ids = set(tier_map.keys())
 
         sources_data: list[dict] = []
         for sid in sorted(all_source_ids):

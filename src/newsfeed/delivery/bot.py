@@ -47,6 +47,9 @@ BOT_COMMANDS = [
     {"command": "unmute", "description": "Unmute a topic (e.g. /unmute crypto)"},
     {"command": "tracked", "description": "View stories you're tracking"},
     {"command": "untrack", "description": "Stop tracking a story (e.g. /untrack 1)"},
+    {"command": "sitrep", "description": "Situation Report \u2014 single-document intelligence summary"},
+    {"command": "diff", "description": "Compare current briefing vs previous briefing"},
+    {"command": "entities", "description": "Key people, orgs, and countries across stories"},
     {"command": "compare", "description": "Compare sources on a story (e.g. /compare 2)"},
     {"command": "recall", "description": "Search past briefings (e.g. /recall AI regulation)"},
     {"command": "insights", "description": "View your preference profile and auto-adjustments"},
@@ -482,6 +485,18 @@ class TelegramBot:
         if presets:
             lines.append("")
             lines.append(f"<b>Saved Presets:</b> {', '.join(presets.keys())}")
+
+        # Delivery channels
+        email = profile.get("email", "")
+        webhook = profile.get("webhook_url", "")
+        if email or webhook:
+            lines.append("")
+            lines.append("<b>Delivery Channels:</b>")
+            lines.append(f"  Telegram: active")
+            if email:
+                lines.append(f"  Email: {email}")
+            if webhook:
+                lines.append(f"  Webhook: {webhook[:50]}...")
 
         crypto = profile.get("watchlist_crypto", [])
         stocks = profile.get("watchlist_stocks", [])

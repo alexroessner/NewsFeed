@@ -188,10 +188,12 @@ class PreferenceStore:
             "max_per_source": profile.max_per_source,
             "muted_topics": list(profile.muted_topics),
         }
-        # Cap at 10 presets
-        if len(profile.presets) > 10:
-            oldest = next(iter(profile.presets))
-            del profile.presets[oldest]
+        # Cap at 10 presets — evict oldest (first inserted) if over limit
+        while len(profile.presets) > 10:
+            first_key = next(iter(profile.presets), None)
+            if first_key is None:
+                break
+            del profile.presets[first_key]
         return profile
 
     def load_preset(self, user_id: str, name: str) -> UserProfile | None:
@@ -200,16 +202,16 @@ class PreferenceStore:
         preset = profile.presets.get(name)
         if not preset:
             return None
-        profile.topic_weights = dict(preset.get("topic_weights", {}))
-        profile.source_weights = dict(preset.get("source_weights", {}))
-        profile.tone = preset.get("tone", "concise")
-        profile.format = preset.get("format", "bullet")
-        profile.max_items = preset.get("max_items", 10)
-        profile.regions_of_interest = list(preset.get("regions", []))
-        profile.confidence_min = preset.get("confidence_min", 0.0)
-        profile.urgency_min = preset.get("urgency_min", "")
-        profile.max_per_source = preset.get("max_per_source", 0)
-        profile.muted_topics = list(preset.get("muted_topics", []))
+        profile.topic_weights = dict(preset.get("topic_weights") or {})
+        profile.source_weights = dict(preset.get("source_weights") or {})
+        profile.tone = str(preset.get("tone") or "concise")
+        profile.format = str(preset.get("format") or "bullet")
+        profile.max_items = int(preset.get("max_items") or 10)
+        profile.regions_of_interest = list(preset.get("regions") or [])
+        profile.confidence_min = float(preset.get("confidence_min") or 0.0)
+        profile.urgency_min = str(preset.get("urgency_min") or "")
+        profile.max_per_source = int(preset.get("max_per_source") or 0)
+        profile.muted_topics = list(preset.get("muted_topics") or [])
         return profile
 
     def delete_preset(self, user_id: str, name: str) -> bool:
