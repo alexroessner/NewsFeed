@@ -1786,6 +1786,10 @@ class CommunicationAgent:
             )
             return {"action": "email_show", "user_id": user_id}
 
+        # Security: reject CRLF injection and enforce length cap
+        if any(c in email for c in ("\r", "\n", "\x00")) or len(email) > 254:
+            self._bot.send_message(chat_id, "That doesn't look like a valid email address.")
+            return {"action": "email_invalid", "user_id": user_id}
         # Basic email validation
         if not re_mod.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
             self._bot.send_message(chat_id, "That doesn't look like a valid email address.")
@@ -2427,7 +2431,10 @@ class CommunicationAgent:
             if not name:
                 self._bot.send_message(chat_id, "Usage: /preset save [name]")
                 return {"action": "preset_save_help", "user_id": user_id}
-            self._engine.preferences.save_preset(user_id, name)
+            _, preset_err = self._engine.preferences.save_preset(user_id, name)
+            if preset_err:
+                self._bot.send_message(chat_id, preset_err)
+                return {"action": "preset_save_error", "user_id": user_id}
             self._persist_prefs()
             self._bot.send_message(
                 chat_id,

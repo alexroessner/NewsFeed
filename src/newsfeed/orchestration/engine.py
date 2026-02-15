@@ -750,11 +750,15 @@ class NewsFeedEngine:
                 self.preferences.apply_max_items(user_id, int(cmd.value))
                 results["max_items"] = cmd.value
             elif cmd.action == "source_boost" and cmd.topic:
-                self.preferences.apply_source_weight(user_id, cmd.topic, 1.0)
+                _, src_hint = self.preferences.apply_source_weight(user_id, cmd.topic, 1.0)
                 results[f"source:{cmd.topic}"] = "boosted"
+                if src_hint:
+                    results[f"hint:{cmd.topic}"] = src_hint
             elif cmd.action == "source_demote" and cmd.topic:
-                self.preferences.apply_source_weight(user_id, cmd.topic, -1.0)
+                _, src_hint = self.preferences.apply_source_weight(user_id, cmd.topic, -1.0)
                 results[f"source:{cmd.topic}"] = "demoted"
+                if src_hint:
+                    results[f"hint:{cmd.topic}"] = src_hint
             elif cmd.action == "remove_region" and cmd.value:
                 self.preferences.remove_region(user_id, cmd.value)
                 results["remove_region"] = cmd.value
