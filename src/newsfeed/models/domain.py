@@ -98,6 +98,14 @@ class UserProfile:
     bookmarks: list[dict[str, Any]] = field(default_factory=list)
     # Email address for email digest delivery
     email: str = ""
+    # Advanced briefing filters — user-controllable thresholds
+    # confidence_min: only show stories with confidence.mid >= this (0.0 = off)
+    confidence_min: float = 0.0
+    # urgency_min: only show stories at or above this urgency level
+    # "routine", "elevated", "breaking", "critical" (empty = off)
+    urgency_min: str = ""
+    # max_per_source: limit stories from a single source (0 = no limit)
+    max_per_source: int = 0
 
 
 @dataclass(slots=True)
