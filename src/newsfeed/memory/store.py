@@ -110,14 +110,28 @@ class PreferenceStore:
 
     MAX_WEIGHTS = 100  # Max distinct topic/source weight entries per user
 
-    def apply_weight_adjustment(self, user_id: str, topic: str, delta: float) -> UserProfile:
+    def apply_weight_adjustment(self, user_id: str, topic: str,
+                               delta: float) -> tuple[UserProfile, str]:
+        """Apply a weight delta to a topic.
+
+        Returns (profile, hint) where hint is a user-facing message if
+        the cap was hit or the weight saturated, or empty string otherwise.
+        """
         profile = self.get_or_create(user_id)
         current = profile.topic_weights.get(topic, 0.0)
         # Reject new entries if at cap (updates to existing keys are always allowed)
         if topic not in profile.topic_weights and len(profile.topic_weights) >= self.MAX_WEIGHTS:
-            return profile
-        profile.topic_weights[topic] = round(max(min(current + delta, 1.0), -1.0), 3)
-        return profile
+            return profile, (
+                f"You've reached the {self.MAX_WEIGHTS}-topic limit. "
+                f"Use /feedback reset preferences or reduce an existing topic to add new ones."
+            )
+        new_val = round(max(min(current + delta, 1.0), -1.0), 3)
+        profile.topic_weights[topic] = new_val
+        hint = ""
+        if new_val == current:
+            direction = "maximum" if delta > 0 else "minimum"
+            hint = f'Topic "{topic.replace("_", " ")}" is already at {direction} weight ({new_val}).'
+        return profile, hint
 
     def apply_style_update(self, user_id: str, tone: str | None = None, fmt: str | None = None) -> UserProfile:
         profile = self.get_or_create(user_id)
