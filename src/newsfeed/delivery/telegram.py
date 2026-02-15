@@ -43,12 +43,21 @@ def _esc(text: str) -> str:
     return html.escape(text, quote=False)
 
 
+_SAFE_URL_SCHEMES = frozenset({"http", "https", "ftp"})
+
+
 def _esc_url(url: str) -> str:
     """Escape a URL for use inside an href attribute.
 
     Only escapes quotes and angle brackets — ampersands must stay literal
     so URL query parameters work (Telegram's HTML parser handles this).
+
+    SECURITY: Rejects javascript:, data:, and other dangerous URI schemes
+    that could arrive via malicious RSS feed entries.
     """
+    scheme = url.split(":", 1)[0].lower().strip() if ":" in url else ""
+    if scheme not in _SAFE_URL_SCHEMES:
+        return ""
     return url.replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;")
 
 
@@ -350,12 +359,12 @@ class TelegramFormatter:
 
         if c.regions:
             meta_parts.append(
-                ", ".join(_format_region(r) for r in c.regions[:4])
+                ", ".join(_esc(_format_region(r)) for r in c.regions[:4])
             )
 
         if c.corroborated_by:
             meta_parts.append(
-                f"Verified by {', '.join(c.corroborated_by[:3])}"
+                f"Verified by {', '.join(_esc(s) for s in c.corroborated_by[:3])}"
             )
 
         if meta_parts:
@@ -403,7 +412,7 @@ class TelegramFormatter:
             sorted_topics = sorted(topic_weights.items(), key=lambda x: x[1], reverse=True)
             topic_strs = []
             for topic, weight in sorted_topics:
-                name = topic.replace("_", " ").title()
+                name = _esc(topic.replace("_", " ").title())
                 topic_strs.append(f"{name} ({weight:.0%})")
             lines.append(", ".join(topic_strs))
 
@@ -412,7 +421,7 @@ class TelegramFormatter:
             lines.append("<b>Source Preferences</b>")
             for src, sw in sorted(source_weights.items(), key=lambda x: -x[1]):
                 label = "\u2191" if sw > 0 else "\u2193"
-                lines.append(f"  {src}: {label} {sw:+.1f}")
+                lines.append(f"  {_esc(src)}: {label} {sw:+.1f}")
 
         lines.append("")
         lines.append("<i>Adjust: /feedback more [topic] or less [topic]</i>")
@@ -570,7 +579,7 @@ class TelegramFormatter:
             # Title line
             tracked_mark = " [TRACKED]" if is_tracked else ""
             delta_mark = f" [{tag.upper()}]" if tag else ""
-            if c.url and not c.url.startswith("https://example.com"):
+            if c.url and not c.url.startswith("https://example.com") and _esc_url(c.url):
                 lines.append(f"### {idx + 1}. [{c.title}]({c.url}){tracked_mark}{delta_mark}")
             else:
                 lines.append(f"### {idx + 1}. {c.title}{tracked_mark}{delta_mark}")
@@ -1324,9 +1333,9 @@ class TelegramFormatter:
         if conf:
             meta.append(conf)
         if c.corroborated_by:
-            meta.append(f"Corr: {', '.join(c.corroborated_by[:2])}")
+            meta.append(f"Corr: {', '.join(_esc(s) for s in c.corroborated_by[:2])}")
         if c.regions:
-            meta.append(", ".join(_format_region(r) for r in c.regions[:2]))
+            meta.append(", ".join(_esc(_format_region(r)) for r in c.regions[:2]))
         if meta:
             meta_str = " \u00b7 ".join(meta)
             entry_lines.append(f"    <i>{meta_str}</i>")
@@ -1370,7 +1379,7 @@ class TelegramFormatter:
                 topic = story.get("topic", "").replace("_", " ")
                 lines.append(f"  + <b>{title}</b> <i>[{_esc(source)}]</i>")
                 if topic:
-                    lines.append(f"    <i>{topic}</i>")
+                    lines.append(f"    <i>{_esc(topic)}</i>")
 
         # Escalated
         if escalated:
@@ -1405,7 +1414,7 @@ class TelegramFormatter:
             for topic, change in sorted(topic_shifts.items(),
                                         key=lambda x: abs(x[1]), reverse=True)[:5]:
                 arrow = "\u2191" if change > 0 else "\u2193"
-                label = topic.replace("_", " ").title()
+                label = _esc(topic.replace("_", " ").title())
                 lines.append(f"  {arrow} {label}: {change:+d} stories")
 
         # Continuing stories
@@ -1449,7 +1458,7 @@ class TelegramFormatter:
                     f"  \u2022 <b>{_esc(name)}</b> \u2192 stories {refs}"
                 )
                 if topic:
-                    lines.append(f"    <i>{topic}</i>")
+                    lines.append(f"    <i>{_esc(topic)}</i>")
             lines.append("")
 
         # Organizations

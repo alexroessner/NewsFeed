@@ -12,6 +12,7 @@ Features:
 """
 from __future__ import annotations
 
+import html as html_mod
 import json
 import logging
 import time
@@ -436,7 +437,7 @@ class TelegramBot:
             for topic, weight in sorted(topics.items(), key=lambda x: x[1], reverse=True):
                 bar = "\u2588" * max(1, int(abs(weight) * 10))
                 sign = "+" if weight > 0 else ""
-                lines.append(f"  {topic}: {sign}{weight:.1f} {bar}")
+                lines.append(f"  {html_mod.escape(topic)}: {sign}{weight:.1f} {bar}")
 
         source_weights = profile.get("source_weights", {})
         if source_weights:
@@ -444,16 +445,16 @@ class TelegramBot:
             lines.append("<b>Source Preferences:</b>")
             for src, sw in sorted(source_weights.items(), key=lambda x: -x[1]):
                 label = "boosted" if sw > 0 else "demoted"
-                lines.append(f"  {src}: {label} ({sw:+.1f})")
+                lines.append(f"  {html_mod.escape(src)}: {label} ({sw:+.1f})")
 
         regions = profile.get("regions", [])
         if regions:
             lines.append("")
-            lines.append(f"<b>Regions:</b> {', '.join(regions)}")
+            lines.append(f"<b>Regions:</b> {', '.join(html_mod.escape(r) for r in regions)}")
 
         muted = profile.get("muted_topics", [])
         if muted:
-            lines.append(f"<b>Muted:</b> {', '.join(muted)}")
+            lines.append(f"<b>Muted:</b> {', '.join(html_mod.escape(m) for m in muted)}")
 
         # Advanced filters
         conf_min = profile.get("confidence_min", 0)
@@ -484,7 +485,7 @@ class TelegramBot:
         presets = profile.get("presets", {})
         if presets:
             lines.append("")
-            lines.append(f"<b>Saved Presets:</b> {', '.join(presets.keys())}")
+            lines.append(f"<b>Saved Presets:</b> {', '.join(html_mod.escape(k) for k in presets.keys())}")
 
         # Delivery channels
         email = profile.get("email", "")
@@ -494,9 +495,9 @@ class TelegramBot:
             lines.append("<b>Delivery Channels:</b>")
             lines.append(f"  Telegram: active")
             if email:
-                lines.append(f"  Email: {email}")
+                lines.append(f"  Email: {html_mod.escape(email)}")
             if webhook:
-                lines.append(f"  Webhook: {webhook[:50]}...")
+                lines.append(f"  Webhook: {html_mod.escape(webhook[:50])}...")
 
         crypto = profile.get("watchlist_crypto", [])
         stocks = profile.get("watchlist_stocks", [])
@@ -504,9 +505,9 @@ class TelegramBot:
             lines.append("")
             lines.append("<b>Market Watchlist:</b>")
             if crypto:
-                lines.append(f"  Crypto: {', '.join(c.upper() for c in crypto)}")
+                lines.append(f"  Crypto: {html_mod.escape(', '.join(c.upper() for c in crypto))}")
             if stocks:
-                lines.append(f"  Stocks: {', '.join(stocks)}")
+                lines.append(f"  Stocks: {html_mod.escape(', '.join(stocks))}")
 
         return "\n".join(lines)
 
