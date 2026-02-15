@@ -472,7 +472,7 @@ class NewsFeedEngine:
         # Pipeline trace metadata — powers /transparency command
         pipeline_trace = {
             "total_candidates_researched": len(all_candidates),
-            "valid_candidates": len(valid_candidates) if 'valid_candidates' in dir() else len(all_candidates),
+            "valid_candidates": len(valid_candidates),
             "research_time_ms": round(research_ms),
             "intelligence_time_ms": round(intel_ms),
             "expert_time_ms": round(expert_ms),
