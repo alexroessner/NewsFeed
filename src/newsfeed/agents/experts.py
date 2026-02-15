@@ -343,9 +343,20 @@ class ExpertCouncil:
             # Try to extract JSON from response
             parsed = self._parse_llm_json(content)
 
-            keep = parsed.get("keep", True)
-            confidence = min(self.confidence_max,
-                             max(self.confidence_min, float(parsed.get("confidence", 0.7))))
+            # Robust boolean parsing — LLM may return "false"/"true" as strings
+            raw_keep = parsed.get("keep", True)
+            if isinstance(raw_keep, str):
+                keep = raw_keep.lower() not in ("false", "0", "no", "n")
+            else:
+                keep = bool(raw_keep)
+            # Guard against NaN/Infinity from malformed LLM output
+            try:
+                raw_conf = float(parsed.get("confidence", 0.7))
+                if not math.isfinite(raw_conf):
+                    raw_conf = 0.7
+            except (ValueError, TypeError):
+                raw_conf = 0.7
+            confidence = min(self.confidence_max, max(self.confidence_min, raw_conf))
             rationale = parsed.get("rationale", "LLM evaluation complete.")
             risk_note = parsed.get("risk_note", "Assessment based on available signals.")
 
@@ -377,8 +388,8 @@ class ExpertCouncil:
                 return json.loads(match.group(1))
             except json.JSONDecodeError:
                 pass
-        # Try finding JSON object
-        match = re.search(r"\{.*\}", text, re.DOTALL)
+        # Try finding JSON object (non-greedy to avoid matching too much)
+        match = re.search(r"\{.*?\}", text, re.DOTALL)
         if match:
             try:
                 return json.loads(match.group(0))
