@@ -49,9 +49,14 @@ class PreferenceStore:
             self._profiles[user_id] = UserProfile(user_id=user_id)
         return self._profiles[user_id]
 
+    _MAX_WEIGHTS = 100  # Max distinct topic/source weight entries per user
+
     def apply_weight_adjustment(self, user_id: str, topic: str, delta: float) -> UserProfile:
         profile = self.get_or_create(user_id)
         current = profile.topic_weights.get(topic, 0.0)
+        # Reject new entries if at cap (updates to existing keys are always allowed)
+        if topic not in profile.topic_weights and len(profile.topic_weights) >= self._MAX_WEIGHTS:
+            return profile
         profile.topic_weights[topic] = round(max(min(current + delta, 1.0), -1.0), 3)
         return profile
 
@@ -82,6 +87,8 @@ class PreferenceStore:
     def apply_source_weight(self, user_id: str, source: str, delta: float) -> UserProfile:
         profile = self.get_or_create(user_id)
         current = profile.source_weights.get(source, 0.0)
+        if source not in profile.source_weights and len(profile.source_weights) >= self._MAX_WEIGHTS:
+            return profile
         profile.source_weights[source] = round(max(min(current + delta, 2.0), -2.0), 3)
         return profile
 
@@ -91,13 +98,15 @@ class PreferenceStore:
             profile.regions_of_interest.remove(region)
         return profile
 
+    _MAX_WATCHLIST_SIZE = 50  # Prevent resource exhaustion via unbounded lists
+
     def set_watchlist(self, user_id: str, crypto: list[str] | None = None,
                      stocks: list[str] | None = None) -> UserProfile:
         profile = self.get_or_create(user_id)
         if crypto is not None:
-            profile.watchlist_crypto = crypto
+            profile.watchlist_crypto = crypto[:self._MAX_WATCHLIST_SIZE]
         if stocks is not None:
-            profile.watchlist_stocks = stocks
+            profile.watchlist_stocks = stocks[:self._MAX_WATCHLIST_SIZE]
         return profile
 
     def set_timezone(self, user_id: str, tz: str) -> UserProfile:
@@ -105,9 +114,13 @@ class PreferenceStore:
         profile.timezone = tz
         return profile
 
+    _MAX_MUTED_TOPICS = 50
+
     def mute_topic(self, user_id: str, topic: str) -> UserProfile:
         profile = self.get_or_create(user_id)
         if topic not in profile.muted_topics:
+            if len(profile.muted_topics) >= self._MAX_MUTED_TOPICS:
+                return profile
             profile.muted_topics.append(topic)
         return profile
 

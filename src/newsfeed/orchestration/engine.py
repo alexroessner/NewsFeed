@@ -635,18 +635,22 @@ class NewsFeedEngine:
         """Return cached candidates the user hasn't seen yet."""
         return self.cache.get_more(user_id=user_id, topic=topic, already_seen_ids=already_seen_ids, limit=limit)
 
-    def apply_user_feedback(self, user_id: str, feedback_text: str) -> dict[str, str]:
+    def apply_user_feedback(self, user_id: str, feedback_text: str,
+                            is_admin: bool = False) -> dict[str, str]:
         log.info("Feedback from user=%s: %r", user_id, feedback_text[:80])
         results: dict[str, str] = {}
 
-        # First: try universal configurator for system-level changes
-        config_changes = self.configurator.parse_and_apply(feedback_text)
-        for change in config_changes:
-            results[change.path] = str(change.new_value)
-            self.audit.record_config_change(
-                f"feedback-{user_id}", change.path,
-                change.old_value, change.new_value, "user_command",
-            )
+        # SECURITY: System-level configuration changes are admin-only.
+        # The configurator modifies global pipeline settings (scoring weights,
+        # pipeline stages, expert behavior) that affect ALL users.
+        if is_admin:
+            config_changes = self.configurator.parse_and_apply(feedback_text)
+            for change in config_changes:
+                results[change.path] = str(change.new_value)
+                self.audit.record_config_change(
+                    f"feedback-{user_id}", change.path,
+                    change.old_value, change.new_value, "user_command",
+                )
 
         # Then: preference commands for user-level changes
         commands = parse_preference_commands(feedback_text, deltas=self._preference_deltas)
