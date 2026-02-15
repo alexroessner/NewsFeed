@@ -1609,7 +1609,8 @@ class CommunicationAgent:
         # Validate and set URL
         valid, error = validate_webhook_url(url)
         if not valid:
-            self._bot.send_message(chat_id, f"Invalid webhook URL: {error}")
+            import html as html_mod
+            self._bot.send_message(chat_id, f"Invalid webhook URL: {html_mod.escape(error)}")
             return {"action": "webhook_invalid", "user_id": user_id}
 
         profile.webhook_url = url

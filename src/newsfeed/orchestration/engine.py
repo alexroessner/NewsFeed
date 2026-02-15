@@ -760,58 +760,94 @@ class NewsFeedEngine:
         self._persistence.save("optimizer", self.optimizer.snapshot())
         self._persistence.save("debate_chair", self.experts.chair.snapshot())
 
+    # Allowed values for validated string fields on restore
+    _VALID_TONES = frozenset({"concise", "detailed", "analytical", "casual"})
+    _VALID_FORMATS = frozenset({"bullet", "narrative", "brief", "detailed"})
+    _VALID_CADENCES = frozenset({"on_demand", "hourly", "daily", "weekly"})
+    _VALID_URGENCIES = frozenset({"", "routine", "elevated", "breaking", "critical"})
+
     def _load_state(self) -> None:
-        """Restore persisted state from disk on startup."""
+        """Restore persisted state from disk on startup.
+
+        SECURITY: All values are re-validated against the same bounds
+        enforced by setter methods.  A tampered persistence file cannot
+        bypass caps or inject invalid data.
+        """
         if not self._persistence:
             return
+
+        _MAX_WEIGHTS = self.preferences._MAX_WEIGHTS
+        _MAX_WATCHLIST = self.preferences._MAX_WATCHLIST_SIZE
+        _MAX_MUTED = self.preferences._MAX_MUTED_TOPICS
 
         # Restore user preferences
         prefs_data = self._persistence.load("preferences")
         if prefs_data and isinstance(prefs_data, dict):
             for uid, pdata in prefs_data.items():
                 profile = self.preferences.get_or_create(uid)
+
+                # topic_weights: clamp values to [-1, 1], cap total entries
                 if isinstance(pdata.get("topic_weights"), dict):
-                    profile.topic_weights.update(pdata["topic_weights"])
+                    tw = pdata["topic_weights"]
+                    for k, v in list(tw.items())[:_MAX_WEIGHTS]:
+                        profile.topic_weights[str(k)] = round(max(-1.0, min(1.0, float(v))), 3)
+
+                # source_weights: clamp values to [-2, 2], cap total entries
                 if isinstance(pdata.get("source_weights"), dict):
-                    profile.source_weights.update(pdata["source_weights"])
-                if pdata.get("tone"):
+                    sw = pdata["source_weights"]
+                    for k, v in list(sw.items())[:_MAX_WEIGHTS]:
+                        profile.source_weights[str(k)] = round(max(-2.0, min(2.0, float(v))), 3)
+
+                if pdata.get("tone") in self._VALID_TONES:
                     profile.tone = pdata["tone"]
-                if pdata.get("format"):
+                if pdata.get("format") in self._VALID_FORMATS:
                     profile.format = pdata["format"]
                 if pdata.get("max_items"):
-                    profile.max_items = int(pdata["max_items"])
-                if pdata.get("cadence"):
+                    profile.max_items = max(1, min(int(pdata["max_items"]), 50))
+                if pdata.get("cadence") in self._VALID_CADENCES:
                     profile.briefing_cadence = pdata["cadence"]
                 if isinstance(pdata.get("regions"), list):
-                    profile.regions_of_interest = list(pdata["regions"])
+                    profile.regions_of_interest = [str(r) for r in pdata["regions"][:20]]
                 if isinstance(pdata.get("watchlist_crypto"), list):
-                    profile.watchlist_crypto = list(pdata["watchlist_crypto"])
+                    profile.watchlist_crypto = [str(c) for c in pdata["watchlist_crypto"][:_MAX_WATCHLIST]]
                 if isinstance(pdata.get("watchlist_stocks"), list):
-                    profile.watchlist_stocks = list(pdata["watchlist_stocks"])
+                    profile.watchlist_stocks = [str(s) for s in pdata["watchlist_stocks"][:_MAX_WATCHLIST]]
                 if pdata.get("timezone"):
-                    profile.timezone = pdata["timezone"]
+                    tz = str(pdata["timezone"])[:40]
+                    profile.timezone = tz
                 if isinstance(pdata.get("muted_topics"), list):
-                    profile.muted_topics = list(pdata["muted_topics"])
+                    profile.muted_topics = [str(t) for t in pdata["muted_topics"][:_MAX_MUTED]]
                 if isinstance(pdata.get("tracked_stories"), list):
-                    profile.tracked_stories = list(pdata["tracked_stories"])
+                    profile.tracked_stories = list(pdata["tracked_stories"][:20])
                 if isinstance(pdata.get("bookmarks"), list):
-                    profile.bookmarks = list(pdata["bookmarks"])
+                    profile.bookmarks = list(pdata["bookmarks"][:50])
                 if pdata.get("email"):
-                    profile.email = pdata["email"]
+                    email = str(pdata["email"]).strip()
+                    # Block newlines (header injection) and require basic format
+                    if "\n" not in email and "\r" not in email and "@" in email and len(email) <= 254:
+                        profile.email = email
                 if pdata.get("confidence_min"):
-                    profile.confidence_min = float(pdata["confidence_min"])
+                    profile.confidence_min = max(0.0, min(float(pdata["confidence_min"]), 1.0))
                 if pdata.get("urgency_min"):
-                    profile.urgency_min = str(pdata["urgency_min"])
+                    val = str(pdata["urgency_min"]).lower()
+                    if val in self._VALID_URGENCIES:
+                        profile.urgency_min = val
                 if pdata.get("max_per_source"):
-                    profile.max_per_source = int(pdata["max_per_source"])
+                    profile.max_per_source = max(0, min(int(pdata["max_per_source"]), 10))
                 if pdata.get("alert_georisk_threshold"):
-                    profile.alert_georisk_threshold = float(pdata["alert_georisk_threshold"])
+                    profile.alert_georisk_threshold = max(0.1, min(float(pdata["alert_georisk_threshold"]), 1.0))
                 if pdata.get("alert_trend_threshold"):
-                    profile.alert_trend_threshold = float(pdata["alert_trend_threshold"])
+                    profile.alert_trend_threshold = max(1.5, min(float(pdata["alert_trend_threshold"]), 10.0))
                 if isinstance(pdata.get("presets"), dict):
-                    profile.presets = dict(pdata["presets"])
+                    # Cap at 10 presets
+                    presets = dict(list(pdata["presets"].items())[:10])
+                    profile.presets = presets
                 if pdata.get("webhook_url"):
-                    profile.webhook_url = str(pdata["webhook_url"])
+                    from newsfeed.delivery.webhook import validate_webhook_url
+                    url = str(pdata["webhook_url"])
+                    valid, _ = validate_webhook_url(url)
+                    if valid:
+                        profile.webhook_url = url
             log.info("Restored preferences for %d users from disk", len(prefs_data))
 
         log.info("State loaded from %s", self._persistence.state_dir)

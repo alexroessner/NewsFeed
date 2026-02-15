@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import html
 import logging
+import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -133,8 +134,8 @@ class BBCAgent(ResearchAgent):
             if not title:
                 continue
 
-            title = html.unescape(title)
-            summary = html.unescape(summary)
+            title = html.unescape(self._strip_html(title))
+            summary = html.unescape(self._strip_html(summary))
 
             created_at = datetime.now(timezone.utc)
             if pub_date_el is not None and pub_date_el.text:
@@ -171,3 +172,7 @@ class BBCAgent(ResearchAgent):
             ))
 
         return candidates
+
+    @staticmethod
+    def _strip_html(text: str) -> str:
+        return re.sub(r"<[^>]+>", "", text).strip()
