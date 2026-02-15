@@ -362,20 +362,9 @@ class CommunicationAgent:
         current_id = briefings[0].get("request_id", "")
         previous_id = briefings[1].get("request_id", "")
 
-        # Get items from both briefings
-        current_items = analytics._query(
-            """SELECT title, source, topic, url, summary, urgency
-               FROM briefing_items WHERE request_id = ?
-               ORDER BY item_index""",
-            (current_id,),
-        ) if current_id else []
-
-        previous_items = analytics._query(
-            """SELECT title, source, topic, url, summary, urgency
-               FROM briefing_items WHERE request_id = ?
-               ORDER BY item_index""",
-            (previous_id,),
-        ) if previous_id else []
+        # Get items from both briefings via public API
+        current_items = analytics.get_briefing_items_by_request(current_id) if current_id else []
+        previous_items = analytics.get_briefing_items_by_request(previous_id) if previous_id else []
 
         if not current_items and not previous_items:
             self._bot.send_message(chat_id, "No briefing item data available for comparison.")
@@ -846,6 +835,8 @@ class CommunicationAgent:
             "watchlist_crypto": list(profile.watchlist_crypto),
             "watchlist_stocks": list(profile.watchlist_stocks),
             "muted_topics": list(profile.muted_topics),
+            "email": profile.email,
+            "webhook_url": profile.webhook_url,
             "confidence_min": profile.confidence_min,
             "urgency_min": profile.urgency_min,
             "max_per_source": profile.max_per_source,
@@ -2198,19 +2189,12 @@ class CommunicationAgent:
         credibility = self._engine.credibility
         profile = self._engine.preferences.get_or_create(user_id)
 
-        # Build source data list
+        # Build source data list using public API
         tier_map = {}
-        for sid in credibility._tier1_sources:
-            tier_map[sid] = "tier_1"
-        for sid in credibility._tier1b_sources:
-            tier_map[sid] = "tier_1b"
-        for sid in credibility._academic_sources:
-            tier_map[sid] = "tier_academic"
-        for sid in credibility._tier2_sources:
-            tier_map[sid] = "tier_2"
-
-        # Get all known sources (initialized + tracked)
-        all_source_ids = set(tier_map.keys()) | set(credibility._sources.keys())
+        for tier_name, source_ids in credibility.get_all_sources_by_tier().items():
+            for sid in source_ids:
+                tier_map[sid] = tier_name
+        all_source_ids = set(tier_map.keys())
 
         sources_data: list[dict] = []
         for sid in sorted(all_source_ids):

@@ -486,6 +486,18 @@ class TelegramBot:
             lines.append("")
             lines.append(f"<b>Saved Presets:</b> {', '.join(presets.keys())}")
 
+        # Delivery channels
+        email = profile.get("email", "")
+        webhook = profile.get("webhook_url", "")
+        if email or webhook:
+            lines.append("")
+            lines.append("<b>Delivery Channels:</b>")
+            lines.append(f"  Telegram: active")
+            if email:
+                lines.append(f"  Email: {email}")
+            if webhook:
+                lines.append(f"  Webhook: {webhook[:50]}...")
+
         crypto = profile.get("watchlist_crypto", [])
         stocks = profile.get("watchlist_stocks", [])
         if crypto or stocks:
