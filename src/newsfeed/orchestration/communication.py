@@ -223,6 +223,9 @@ class CommunicationAgent:
         if command == "digest":
             return self._send_email_digest(chat_id, user_id)
 
+        if command == "filter":
+            return self._set_filter(chat_id, user_id, args)
+
         if command == "reset":
             self._engine.preferences.reset(user_id)
             self._engine.apply_user_feedback(user_id, "reset preferences")
@@ -249,13 +252,18 @@ class CommunicationAgent:
             "Personalized news briefings from 23+ sources "
             "across geopolitics, AI, technology, markets, and more.\n\n"
             "<b>Quick start:</b>\n"
-            "\u2022 /briefing \u2014 Get your first briefing\n"
-            "\u2022 /topics \u2014 See topics and weights\n"
-            "\u2022 /watchlist crypto BTC ETH \u2014 Set market tickers\n"
-            "\u2022 /feedback more AI, less crypto \u2014 Customize\n"
-            "\u2022 /schedule morning 08:00 \u2014 Set daily delivery\n"
-            "\u2022 /help \u2014 Full command list\n\n"
-            "Send any text to give feedback (e.g. \"more geopolitics\")."
+            "\u2022 /briefing \u2014 Full intelligence briefing\n"
+            "\u2022 /quick \u2014 Fast headlines-only scan\n"
+            "\u2022 /schedule morning 08:00 \u2014 Daily delivery\n\n"
+            "<b>Just ask me anything:</b>\n"
+            "\u2022 \"What's happening with AI?\"\n"
+            "\u2022 \"Show me geopolitics news\"\n"
+            "\u2022 \"What's trending?\"\n\n"
+            "<b>Customize:</b>\n"
+            "\u2022 Type \"more AI, less crypto\" to adjust\n"
+            "\u2022 /filter confidence 0.7 \u2014 Quality filter\n"
+            "\u2022 /watchlist crypto BTC ETH \u2014 Market tickers\n"
+            "\u2022 /help \u2014 Full command list"
         )
         return {"action": "onboard", "user_id": user_id}
 
@@ -285,6 +293,15 @@ class CommunicationAgent:
             weighted_topics=topics,
             max_items=max_items,
         )
+
+        # Apply user-configured advanced filters
+        has_filters = profile.confidence_min > 0 or profile.urgency_min or profile.max_per_source > 0
+        if has_filters and payload.items:
+            pre_count = len(payload.items)
+            payload.items = self._apply_user_filters(payload.items, profile)
+            filtered_out = pre_count - len(payload.items)
+            if filtered_out:
+                log.info("User filters removed %d/%d items for user=%s", filtered_out, pre_count, user_id)
 
         # Build market ticker bar
         ticker_bar = ""
@@ -382,25 +399,98 @@ class CommunicationAgent:
         self._bot.send_message(chat_id, f"Searching for more on {topic}...")
         return self._run_briefing(chat_id, user_id, topic_hint=topic)
 
+    def _detect_intent(self, text: str) -> tuple[str, str]:
+        """Detect conversational intent from natural language text.
+
+        Returns (intent, argument) where intent is one of:
+        - "briefing_query": user wants news on a topic ("what's happening with AI?")
+        - "trending": user asks about trends ("what's trending?")
+        - "status_query": user asks about system status
+        - "help_query": user asks for help
+        - "search_query": user wants to find past stories
+        - "preference": standard preference adjustment (more/less/tone)
+        - "unknown": no recognizable intent
+        """
+        import re as re_mod
+        lower = text.lower().strip()
+
+        # Trending / what's hot
+        if re_mod.search(r"\b(what'?s\s+trending|trending|what'?s\s+hot|hot\s+topics?)\b", lower):
+            return ("trending", "")
+
+        # Briefing query — "what's happening with X", "show me X news", "tell me about X"
+        m = re_mod.search(
+            r"\b(?:what'?s\s+happening\s+(?:with|in)\s+|"
+            r"show\s+(?:me\s+)?(?:the\s+)?(?:latest\s+)?|"
+            r"tell\s+me\s+about\s+|"
+            r"(?:any\s+)?news\s+(?:on|about)\s+|"
+            r"brief\s+me\s+on\s+|"
+            r"update\s+(?:me\s+)?on\s+)"
+            r"(.+?)(?:[?.!]|$)", lower
+        )
+        if m:
+            topic = m.group(1).strip().rstrip("?.! ")
+            return ("briefing_query", topic)
+
+        # Search/recall — "find stories about X", "search for X"
+        m = re_mod.search(
+            r"\b(?:find|search|look\s+up|recall)\s+(?:stories?\s+)?(?:about|for|on)\s+(.+?)(?:[?.!]|$)",
+            lower,
+        )
+        if m:
+            return ("search_query", m.group(1).strip().rstrip("?.! "))
+
+        # Help query
+        if re_mod.search(r"\b(how\s+do\s+i|help\s+me|what\s+can\s+you\s+do|commands?)\b", lower):
+            return ("help_query", "")
+
+        # Status query
+        if re_mod.search(r"\b(status|are\s+you\s+(?:online|working|running))\b", lower):
+            return ("status_query", "")
+
+        return ("unknown", "")
+
     def _handle_feedback(self, chat_id: int | str, user_id: str,
                          text: str) -> dict[str, Any]:
-        """Apply user feedback to preferences and acknowledge."""
+        """Apply user feedback to preferences, or detect conversational intent."""
         results = self._engine.apply_user_feedback(user_id, text)
 
         if results:
             changes = ", ".join(f"{k}={v}" for k, v in results.items())
             self._bot.send_message(chat_id, f"Preferences updated: {changes}")
-        else:
-            self._bot.send_message(
-                chat_id,
-                "I didn't catch a preference change. Try:\n"
-                "• more [topic] / less [topic]\n"
-                "• tone: analyst\n"
-                "• format: sections\n"
-                "• max: 15"
-            )
+            return {"action": "feedback", "user_id": user_id, "changes": results}
 
-        return {"action": "feedback", "user_id": user_id, "changes": results}
+        # No preference match — try conversational intent detection
+        intent, arg = self._detect_intent(text)
+
+        if intent == "briefing_query":
+            self._bot.send_message(chat_id, f"Pulling intelligence on {arg}...")
+            return self._run_briefing(chat_id, user_id, topic_hint=arg)
+
+        if intent == "trending":
+            return self._show_weekly(chat_id, user_id)
+
+        if intent == "search_query":
+            return self._recall(chat_id, user_id, arg)
+
+        if intent == "help_query":
+            self._bot.send_message(chat_id, self._bot.format_help())
+            return {"action": "help", "user_id": user_id}
+
+        if intent == "status_query":
+            return self._show_status(chat_id, user_id)
+
+        # Truly unrecognized
+        self._bot.send_message(
+            chat_id,
+            "I can help with that! Try:\n"
+            "\u2022 <b>Ask me:</b> \"What's happening with AI?\"\n"
+            "\u2022 <b>Search:</b> \"Find stories about regulation\"\n"
+            "\u2022 <b>Adjust:</b> more [topic] / less [topic]\n"
+            "\u2022 <b>Commands:</b> /briefing, /quick, /help"
+        )
+
+        return {"action": "feedback_unrecognized", "user_id": user_id}
 
     def _handle_preference(self, chat_id: int | str, user_id: str,
                            pref_command: str) -> dict[str, Any]:
@@ -532,6 +622,9 @@ class CommunicationAgent:
             "watchlist_crypto": list(profile.watchlist_crypto),
             "watchlist_stocks": list(profile.watchlist_stocks),
             "muted_topics": list(profile.muted_topics),
+            "confidence_min": profile.confidence_min,
+            "urgency_min": profile.urgency_min,
+            "max_per_source": profile.max_per_source,
         }
         self._bot.send_message(chat_id, self._bot.format_settings(profile_dict))
         return {"action": "settings", "user_id": user_id}
@@ -792,11 +885,13 @@ class CommunicationAgent:
 
         self._engine.preferences.track_story(user_id, topic, headline)
         self._persist_prefs()
+        track_count = len(self._engine.preferences.get_or_create(user_id).tracked_stories)
         self._bot.send_message(
             chat_id,
             f"\U0001f4cc Now tracking: <b>{headline}</b>\n"
             f"You'll see \U0001f4cc badges when new developments appear in future briefings.\n"
-            f"View tracked stories: /tracked"
+            f"View tracked stories: /tracked\n"
+            f"<i>Tip: Use /timeline {track_count} to see this story's evolution over time</i>"
         )
         return {"action": "track", "user_id": user_id, "story": story_num}
 
@@ -1095,10 +1190,12 @@ class CommunicationAgent:
         self._persist_prefs()
 
         import html as html_mod
+        bookmark_count = len(self._engine.preferences.get_or_create(user_id).bookmarks)
         self._bot.send_message(
             chat_id,
             f"\U0001f516 Saved: <b>{html_mod.escape(item['title'][:80])}</b>\n"
-            f"View bookmarks: /saved"
+            f"View bookmarks: /saved ({bookmark_count} total)\n"
+            f"<i>Tip: /export to get all stories as Markdown for your notes app</i>"
         )
         return {"action": "save", "user_id": user_id, "story": story_num}
 
@@ -1336,6 +1433,11 @@ class CommunicationAgent:
             max_items=profile.max_items,
         )
 
+        # Apply user-configured advanced filters
+        has_filters = profile.confidence_min > 0 or profile.urgency_min or profile.max_per_source > 0
+        if has_filters and payload.items:
+            payload.items = self._apply_user_filters(payload.items, profile)
+
         # Build market ticker bar
         ticker_bar = ""
         try:
@@ -1373,7 +1475,7 @@ class CommunicationAgent:
         card = formatter.format_quick_briefing(
             payload, ticker_bar, tracked_flags, delta_tags, tracked_count,
         )
-        self._bot.send_message(chat_id, card)
+        self._bot.send_quick_briefing(chat_id, card, item_count=len(payload.items))
 
         log.info(
             "Quick briefing: user=%s chat=%s (%d items)",
@@ -1465,6 +1567,143 @@ class CommunicationAgent:
         )
 
         return {"action": "deep_dive_story", "user_id": user_id, "story": story_num}
+
+    def _set_filter(self, chat_id: int | str, user_id: str,
+                    args: str) -> dict[str, Any]:
+        """Set or show advanced briefing filters."""
+        import html as html_mod
+        profile = self._engine.preferences.get_or_create(user_id)
+
+        if not args.strip():
+            # Show current filters
+            conf = f"{profile.confidence_min:.0%}" if profile.confidence_min > 0 else "off"
+            urg = profile.urgency_min or "off"
+            mps = str(profile.max_per_source) if profile.max_per_source > 0 else "off"
+            self._bot.send_message(
+                chat_id,
+                "<b>\U0001f527 Briefing Filters</b>\n\n"
+                f"\u2022 Confidence threshold: <code>{conf}</code>\n"
+                f"\u2022 Minimum urgency: <code>{urg}</code>\n"
+                f"\u2022 Max stories per source: <code>{mps}</code>\n\n"
+                "<b>Set with:</b>\n"
+                "/filter confidence 0.7 \u2014 Only high-confidence stories\n"
+                "/filter urgency elevated \u2014 Skip routine stories\n"
+                "/filter max_per_source 2 \u2014 Limit source repetition\n"
+                "/filter off \u2014 Remove all filters"
+            )
+            return {"action": "filter_show", "user_id": user_id}
+
+        parts = args.strip().split(maxsplit=1)
+        field = parts[0].lower()
+        value = parts[1].strip() if len(parts) > 1 else ""
+
+        if field == "off":
+            # Clear all filters
+            profile.confidence_min = 0.0
+            profile.urgency_min = ""
+            profile.max_per_source = 0
+            self._persist_prefs()
+            self._bot.send_message(chat_id, "All briefing filters removed.")
+            return {"action": "filter_off", "user_id": user_id}
+
+        if field == "confidence":
+            try:
+                val = float(value)
+                self._engine.preferences.set_filter(user_id, "confidence", str(val))
+                self._persist_prefs()
+                label = f"{val:.0%}" if val > 0 else "off"
+                self._bot.send_message(
+                    chat_id,
+                    f"Confidence filter set to <code>{label}</code>. "
+                    f"Stories below this threshold will be hidden."
+                )
+            except ValueError:
+                self._bot.send_message(chat_id, "Usage: /filter confidence 0.7 (value 0.0-1.0)")
+            return {"action": "filter_confidence", "user_id": user_id}
+
+        if field == "urgency":
+            valid = {"routine", "elevated", "breaking", "critical", "off"}
+            if value.lower() not in valid:
+                self._bot.send_message(
+                    chat_id,
+                    "Usage: /filter urgency [routine|elevated|breaking|critical|off]"
+                )
+                return {"action": "filter_urgency_help", "user_id": user_id}
+            urg_val = "" if value.lower() == "off" else value.lower()
+            self._engine.preferences.set_filter(user_id, "urgency", urg_val)
+            self._persist_prefs()
+            label = value.lower() if urg_val else "off"
+            self._bot.send_message(
+                chat_id,
+                f"Urgency filter set to <code>{label}</code>."
+            )
+            return {"action": "filter_urgency", "user_id": user_id}
+
+        if field in ("max_per_source", "source_limit"):
+            try:
+                val = int(value) if value.lower() != "off" else 0
+                self._engine.preferences.set_filter(user_id, "max_per_source", str(val))
+                self._persist_prefs()
+                label = str(val) if val > 0 else "off"
+                self._bot.send_message(
+                    chat_id,
+                    f"Source limit set to <code>{label}</code> stories per source."
+                )
+            except ValueError:
+                self._bot.send_message(chat_id, "Usage: /filter max_per_source 2 (1-10 or off)")
+            return {"action": "filter_source_limit", "user_id": user_id}
+
+        self._bot.send_message(
+            chat_id,
+            "Unknown filter. Available:\n"
+            "/filter confidence 0.7\n"
+            "/filter urgency elevated\n"
+            "/filter max_per_source 2\n"
+            "/filter off"
+        )
+        return {"action": "filter_unknown", "user_id": user_id}
+
+    def _apply_user_filters(self, items: list, profile) -> list:
+        """Apply user's advanced filters to briefing items.
+
+        Filters by confidence threshold, urgency minimum, and max-per-source.
+        """
+        from newsfeed.models.domain import UrgencyLevel
+
+        urgency_rank = {
+            "routine": 0, "elevated": 1, "breaking": 2, "critical": 3,
+        }
+
+        filtered = list(items)
+
+        # Confidence filter
+        if profile.confidence_min > 0:
+            filtered = [
+                item for item in filtered
+                if not item.confidence or item.confidence.mid >= profile.confidence_min
+            ]
+
+        # Urgency filter
+        if profile.urgency_min:
+            min_rank = urgency_rank.get(profile.urgency_min, 0)
+            filtered = [
+                item for item in filtered
+                if urgency_rank.get(item.candidate.urgency.value, 0) >= min_rank
+            ]
+
+        # Max per source
+        if profile.max_per_source > 0:
+            source_count: dict[str, int] = {}
+            source_filtered = []
+            for item in filtered:
+                src = item.candidate.source
+                count = source_count.get(src, 0)
+                if count < profile.max_per_source:
+                    source_filtered.append(item)
+                    source_count[src] = count + 1
+            filtered = source_filtered
+
+        return filtered
 
     # ──────────────────────────────────────────────────────────────
     # ADMIN COMMANDS — owner-only analytics dashboard via Telegram

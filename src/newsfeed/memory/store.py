@@ -173,6 +173,19 @@ class PreferenceStore:
             profile.bookmarks.pop(index - 1)
         return profile
 
+    def set_filter(self, user_id: str, field: str, value: str) -> UserProfile:
+        """Set an advanced briefing filter."""
+        profile = self.get_or_create(user_id)
+        if field == "confidence":
+            profile.confidence_min = max(0.0, min(float(value), 1.0))
+        elif field == "urgency":
+            valid = {"", "routine", "elevated", "breaking", "critical"}
+            if value.lower() in valid:
+                profile.urgency_min = value.lower()
+        elif field == "max_per_source":
+            profile.max_per_source = max(0, min(int(value), 10))
+        return profile
+
     def set_email(self, user_id: str, email: str) -> UserProfile:
         """Set the user's email address for digest delivery."""
         profile = self.get_or_create(user_id)
@@ -191,6 +204,9 @@ class PreferenceStore:
         profile.max_items = 10
         profile.briefing_cadence = "on_demand"
         profile.timezone = "UTC"
+        profile.confidence_min = 0.0
+        profile.urgency_min = ""
+        profile.max_per_source = 0
         # Keep watchlists, tracked stories, bookmarks, and email on reset — those are data, not weights
         return profile
 
@@ -212,6 +228,9 @@ class PreferenceStore:
                 "tracked_stories": list(p.tracked_stories),
                 "bookmarks": list(p.bookmarks),
                 "email": p.email,
+                "confidence_min": p.confidence_min,
+                "urgency_min": p.urgency_min,
+                "max_per_source": p.max_per_source,
             }
         return result
 
