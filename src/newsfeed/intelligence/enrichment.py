@@ -132,9 +132,10 @@ def _throttle_domain(url: str) -> None:
     if not hostname:
         return
     with _domain_lock:
-        # Evict stale entries if cache grows too large
+        # LRU eviction: drop oldest-accessed domain instead of clearing all
         if len(_domain_last_access) > _DOMAIN_CACHE_MAX:
-            _domain_last_access.clear()
+            oldest_host = min(_domain_last_access, key=_domain_last_access.get)  # type: ignore[arg-type]
+            del _domain_last_access[oldest_host]
         last = _domain_last_access.get(hostname, 0.0)
         now = time.monotonic()
         wait = _DOMAIN_MIN_INTERVAL - (now - last)
@@ -409,7 +410,13 @@ class ArticleEnricher:
     1. Gemini API (fast, generous free tier — best for bulk summarization)
     2. Anthropic Claude (high quality, requires paid key)
     3. Extractive (always available, no API key needed)
+
+    Includes a bounded URL→summary TTL cache so the same article is not
+    re-fetched and re-summarized across consecutive briefings.
     """
+
+    _SUMMARY_CACHE_MAX = 200
+    _CACHE_TTL_SECONDS = 1800  # 30 minutes
 
     def __init__(
         self,
@@ -431,6 +438,12 @@ class ArticleEnricher:
         self._max_workers = max_workers
         self._target_chars = target_summary_chars
 
+        # URL → (summary, monotonic_timestamp) cache
+        # Protected by lock since enrich() uses ThreadPoolExecutor and
+        # concurrent briefing requests could access the cache simultaneously.
+        self._summary_cache: dict[str, tuple[str, float]] = {}
+        self._cache_lock = threading.Lock()
+
         # Log which summarization backend is active
         if gemini_api_key:
             log.info("Article enrichment: using Gemini (%s)", gemini_model)
@@ -439,52 +452,85 @@ class ArticleEnricher:
         else:
             log.info("Article enrichment: using extractive (no LLM key)")
 
+    def _get_cached_summary(self, url: str) -> str | None:
+        """Return cached summary if present and not expired.  Thread-safe."""
+        with self._cache_lock:
+            entry = self._summary_cache.get(url)
+            if entry is None:
+                return None
+            summary, ts = entry
+            if time.monotonic() - ts > self._CACHE_TTL_SECONDS:
+                del self._summary_cache[url]
+                return None
+            return summary
+
+    def _put_cached_summary(self, url: str, summary: str) -> None:
+        """Store a summary in the cache, evicting oldest if over capacity.  Thread-safe."""
+        with self._cache_lock:
+            if len(self._summary_cache) >= self._SUMMARY_CACHE_MAX:
+                oldest_url = min(self._summary_cache, key=lambda u: self._summary_cache[u][1])
+                del self._summary_cache[oldest_url]
+            self._summary_cache[url] = (summary, time.monotonic())
+
     def enrich(self, candidates: list[CandidateItem]) -> list[CandidateItem]:
         """Fetch articles and replace RSS teasers with real summaries.
 
         Fetches articles in parallel for speed. If a fetch or summary
-        fails, the original RSS description is preserved.
+        fails, the original RSS description is preserved.  Cached summaries
+        are reused to avoid redundant network and LLM calls.
         """
         if not candidates:
             return candidates
 
-        # Parallel fetch
-        article_texts: dict[str, str] = {}
-        with ThreadPoolExecutor(max_workers=self._max_workers) as pool:
-            futures = {
-                pool.submit(fetch_article, c.url, self._fetch_timeout): c.candidate_id
-                for c in candidates
-                if c.url
-            }
-            for future in as_completed(futures):
-                cid = futures[future]
-                try:
-                    article_texts[cid] = future.result()
-                except Exception:
-                    article_texts[cid] = ""
-
-        # Summarize
-        enriched_count = 0
+        # Check cache first — skip fetching URLs we already have summaries for
+        cache_hits = 0
+        to_fetch: list[CandidateItem] = []
         for c in candidates:
+            if not c.url:
+                continue
+            cached = self._get_cached_summary(c.url)
+            if cached and len(cached) > len(c.summary):
+                c.summary = cached
+                cache_hits += 1
+            else:
+                to_fetch.append(c)
+
+        # Parallel fetch for uncached URLs
+        article_texts: dict[str, str] = {}
+        if to_fetch:
+            with ThreadPoolExecutor(max_workers=self._max_workers) as pool:
+                futures = {
+                    pool.submit(fetch_article, c.url, self._fetch_timeout): c
+                    for c in to_fetch
+                }
+                for future in as_completed(futures):
+                    c = futures[future]
+                    try:
+                        article_texts[c.candidate_id] = future.result()
+                    except Exception:
+                        article_texts[c.candidate_id] = ""
+
+        # Summarize uncached articles
+        enriched_count = 0
+        for c in to_fetch:
             raw_html = article_texts.get(c.candidate_id, "")
             if not raw_html:
                 continue
 
             article_text = extract_article_text(raw_html)
             if len(article_text) < 100:
-                # Extraction failed — keep original
                 continue
 
-            # Generate summary — try Gemini first, then Anthropic, then extractive
             summary = self._summarize(article_text, c.title, c.source)
 
             if summary and len(summary) > len(c.summary):
                 c.summary = summary
+                self._put_cached_summary(c.url, summary)
                 enriched_count += 1
 
         log.info(
-            "Article enrichment: %d/%d candidates enriched",
-            enriched_count, len(candidates),
+            "Article enrichment: %d/%d enriched, %d cache hits",
+            enriched_count, len(candidates), cache_hits,
         )
         return candidates
 

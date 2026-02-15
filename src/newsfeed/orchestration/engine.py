@@ -23,7 +23,7 @@ from newsfeed.intelligence.georisk import GeoRiskIndex
 from newsfeed.intelligence.trends import TrendDetector
 from newsfeed.intelligence.urgency import BreakingDetector
 from newsfeed.memory.commands import parse_preference_commands
-from newsfeed.memory.store import CandidateCache, PreferenceStore, StatePersistence
+from newsfeed.memory.store import BoundedUserDict, CandidateCache, PreferenceStore, StatePersistence
 from newsfeed.models.domain import (
     BriefingType,
     CandidateItem,
@@ -202,14 +202,16 @@ class NewsFeedEngine:
         self._disabled_agents: set[str] = set()
 
         # Track last briefing item topics per user (for "More/Less like this")
-        self._last_briefing_topics: dict[str, list[str]] = {}
+        # BoundedUserDict caps per-user dicts at 500 entries with LRU eviction
+        # to prevent unbounded memory growth in multi-user deployments.
+        self._last_briefing_topics: BoundedUserDict[list[str]] = BoundedUserDict(maxlen=500)
         # Track per-item info per user (for per-item thumbs up/down)
-        self._last_briefing_items: dict[str, list[dict]] = {}  # [{topic, source}, ...]
+        self._last_briefing_items: BoundedUserDict[list[dict]] = BoundedUserDict(maxlen=500)
         # Track full ReportItem objects for per-story deep dive
-        self._last_report_items: dict[str, list[ReportItem]] = {}  # user_id -> [ReportItem, ...]
+        self._last_report_items: BoundedUserDict[list[ReportItem]] = BoundedUserDict(maxlen=500)
         # Track threads from last briefing for source comparison
         from newsfeed.models.domain import NarrativeThread
-        self._last_threads: dict[str, list[NarrativeThread]] = {}  # user_id -> [NarrativeThread, ...]
+        self._last_threads: BoundedUserDict[list[NarrativeThread]] = BoundedUserDict(maxlen=500)
 
         # State persistence — save and restore preferences, credibility, etc.
         persist_cfg = pipeline.get("persistence", {})
@@ -258,8 +260,26 @@ class NewsFeedEngine:
 
         return agents
 
+    async def _run_agent_with_breaker(self, agent: ResearchAgent, task: ResearchTask, top_k: int) -> list:
+        """Run a single agent with circuit breaker protection."""
+        cb = self.optimizer.circuit_breaker
+        if not cb.allow_request(agent.agent_id):
+            log.debug("Circuit breaker OPEN — skipping %s", agent.agent_id)
+            return []
+        try:
+            result = await agent.run_async(task, top_k=top_k)
+            cb.record_success(agent.agent_id)
+            return result
+        except Exception:
+            cb.record_failure(agent.agent_id)
+            log.warning("Agent %s failed (circuit breaker tracking)", agent.agent_id, exc_info=True)
+            return []
+
     async def _run_research_async(self, task: ResearchTask, top_k: int) -> list:
-        coros = [agent.run_async(task, top_k=top_k) for agent in self._research_agents(task.user_id)]
+        coros = [
+            self._run_agent_with_breaker(agent, task, top_k)
+            for agent in self._research_agents(task.user_id)
+        ]
         batch = await asyncio.gather(*coros)
         flattened = []
         for chunk in batch:

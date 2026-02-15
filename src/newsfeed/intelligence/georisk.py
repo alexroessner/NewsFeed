@@ -30,6 +30,10 @@ _DEFAULT_DEESCALATION = frozenset({
 
 
 class GeoRiskIndex:
+    # Cap tracked regions — the default config defines ~9 regions,
+    # but dynamic detection could create more from custom content.
+    _MAX_REGIONS = 100
+
     def __init__(self, georisk_cfg: dict[str, Any] | None = None) -> None:
         cfg = georisk_cfg or {}
         self._history: dict[str, float] = {}
@@ -77,6 +81,17 @@ class GeoRiskIndex:
             ))
 
         entries.sort(key=lambda e: e.risk_level, reverse=True)
+
+        # Evict stale regions when history grows too large
+        if len(self._history) > self._MAX_REGIONS:
+            active_regions = {e.region for e in entries}
+            stale = [r for r in self._history if r not in active_regions]
+            # Drop lowest-risk inactive regions first
+            stale.sort(key=lambda r: self._history[r])
+            excess = len(self._history) - self._MAX_REGIONS
+            for r in stale[:excess]:
+                del self._history[r]
+
         return entries
 
     def _detect_regions(self, item: CandidateItem) -> list[str]:

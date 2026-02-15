@@ -7,6 +7,9 @@ from newsfeed.models.domain import CandidateItem, SourceReliability
 
 
 class CredibilityTracker:
+    # Cap tracked sources to prevent unbounded growth from custom feeds
+    _MAX_SOURCES = 500
+
     def __init__(self, intel_cfg: dict[str, Any] | None = None) -> None:
         cfg = intel_cfg or {}
         self._sources: dict[str, SourceReliability] = {}
@@ -60,8 +63,28 @@ class CredibilityTracker:
 
     def get_source(self, source_id: str) -> SourceReliability:
         if source_id not in self._sources:
+            # Evict least-seen unknown sources when at capacity
+            if len(self._sources) >= self._MAX_SOURCES:
+                self._evict_least_seen()
             self._sources[source_id] = self._init_source(source_id)
         return self._sources[source_id]
+
+    def _evict_least_seen(self) -> None:
+        """Evict the least-active unknown-tier source to stay under cap.
+
+        Known-tier sources (tier_1, tier_1b, tier_2, academic) are never
+        evicted — only dynamically discovered sources are candidates.
+        """
+        known = self._tier1_sources | self._tier1b_sources | self._tier2_sources | self._academic_sources
+        evict_candidates = [
+            (sid, sr) for sid, sr in self._sources.items()
+            if sid not in known
+        ]
+        if not evict_candidates:
+            return
+        # Evict the one with fewest total_items_seen
+        victim = min(evict_candidates, key=lambda x: x[1].total_items_seen)
+        del self._sources[victim[0]]
 
     def record_item(self, item: CandidateItem) -> None:
         sr = self.get_source(item.source)
