@@ -72,6 +72,83 @@ class TuningRecommendation:
     severity: str  # "low", "medium", "high"
 
 
+class CircuitBreaker:
+    """Per-agent circuit breaker with automatic recovery.
+
+    States:
+    - CLOSED  (normal):  agent runs every request
+    - OPEN    (tripped): agent is skipped after *failure_threshold* consecutive failures
+    - HALF_OPEN:         after *recovery_seconds*, ONE probe request is allowed through;
+                         success → CLOSED, failure → re-OPEN
+
+    This prevents a persistently failing agent (network down, rate-limited,
+    malformed source) from wasting latency budget on every request while
+    still allowing it to automatically recover when the underlying issue
+    resolves.
+    """
+
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+    def __init__(self, failure_threshold: int = 3, recovery_seconds: float = 120.0) -> None:
+        self._failure_threshold = max(1, failure_threshold)
+        self._recovery_seconds = recovery_seconds
+        # agent_id → (state, consecutive_failures, last_failure_time)
+        self._breakers: dict[str, tuple[str, int, float]] = {}
+
+    def allow_request(self, agent_id: str) -> bool:
+        """Return True if the agent should run this cycle."""
+        state, failures, last_fail = self._breakers.get(agent_id, (self.CLOSED, 0, 0.0))
+        if state == self.CLOSED:
+            return True
+        if state == self.OPEN:
+            # Check if recovery window has elapsed → transition to HALF_OPEN
+            if time.monotonic() - last_fail >= self._recovery_seconds:
+                self._breakers[agent_id] = (self.HALF_OPEN, failures, last_fail)
+                log.debug("Circuit breaker HALF_OPEN for %s (probing)", agent_id)
+                return True
+            return False
+        # HALF_OPEN: allow exactly one probe
+        return True
+
+    def record_success(self, agent_id: str) -> None:
+        """Record a successful agent run — reset to CLOSED."""
+        state, _, _ = self._breakers.get(agent_id, (self.CLOSED, 0, 0.0))
+        if state != self.CLOSED:
+            log.info("Circuit breaker CLOSED for %s (recovered)", agent_id)
+        self._breakers[agent_id] = (self.CLOSED, 0, 0.0)
+
+    def record_failure(self, agent_id: str) -> None:
+        """Record an agent failure — may trip to OPEN."""
+        state, failures, _ = self._breakers.get(agent_id, (self.CLOSED, 0, 0.0))
+        failures += 1
+        now = time.monotonic()
+        if failures >= self._failure_threshold:
+            if state != self.OPEN:
+                log.warning("Circuit breaker OPEN for %s (%d consecutive failures)", agent_id, failures)
+            self._breakers[agent_id] = (self.OPEN, failures, now)
+        else:
+            self._breakers[agent_id] = (state, failures, now)
+
+    def get_state(self, agent_id: str) -> str:
+        """Return the current circuit state for an agent."""
+        state, _, _ = self._breakers.get(agent_id, (self.CLOSED, 0, 0.0))
+        return state
+
+    def snapshot(self) -> dict[str, dict[str, Any]]:
+        """Return circuit breaker state for reporting."""
+        result: dict[str, dict[str, Any]] = {}
+        for agent_id, (state, failures, last_fail) in self._breakers.items():
+            if state != self.CLOSED or failures > 0:
+                result[agent_id] = {
+                    "state": state,
+                    "consecutive_failures": failures,
+                    "last_failure_ago_s": round(time.monotonic() - last_fail, 1) if last_fail else 0,
+                }
+        return result
+
+
 class SystemOptimizationAgent:
     """Global configuration and policy optimizer.
 
@@ -80,6 +157,7 @@ class SystemOptimizationAgent:
     2. Monitor pipeline stage health
     3. Generate tuning recommendations
     4. Produce health reports for observability
+    5. Circuit breaker: auto-disable failing agents with gradual recovery
     """
 
     agent_id = "system_optimization_agent"
@@ -90,6 +168,8 @@ class SystemOptimizationAgent:
         min_yield_threshold: float = 0.5,
         latency_threshold_ms: float = 10000.0,
         keep_rate_threshold: float = 0.1,
+        circuit_failure_threshold: int = 3,
+        circuit_recovery_seconds: float = 120.0,
     ) -> None:
         self._agents: dict[str, AgentMetric] = {}
         self._stages: dict[str, StageMetric] = {}
@@ -99,6 +179,10 @@ class SystemOptimizationAgent:
         self._keep_rate_threshold = keep_rate_threshold
         self._disabled_agents: set[str] = set()
         self._weight_overrides: dict[str, float] = {}
+        self.circuit_breaker = CircuitBreaker(
+            failure_threshold=circuit_failure_threshold,
+            recovery_seconds=circuit_recovery_seconds,
+        )
 
     # ──────────────────────────────────────────────────────────────
     # Recording methods (called by the engine during pipeline execution)
@@ -273,6 +357,7 @@ class SystemOptimizationAgent:
             ],
             "disabled_agents": sorted(self._disabled_agents),
             "weight_overrides": dict(self._weight_overrides),
+            "circuit_breakers": self.circuit_breaker.snapshot(),
         }
 
     def snapshot(self) -> dict[str, Any]:

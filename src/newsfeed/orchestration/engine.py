@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from newsfeed.agents.base import ResearchAgent
+from newsfeed.agents.dynamic_sources import create_custom_agent
 from newsfeed.agents.experts import ExpertCouncil
 from newsfeed.agents.registry import create_agent
 from newsfeed.db.analytics import AnalyticsDB, create_analytics_db
@@ -22,7 +23,7 @@ from newsfeed.intelligence.georisk import GeoRiskIndex
 from newsfeed.intelligence.trends import TrendDetector
 from newsfeed.intelligence.urgency import BreakingDetector
 from newsfeed.memory.commands import parse_preference_commands
-from newsfeed.memory.store import CandidateCache, PreferenceStore, StatePersistence
+from newsfeed.memory.store import BoundedUserDict, CandidateCache, PreferenceStore, StatePersistence
 from newsfeed.models.domain import (
     BriefingType,
     CandidateItem,
@@ -201,14 +202,16 @@ class NewsFeedEngine:
         self._disabled_agents: set[str] = set()
 
         # Track last briefing item topics per user (for "More/Less like this")
-        self._last_briefing_topics: dict[str, list[str]] = {}
+        # BoundedUserDict caps per-user dicts at 500 entries with LRU eviction
+        # to prevent unbounded memory growth in multi-user deployments.
+        self._last_briefing_topics: BoundedUserDict[list[str]] = BoundedUserDict(maxlen=500)
         # Track per-item info per user (for per-item thumbs up/down)
-        self._last_briefing_items: dict[str, list[dict]] = {}  # [{topic, source}, ...]
+        self._last_briefing_items: BoundedUserDict[list[dict]] = BoundedUserDict(maxlen=500)
         # Track full ReportItem objects for per-story deep dive
-        self._last_report_items: dict[str, list[ReportItem]] = {}  # user_id -> [ReportItem, ...]
+        self._last_report_items: BoundedUserDict[list[ReportItem]] = BoundedUserDict(maxlen=500)
         # Track threads from last briefing for source comparison
         from newsfeed.models.domain import NarrativeThread
-        self._last_threads: dict[str, list[NarrativeThread]] = {}  # user_id -> [NarrativeThread, ...]
+        self._last_threads: BoundedUserDict[list[NarrativeThread]] = BoundedUserDict(maxlen=500)
 
         # State persistence — save and restore preferences, credibility, etc.
         persist_cfg = pipeline.get("persistence", {})
@@ -230,7 +233,7 @@ class NewsFeedEngine:
             ",".join(sorted(self._enabled_stages)),
         )
 
-    def _research_agents(self) -> list[ResearchAgent]:
+    def _research_agents(self, user_id: str | None = None) -> list[ResearchAgent]:
         api_keys = self.pipeline.get("api_keys", {})
         agents = []
         for a in self.config.get("research_agents", []):
@@ -240,10 +243,43 @@ class NewsFeedEngine:
                 continue
             agent = create_agent(a, api_keys)
             agents.append(agent)
+
+        # Inject per-user custom source agents
+        if user_id:
+            for src in self.preferences.get_custom_sources(user_id):
+                try:
+                    agent = create_custom_agent(
+                        name=src["name"],
+                        feed_url=src["feed_url"],
+                        user_id=user_id,
+                        topics=src.get("topics"),
+                    )
+                    agents.append(agent)
+                except Exception:
+                    log.debug("Failed to create custom agent %s", src.get("name"), exc_info=True)
+
         return agents
 
+    async def _run_agent_with_breaker(self, agent: ResearchAgent, task: ResearchTask, top_k: int) -> list:
+        """Run a single agent with circuit breaker protection."""
+        cb = self.optimizer.circuit_breaker
+        if not cb.allow_request(agent.agent_id):
+            log.debug("Circuit breaker OPEN — skipping %s", agent.agent_id)
+            return []
+        try:
+            result = await agent.run_async(task, top_k=top_k)
+            cb.record_success(agent.agent_id)
+            return result
+        except Exception:
+            cb.record_failure(agent.agent_id)
+            log.warning("Agent %s failed (circuit breaker tracking)", agent.agent_id, exc_info=True)
+            return []
+
     async def _run_research_async(self, task: ResearchTask, top_k: int) -> list:
-        coros = [agent.run_async(task, top_k=top_k) for agent in self._research_agents()]
+        coros = [
+            self._run_agent_with_breaker(agent, task, top_k)
+            for agent in self._research_agents(task.user_id)
+        ]
         batch = await asyncio.gather(*coros)
         flattened = []
         for chunk in batch:
@@ -322,6 +358,14 @@ class NewsFeedEngine:
                 candidate_regions = {r.lower().replace(" ", "_") for r in c.regions}
                 if candidate_regions & roi_set:
                     c.preference_fit = round(min(1.0, c.preference_fit + 0.15), 3)
+
+        # Boost stories matching keyword alerts — cross-topic priority boosting
+        if profile.alert_keywords:
+            for c in all_candidates:
+                text = f"{c.title} {c.summary}".lower()
+                if any(kw in text for kw in profile.alert_keywords):
+                    c.preference_fit = round(min(1.0, c.preference_fit + 0.25), 3)
+                    c.novelty_score = round(min(1.0, c.novelty_score + 0.10), 3)
 
         # Stage 2: Intelligence enrichment (conditionally enabled, with error isolation)
         t0 = time.monotonic()
@@ -740,15 +784,48 @@ class NewsFeedEngine:
             "agent_count": len(self.config.get("research_agents", [])),
             "expert_count": len(self.experts.expert_ids),
             "stage_count": len(self._enabled_stages),
-            "llm_backed": bool(self.experts._use_llm),
-            "telegram_connected": self._bot is not None,
-            "cache_entries": sum(len(v) for v in self.cache._entries.values()),
+            "llm_backed": self.is_llm_backed(),
+            "telegram_connected": self.is_telegram_connected(),
+            "cache_entries": self.cache_entry_count(),
             "orchestrator_metrics": self.orchestrator.metrics(),
             "optimizer_health": self.optimizer.health_report(),
             "audit_stats": self.audit.stats(),
             "expert_influence": self.experts.chair.snapshot(),
             "config_changes": len(self.configurator.history()),
         }
+
+    # ──────────────────────────────────────────────────────────────
+    # Public API — avoid private attribute access across modules
+    # ──────────────────────────────────────────────────────────────
+
+    def last_report_items(self, user_id: str) -> list[ReportItem]:
+        """Return the full ReportItem list from the user's last briefing."""
+        return self._last_report_items.get(user_id, [])
+
+    def is_telegram_connected(self) -> bool:
+        """Check if the Telegram bot and communication agent are initialized."""
+        return self._bot is not None and self._comm_agent is not None
+
+    def get_comm_agent(self):
+        """Return the communication agent (or None if not initialized)."""
+        return self._comm_agent
+
+    def get_bot(self):
+        """Return the Telegram bot (or None if not initialized)."""
+        return self._bot
+
+    def is_llm_backed(self) -> bool:
+        """Check if the expert council is using LLM-based evaluation."""
+        return bool(self.experts._use_llm)
+
+    def cache_entry_count(self) -> int:
+        """Return the total number of cached candidate entries."""
+        return sum(len(v) for v in self.cache._entries.values())
+
+    def persist_preferences(self) -> None:
+        """Persist current preferences to disk (if persistence is enabled)."""
+        if self._persistence:
+            self._persistence.save("preferences", self.preferences.snapshot())
 
     def _save_state(self) -> None:
         if not self._persistence:
@@ -776,9 +853,9 @@ class NewsFeedEngine:
         if not self._persistence:
             return
 
-        _MAX_WEIGHTS = self.preferences._MAX_WEIGHTS
-        _MAX_WATCHLIST = self.preferences._MAX_WATCHLIST_SIZE
-        _MAX_MUTED = self.preferences._MAX_MUTED_TOPICS
+        _MAX_WEIGHTS = self.preferences.MAX_WEIGHTS
+        _MAX_WATCHLIST = self.preferences.MAX_WATCHLIST_SIZE
+        _MAX_MUTED = self.preferences.MAX_MUTED_TOPICS
 
         # Restore user preferences
         prefs_data = self._persistence.load("preferences")
@@ -849,5 +926,50 @@ class NewsFeedEngine:
                     if valid:
                         profile.webhook_url = url
             log.info("Restored preferences for %d users from disk", len(prefs_data))
+
+        # Restore optimizer state (disabled agents, weight overrides, agent stats)
+        opt_data = self._persistence.load("optimizer")
+        if opt_data and isinstance(opt_data, dict):
+            if isinstance(opt_data.get("disabled"), list):
+                for aid in opt_data["disabled"]:
+                    if isinstance(aid, str) and len(aid) <= 100:
+                        self.optimizer._disabled_agents.add(aid)
+            if isinstance(opt_data.get("weights"), dict):
+                for aid, w in opt_data["weights"].items():
+                    if isinstance(aid, str) and len(aid) <= 100:
+                        self.optimizer._weight_overrides[str(aid)] = max(0.1, min(float(w), 2.0))
+            log.info("Restored optimizer state: %d disabled, %d weight overrides",
+                     len(self.optimizer._disabled_agents), len(self.optimizer._weight_overrides))
+
+        # Restore credibility baselines
+        cred_data = self._persistence.load("credibility")
+        if cred_data and isinstance(cred_data, dict):
+            for source_id, sdata in cred_data.items():
+                if not isinstance(source_id, str) or not isinstance(sdata, dict):
+                    continue
+                sr = self.credibility.get_source(source_id)
+                if isinstance(sdata.get("reliability_score"), (int, float)):
+                    sr.reliability_score = max(0.0, min(1.0, float(sdata["reliability_score"])))
+                if isinstance(sdata.get("corroboration_rate"), (int, float)):
+                    sr.corroboration_rate = max(0.0, min(1.0, float(sdata["corroboration_rate"])))
+                if isinstance(sdata.get("total_items_seen"), int):
+                    sr.total_items_seen = max(0, sdata["total_items_seen"])
+            log.info("Restored credibility data for %d sources", len(cred_data))
+
+        # Restore georisk baselines
+        geo_data = self._persistence.load("georisk")
+        if geo_data and isinstance(geo_data, dict):
+            for region, level in geo_data.items():
+                if isinstance(region, str) and isinstance(level, (int, float)):
+                    self.georisk._history[region] = max(0.0, min(1.0, float(level)))
+            log.info("Restored georisk baselines for %d regions", len(geo_data))
+
+        # Restore trend baselines
+        trend_data = self._persistence.load("trends")
+        if trend_data and isinstance(trend_data, dict):
+            for topic, velocity in trend_data.items():
+                if isinstance(topic, str) and isinstance(velocity, (int, float)):
+                    self.trends._baseline[topic] = max(0.0, min(1.0, float(velocity)))
+            log.info("Restored trend baselines for %d topics", len(trend_data))
 
         log.info("State loaded from %s", self._persistence.state_dir)

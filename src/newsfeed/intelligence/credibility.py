@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import hashlib
+from collections import defaultdict
 from typing import Any
 
 from newsfeed.models.domain import CandidateItem, SourceReliability
 
 
 class CredibilityTracker:
+    # Cap tracked sources to prevent unbounded growth from custom feeds
+    _MAX_SOURCES = 500
+
     def __init__(self, intel_cfg: dict[str, Any] | None = None) -> None:
         cfg = intel_cfg or {}
         self._sources: dict[str, SourceReliability] = {}
@@ -60,8 +64,28 @@ class CredibilityTracker:
 
     def get_source(self, source_id: str) -> SourceReliability:
         if source_id not in self._sources:
+            # Evict least-seen unknown sources when at capacity
+            if len(self._sources) >= self._MAX_SOURCES:
+                self._evict_least_seen()
             self._sources[source_id] = self._init_source(source_id)
         return self._sources[source_id]
+
+    def _evict_least_seen(self) -> None:
+        """Evict the least-active unknown-tier source to stay under cap.
+
+        Known-tier sources (tier_1, tier_1b, tier_2, academic) are never
+        evicted — only dynamically discovered sources are candidates.
+        """
+        known = self._tier1_sources | self._tier1b_sources | self._tier2_sources | self._academic_sources
+        evict_candidates = [
+            (sid, sr) for sid, sr in self._sources.items()
+            if sid not in known
+        ]
+        if not evict_candidates:
+            return
+        # Evict the one with fewest total_items_seen
+        victim = min(evict_candidates, key=lambda x: x[1].total_items_seen)
+        del self._sources[victim[0]]
 
     def record_item(self, item: CandidateItem) -> None:
         sr = self.get_source(item.source)
@@ -108,34 +132,46 @@ def detect_cross_corroboration(candidates: list[CandidateItem]) -> list[Candidat
     similarity) between title+summary text, requiring a threshold of shared
     significant words.  Topic-level matching alone is NOT sufficient — simply
     covering the same broad topic (e.g. geopolitics) is not corroboration.
+
+    Optimization: candidates are pre-grouped by topic so only items within
+    the same topic are compared, reducing O(n²) to O(sum(k²)) where k
+    is the per-topic count — typically a 3-5x reduction.
     """
-    word_sets: list[tuple[CandidateItem, set[str]]] = []
+    # Pre-extract word sets and group by topic for efficient comparison
+    word_map: dict[str, set[str]] = {}
+    topic_groups: dict[str, list[CandidateItem]] = defaultdict(list)
     for c in candidates:
         # Simulated placeholders have synthetic text — skip them to avoid
         # false corroboration between "Simulated placeholder — reddit agent..."
         # and "Simulated placeholder — reuters agent..." (Jaccard ~0.75).
         if "example.com" in (c.url or ""):
-            word_sets.append((c, set()))
-            continue
-        words = _extract_significant_words(f"{c.title} {c.summary}")
-        word_sets.append((c, words))
+            word_map[c.candidate_id] = set()
+        else:
+            word_map[c.candidate_id] = _extract_significant_words(f"{c.title} {c.summary}")
+        topic_groups[c.topic].append(c)
 
-    # Compare every pair; only mark if from different sources and similar enough
-    for i, (ci, wi) in enumerate(word_sets):
-        corr_sources: set[str] = set()
-        for j, (cj, wj) in enumerate(word_sets):
-            if i >= j:
+    # Compare within each topic group — cross-topic items can't corroborate
+    for group in topic_groups.values():
+        for i, ci in enumerate(group):
+            wi = word_map[ci.candidate_id]
+            if not wi:
                 continue
-            if ci.source == cj.source:
-                continue
-            similarity = _jaccard(wi, wj)
-            if similarity >= 0.25:
-                corr_sources.add(cj.source)
-                # Also mark the other direction
-                if ci.source not in (cj.corroborated_by or []):
-                    cj.corroborated_by = list(set(cj.corroborated_by or []) | {ci.source})
-        if corr_sources:
-            ci.corroborated_by = list(set(ci.corroborated_by or []) | corr_sources)
+            corr_sources: set[str] = set()
+            for j in range(i + 1, len(group)):
+                cj = group[j]
+                if ci.source == cj.source:
+                    continue
+                wj = word_map[cj.candidate_id]
+                if not wj:
+                    continue
+                similarity = _jaccard(wi, wj)
+                if similarity >= 0.25:
+                    corr_sources.add(cj.source)
+                    # Also mark the other direction
+                    if ci.source not in (cj.corroborated_by or []):
+                        cj.corroborated_by = list(set(cj.corroborated_by or []) | {ci.source})
+            if corr_sources:
+                ci.corroborated_by = list(set(ci.corroborated_by or []) | corr_sources)
 
     return candidates
 

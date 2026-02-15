@@ -58,7 +58,7 @@ def main() -> None:
     engine = NewsFeedEngine(config=cfg.agents, pipeline=cfg.pipeline, personas=cfg.personas, personas_dir=personas_dir)
 
     # If Telegram bot is configured, start the polling loop
-    if engine._bot is not None and engine._comm_agent is not None:
+    if engine.is_telegram_connected():
         log.info("Telegram bot configured — starting polling loop")
         _run_bot_loop(engine)
     else:
@@ -77,8 +77,8 @@ def main() -> None:
 
 def _run_bot_loop(engine: NewsFeedEngine) -> None:
     """Main Telegram polling loop with scheduled briefing support."""
-    bot = engine._bot
-    comm = engine._comm_agent
+    bot = engine.get_bot()
+    comm = engine.get_comm_agent()
     scheduler_check_interval = 60  # Check for scheduled briefings every 60s
     last_scheduler_check = 0.0
 

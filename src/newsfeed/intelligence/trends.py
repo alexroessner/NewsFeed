@@ -7,6 +7,9 @@ from newsfeed.models.domain import CandidateItem, TrendSnapshot
 
 
 class TrendDetector:
+    # Cap tracked topics — evict lowest-velocity topics when exceeded
+    _MAX_TOPICS = 200
+
     def __init__(self, window_minutes: int = 60, anomaly_threshold: float = 2.0, baseline_decay: float = 0.8) -> None:
         self.window = timedelta(minutes=window_minutes)
         self.window_minutes = window_minutes
@@ -49,6 +52,14 @@ class TrendDetector:
                 is_emerging=is_emerging,
                 sample_window_minutes=self.window_minutes,
             ))
+
+        # Evict stale topics when baseline grows too large
+        if len(self._baseline) > self._MAX_TOPICS:
+            # Drop the topics with lowest baseline velocity (least active)
+            sorted_topics = sorted(self._baseline.items(), key=lambda kv: kv[1])
+            excess = len(self._baseline) - self._MAX_TOPICS
+            for topic_key, _ in sorted_topics[:excess]:
+                del self._baseline[topic_key]
 
         snapshots.sort(key=lambda t: t.anomaly_score, reverse=True)
         return snapshots
