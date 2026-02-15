@@ -98,6 +98,27 @@ class UserProfile:
     bookmarks: list[dict[str, Any]] = field(default_factory=list)
     # Email address for email digest delivery
     email: str = ""
+    # Advanced briefing filters — user-controllable thresholds
+    # confidence_min: only show stories with confidence.mid >= this (0.0 = off)
+    confidence_min: float = 0.0
+    # urgency_min: only show stories at or above this urgency level
+    # "routine", "elevated", "breaking", "critical" (empty = off)
+    urgency_min: str = ""
+    # max_per_source: limit stories from a single source (0 = no limit)
+    max_per_source: int = 0
+    # Alert sensitivity thresholds — user-configurable
+    # geo-risk threshold: alert when risk_level exceeds this (default 0.5)
+    alert_georisk_threshold: float = 0.5
+    # trend spike threshold: alert when anomaly_score exceeds this (default 3.0)
+    alert_trend_threshold: float = 3.0
+    # Saved briefing presets — named configurations users can switch between
+    # Each entry: {"name": str, "topic_weights": dict, "source_weights": dict,
+    #   "tone": str, "format": str, "max_items": int, "regions": list,
+    #   "confidence_min": float, "urgency_min": str, "max_per_source": int,
+    #   "muted_topics": list}
+    presets: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Outbound webhook URL for pushing briefings/alerts as structured JSON
+    webhook_url: str = ""
 
 
 @dataclass(slots=True)

@@ -794,6 +794,20 @@ class NewsFeedEngine:
                     profile.bookmarks = list(pdata["bookmarks"])
                 if pdata.get("email"):
                     profile.email = pdata["email"]
+                if pdata.get("confidence_min"):
+                    profile.confidence_min = float(pdata["confidence_min"])
+                if pdata.get("urgency_min"):
+                    profile.urgency_min = str(pdata["urgency_min"])
+                if pdata.get("max_per_source"):
+                    profile.max_per_source = int(pdata["max_per_source"])
+                if pdata.get("alert_georisk_threshold"):
+                    profile.alert_georisk_threshold = float(pdata["alert_georisk_threshold"])
+                if pdata.get("alert_trend_threshold"):
+                    profile.alert_trend_threshold = float(pdata["alert_trend_threshold"])
+                if isinstance(pdata.get("presets"), dict):
+                    profile.presets = dict(pdata["presets"])
+                if pdata.get("webhook_url"):
+                    profile.webhook_url = str(pdata["webhook_url"])
             log.info("Restored preferences for %d users from disk", len(prefs_data))
 
         log.info("State loaded from %s", self._persistence.state_dir)

@@ -58,6 +58,11 @@ BOT_COMMANDS = [
     {"command": "email", "description": "Set email for digest delivery (e.g. /email user@example.com)"},
     {"command": "digest", "description": "Send email digest of your latest briefing"},
     {"command": "export", "description": "Export last briefing as Markdown"},
+    {"command": "stats", "description": "View your personal engagement analytics"},
+    {"command": "webhook", "description": "Set webhook URL for Slack/Discord/custom delivery"},
+    {"command": "sources", "description": "View source reliability, bias, and trust ratings"},
+    {"command": "filter", "description": "Set briefing filters (e.g. /filter confidence 0.7)"},
+    {"command": "preset", "description": "Save/load briefing presets (e.g. /preset save Work)"},
     {"command": "help", "description": "Show available commands and usage"},
 ]
 
@@ -229,6 +234,22 @@ class TelegramBot:
         ]
         keyboard = {"inline_keyboard": rows}
         return self.send_message(chat_id, text, reply_markup=keyboard)
+
+    def send_quick_briefing(self, chat_id: int | str, formatted_text: str,
+                            item_count: int = 0) -> dict:
+        """Send a quick-scan briefing with compact action buttons."""
+        rows: list[list[dict]] = [
+            [
+                {"text": "\U0001f4cb Full briefing", "callback_data": "cmd:briefing"},
+                {"text": "\U0001f50d Deep Dive", "callback_data": "cmd:deep_dive"},
+            ],
+            [
+                {"text": "\u2b50 Rate Stories", "callback_data": "cmd:rate_prompt"},
+                {"text": "\U0001f4dd Export", "callback_data": "cmd:export"},
+            ],
+        ]
+        keyboard = {"inline_keyboard": rows}
+        return self.send_message(chat_id, formatted_text, reply_markup=keyboard)
 
     def send_breaking_alert(self, chat_id: int | str, formatted_text: str) -> dict:
         """Send a breaking alert with urgency formatting."""
@@ -431,6 +452,37 @@ class TelegramBot:
         if muted:
             lines.append(f"<b>Muted:</b> {', '.join(muted)}")
 
+        # Advanced filters
+        conf_min = profile.get("confidence_min", 0)
+        urg_min = profile.get("urgency_min", "")
+        mps = profile.get("max_per_source", 0)
+        if conf_min or urg_min or mps:
+            lines.append("")
+            lines.append("<b>Briefing Filters:</b>")
+            if conf_min:
+                lines.append(f"  Confidence: \u2265 {conf_min:.0%}")
+            if urg_min:
+                lines.append(f"  Urgency: \u2265 {urg_min}")
+            if mps:
+                lines.append(f"  Max per source: {mps}")
+
+        # Alert thresholds (only show if non-default)
+        geo_t = profile.get("alert_georisk_threshold", 0.5)
+        trend_t = profile.get("alert_trend_threshold", 3.0)
+        if geo_t != 0.5 or trend_t != 3.0:
+            lines.append("")
+            lines.append("<b>Alert Sensitivity:</b>")
+            if geo_t != 0.5:
+                lines.append(f"  Geo-risk at: {geo_t:.0%}")
+            if trend_t != 3.0:
+                lines.append(f"  Trend spike at: {trend_t:.1f}x")
+
+        # Presets
+        presets = profile.get("presets", {})
+        if presets:
+            lines.append("")
+            lines.append(f"<b>Saved Presets:</b> {', '.join(presets.keys())}")
+
         crypto = profile.get("watchlist_crypto", [])
         stocks = profile.get("watchlist_stocks", [])
         if crypto or stocks:
@@ -456,18 +508,16 @@ class TelegramBot:
 
         lines.extend([
             "",
-            "<b>Feedback (send as plain text):</b>",
-            "\u2022 <code>more geopolitics</code> \u2014 Increase topic weight",
-            "\u2022 <code>less crypto</code> \u2014 Decrease topic weight",
-            "\u2022 <code>tone: analyst</code> \u2014 Change tone",
-            "\u2022 <code>format: sections</code> \u2014 Change format",
-            "\u2022 <code>region: middle_east</code> \u2014 Add region",
-            "\u2022 <code>remove region: middle_east</code> \u2014 Remove region",
-            "\u2022 <code>cadence: morning</code> \u2014 Set cadence",
-            "\u2022 <code>max: 15</code> \u2014 Set max items",
-            "\u2022 <code>prefer reuters</code> \u2014 Boost source",
-            "\u2022 <code>demote reddit</code> \u2014 Penalize source",
-            "\u2022 <code>reset preferences</code> \u2014 Reset all",
+            "<b>Natural language (just type):</b>",
+            "\u2022 <code>What's happening with AI?</code> \u2014 Topic briefing",
+            "\u2022 <code>Find stories about regulation</code> \u2014 Search history",
+            "\u2022 <code>What's trending?</code> \u2014 Weekly trends",
+            "",
+            "<b>Preferences (just type):</b>",
+            "\u2022 <code>more geopolitics</code> / <code>less crypto</code>",
+            "\u2022 <code>tone: analyst</code> / <code>format: sections</code>",
+            "\u2022 <code>prefer reuters</code> / <code>demote reddit</code>",
+            "\u2022 <code>region: middle_east</code> / <code>max: 15</code>",
         ])
 
         return "\n".join(lines)

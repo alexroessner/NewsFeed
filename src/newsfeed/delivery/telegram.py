@@ -246,6 +246,35 @@ class TelegramFormatter:
 
         return "\n".join(lines).strip()
 
+    def format_thread_separator(self, thread_info: dict) -> str:
+        """Format a narrative thread separator inserted before grouped stories."""
+        headline = _esc(thread_info.get("headline", "Related Stories"))
+        sources = thread_info.get("source_count", 1)
+        count = thread_info.get("story_count", 1)
+        urgency = thread_info.get("urgency", "routine")
+        lifecycle = thread_info.get("lifecycle", "developing")
+
+        urgency_icon = {
+            "critical": "\U0001f534", "breaking": "\U0001f7e0",
+            "elevated": "\U0001f7e1", "routine": "\u26aa",
+        }.get(urgency, "\u26aa")
+
+        lifecycle_label = {
+            "breaking": "\u26a1 Breaking", "developing": "\U0001f504 Developing",
+            "ongoing": "\u27a1\ufe0f Ongoing", "waning": "\U0001f4c9 Waning",
+            "resolved": "\u2705 Resolved",
+        }.get(lifecycle, lifecycle)
+
+        parts = [f"{count} stories"]
+        if sources > 1:
+            parts.append(f"{sources} sources")
+
+        detail = " \u00b7 ".join(parts)
+        return (
+            f"{urgency_icon} <b>\U0001f517 {headline}</b>\n"
+            f"<i>{lifecycle_label} \u00b7 {detail}</i>"
+        )
+
     def format_story_card(self, item: ReportItem, index: int,
                           is_tracked: bool = False,
                           delta_tag: str = "") -> str:
@@ -1058,4 +1087,73 @@ class TelegramFormatter:
             lines.append("")
 
         lines.append("<i>Remove: /unsave [number]</i>")
+        return "\n".join(lines).strip()
+
+    def format_sources(self, sources: list[dict],
+                       user_weights: dict[str, float] | None = None) -> str:
+        """Format source credibility dashboard showing reliability, bias, and trust."""
+        lines: list[str] = []
+        lines.append("<b>\U0001f50e Source Intelligence Dashboard</b>")
+        lines.append(f"<i>{len(sources)} sources tracked</i>")
+        lines.append("")
+
+        if not sources:
+            lines.append("<i>No source data available yet. Run /briefing first.</i>")
+            return "\n".join(lines).strip()
+
+        # Tier groupings
+        tier_labels = {
+            "tier_1": "\U0001f947 Tier 1 — Wire Services & Prestige",
+            "tier_1b": "\U0001f948 Tier 1b — Major International",
+            "tier_academic": "\U0001f393 Academic & Research",
+            "tier_2": "\U0001f310 Tier 2 — Community & Aggregators",
+            "unknown": "\u2753 Other",
+        }
+
+        by_tier: dict[str, list[dict]] = {}
+        for s in sources:
+            tier = s.get("tier", "unknown")
+            by_tier.setdefault(tier, []).append(s)
+
+        tier_order = ["tier_1", "tier_1b", "tier_academic", "tier_2", "unknown"]
+        for tier in tier_order:
+            tier_sources = by_tier.get(tier, [])
+            if not tier_sources:
+                continue
+
+            lines.append(f"<b>{tier_labels.get(tier, tier)}</b>")
+
+            for s in sorted(tier_sources, key=lambda x: x.get("reliability", 0), reverse=True):
+                name = _esc(s["source_id"])
+                reliability = s.get("reliability", 0)
+                bias = s.get("bias", "unrated")
+                trust = s.get("trust_factor", 0)
+                seen = s.get("items_seen", 0)
+                corr = s.get("corroboration_rate", 0)
+
+                # Reliability bar
+                filled = round(reliability * 10)
+                bar = "\u2588" * filled + "\u2591" * (10 - filled)
+
+                # User weight indicator
+                weight_str = ""
+                if user_weights and name.lower() in user_weights:
+                    w = user_weights[name.lower()]
+                    if w > 0:
+                        weight_str = f" \u2191{w:+.1f}"
+                    elif w < 0:
+                        weight_str = f" \u2193{w:+.1f}"
+
+                lines.append(
+                    f"  <b>{name}</b>{weight_str}\n"
+                    f"    {bar} {reliability:.0%} reliable\n"
+                    f"    Bias: <i>{_esc(bias)}</i> \u00b7 "
+                    f"Trust: {trust:.0%} \u00b7 "
+                    f"Corr: {corr:.0%}"
+                )
+                if seen:
+                    lines.append(f"    <i>{seen} stories processed</i>")
+                lines.append("")
+
+        lines.append("<i>Adjust: /feedback prefer [source] or demote [source]</i>")
         return "\n".join(lines).strip()
