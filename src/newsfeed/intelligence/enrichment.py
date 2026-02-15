@@ -355,9 +355,10 @@ def gemini_summary(
         f"{article_truncated}"
     )
 
+    # API key in header, not URL — URLs leak into logs, proxies, and error traces
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/{model}"
-        f":generateContent?key={api_key}"
+        f":generateContent"
     )
 
     try:
@@ -372,7 +373,10 @@ def gemini_summary(
         req = urllib.request.Request(
             url,
             data=body,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key,
+            },
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=20) as resp:
