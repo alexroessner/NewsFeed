@@ -91,13 +91,15 @@ class PreferenceStore:
             profile.regions_of_interest.remove(region)
         return profile
 
+    _MAX_WATCHLIST_SIZE = 50  # Prevent resource exhaustion via unbounded lists
+
     def set_watchlist(self, user_id: str, crypto: list[str] | None = None,
                      stocks: list[str] | None = None) -> UserProfile:
         profile = self.get_or_create(user_id)
         if crypto is not None:
-            profile.watchlist_crypto = crypto
+            profile.watchlist_crypto = crypto[:self._MAX_WATCHLIST_SIZE]
         if stocks is not None:
-            profile.watchlist_stocks = stocks
+            profile.watchlist_stocks = stocks[:self._MAX_WATCHLIST_SIZE]
         return profile
 
     def set_timezone(self, user_id: str, tz: str) -> UserProfile:

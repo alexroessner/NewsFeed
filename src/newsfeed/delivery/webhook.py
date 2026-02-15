@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import logging
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlparse
@@ -167,12 +169,30 @@ def format_alert_payload(alert_type: str, alert_data: dict,
     return payload
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """HTTP redirect handler that blocks all redirects to prevent SSRF.
+
+    An attacker could set a webhook URL to https://evil.com/redir which
+    returns a 302 to http://169.254.169.254/latest/meta-data/ (cloud
+    metadata) or http://127.0.0.1:8080/admin, bypassing our URL
+    validation.  By refusing to follow redirects we close this vector.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ARG002
+        raise urllib.error.HTTPError(
+            req.full_url, code,
+            f"Redirect blocked (SSRF prevention): {newurl}",
+            headers, fp,
+        )
+
+
 def send_webhook(url: str, payload: dict[str, Any],
                  timeout: float = 10.0) -> bool:
-    """Send a JSON payload to a webhook URL. Returns True on success."""
-    import urllib.request
-    import urllib.error
+    """Send a JSON payload to a webhook URL. Returns True on success.
 
+    SECURITY: Uses a custom opener that refuses HTTP redirects to prevent
+    SSRF via open-redirect chains (validated URL -> 302 -> internal IP).
+    """
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -180,10 +200,15 @@ def send_webhook(url: str, payload: dict[str, Any],
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+    # Build opener with our redirect-blocking handler (replaces default)
+    opener = urllib.request.build_opener(_NoRedirectHandler)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with opener.open(req, timeout=timeout) as resp:
             return 200 <= resp.status < 300
     except urllib.error.HTTPError as exc:
+        if 300 <= exc.code < 400:
+            log.warning("Webhook redirect blocked (SSRF prevention): %s", url)
+            return False
         log.warning("Webhook HTTP error: %s %s", exc.code, exc.reason)
         return False
     except Exception:
