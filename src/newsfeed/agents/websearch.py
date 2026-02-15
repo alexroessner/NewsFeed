@@ -92,13 +92,18 @@ class WebSearchAgent(ResearchAgent):
         log.info("WebSearch agent %s returned %d candidates", self.agent_id, len(result))
         return result
 
+    _MAX_FEED_BYTES = 5 * 1024 * 1024  # 5 MB
+
     def _fetch_rss(self, url: str, default_topic: str, task: ResearchTask) -> list[CandidateItem]:
         try:
             req = Request(url, headers={
                 "User-Agent": "Mozilla/5.0 (compatible; NewsFeed/1.0)",
             })
             with urlopen(req, timeout=self._timeout) as resp:
-                xml_data = resp.read()
+                xml_data = resp.read(self._MAX_FEED_BYTES + 1)
+            if len(xml_data) > self._MAX_FEED_BYTES:
+                log.warning("Google News RSS response too large (%d bytes), skipping", len(xml_data))
+                return []
         except (URLError, OSError) as e:
             log.error("Google News RSS fetch failed: %s", e)
             return []

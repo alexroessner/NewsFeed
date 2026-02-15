@@ -105,11 +105,16 @@ class BBCAgent(ResearchAgent):
 
         return selected
 
+    _MAX_FEED_BYTES = 5 * 1024 * 1024  # 5 MB
+
     def _fetch_feed(self, feed_name: str, url: str, task: ResearchTask) -> list[CandidateItem]:
         try:
             req = Request(url, headers={"User-Agent": "NewsFeed/1.0"})
             with urlopen(req, timeout=self._timeout) as resp:
-                xml_data = resp.read()
+                xml_data = resp.read(self._MAX_FEED_BYTES + 1)
+            if len(xml_data) > self._MAX_FEED_BYTES:
+                log.warning("BBC RSS feed too large for %s (%d bytes), skipping", feed_name, len(xml_data))
+                return []
         except (URLError, OSError) as e:
             log.error("BBC RSS fetch failed for %s: %s", feed_name, e)
             return []
