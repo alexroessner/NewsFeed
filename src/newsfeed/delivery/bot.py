@@ -420,15 +420,15 @@ class TelegramBot:
         """Format user settings for display."""
         lines = ["<b>\u2699 Your NewsFeed Settings</b>", ""]
 
-        lines.append(f"\u2022 Tone: <code>{profile.get('tone', 'concise')}</code>")
-        lines.append(f"\u2022 Format: <code>{profile.get('format', 'bullet')}</code>")
+        lines.append(f"\u2022 Tone: <code>{html_mod.escape(str(profile.get('tone', 'concise')))}</code>")
+        lines.append(f"\u2022 Format: <code>{html_mod.escape(str(profile.get('format', 'bullet')))}</code>")
         lines.append(f"\u2022 Max items: <code>{profile.get('max_items', 10)}</code>")
-        lines.append(f"\u2022 Cadence: <code>{profile.get('cadence', 'on_demand')}</code>")
-        lines.append(f"\u2022 Timezone: <code>{profile.get('timezone', 'UTC')}</code>")
+        lines.append(f"\u2022 Cadence: <code>{html_mod.escape(str(profile.get('cadence', 'on_demand')))}</code>")
+        lines.append(f"\u2022 Timezone: <code>{html_mod.escape(str(profile.get('timezone', 'UTC')))}</code>")
 
         schedule = profile.get("schedule")
         if schedule:
-            lines.append(f"\u2022 Schedule: <code>{schedule}</code>")
+            lines.append(f"\u2022 Schedule: <code>{html_mod.escape(str(schedule))}</code>")
 
         topics = profile.get("topic_weights", {})
         if topics:

@@ -346,19 +346,36 @@ class CandidateCache:
 
 
 class StatePersistence:
+    # Only alphanumeric + underscore/hyphen allowed in persistence keys
+    _VALID_KEY_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+
     def __init__(self, state_dir: Path) -> None:
         self.state_dir = state_dir
         self.state_dir.mkdir(parents=True, exist_ok=True)
 
+    def _safe_path(self, key: str) -> Path:
+        """Resolve a persistence key to a safe file path.
+
+        SECURITY: Rejects keys containing path traversal sequences or
+        characters outside a strict allowlist.
+        """
+        if not self._VALID_KEY_RE.match(key):
+            raise ValueError(f"Invalid persistence key: {key!r}")
+        path = (self.state_dir / f"{key}.json").resolve()
+        # Belt-and-suspenders: ensure resolved path is under state_dir
+        if not str(path).startswith(str(self.state_dir.resolve())):
+            raise ValueError(f"Path traversal blocked for key: {key!r}")
+        return path
+
     def save(self, key: str, data: dict) -> None:
-        path = self.state_dir / f"{key}.json"
+        path = self._safe_path(key)
         tmp = path.with_suffix(".tmp")
         with tmp.open("w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, default=str)
         tmp.rename(path)
 
     def load(self, key: str) -> dict | None:
-        path = self.state_dir / f"{key}.json"
+        path = self._safe_path(key)
         if not path.exists():
             return None
         try:
