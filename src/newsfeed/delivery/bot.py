@@ -72,6 +72,7 @@ BOT_COMMANDS = [
     {"command": "sources", "description": "View source reliability, bias, and trust ratings"},
     {"command": "filter", "description": "Set briefing filters (e.g. /filter confidence 0.7)"},
     {"command": "preset", "description": "Save/load briefing presets (e.g. /preset save Work)"},
+    {"command": "transparency", "description": "Pipeline trace \u2014 see how your briefing was built"},
     {"command": "help", "description": "Show available commands and usage"},
 ]
 
@@ -380,6 +381,15 @@ class TelegramBot:
                     "user_id": user_id,
                     "command": "compare",
                     "args": data[8:],  # story index number
+                    "text": "",
+                }
+            if data.startswith("onboard:"):
+                return {
+                    "type": "onboard",
+                    "chat_id": chat_id,
+                    "user_id": user_id,
+                    "command": data,  # "onboard:topic:X" or "onboard:role:X" etc.
+                    "args": "",
                     "text": "",
                 }
             return None
