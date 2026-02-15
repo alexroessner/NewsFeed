@@ -30,6 +30,7 @@ from newsfeed.orchestration.handlers.management import (
     handle_unsave as _h_unsave,
     handle_untrack as _h_untrack,
 )
+from newsfeed.memory.commands import parse_preference_commands_rich
 from newsfeed.delivery.onboarding import (
     OnboardingState,
     apply_onboarding_profile,
@@ -138,10 +139,13 @@ class CommunicationAgent:
             elif cmd_type == "onboard":
                 result = self._handle_onboard_callback(chat_id, user_id, command)
 
-        except Exception:
+        except Exception as exc:
             log.exception("Error handling update for user=%s", user_id)
-            self._bot.send_message(chat_id, "Something went wrong. Please try again.")
-            result = {"action": "error", "user_id": user_id}
+            # Categorize the error so the user gets actionable feedback
+            error_msg = self._categorize_error(exc)
+            self._bot.send_message(chat_id, error_msg)
+            result = {"action": "error", "user_id": user_id,
+                      "error_type": type(exc).__name__}
 
         # Analytics: record EVERY interaction
         self._engine.analytics.record_interaction(
@@ -351,6 +355,14 @@ class CommunicationAgent:
 
         if command == "admin":
             return self._handle_admin(chat_id, user_id, args)
+
+        if command == "_stale_callback":
+            self._bot.send_message(
+                chat_id,
+                "This button is no longer active. "
+                "Run /briefing for a fresh briefing with working controls."
+            )
+            return {"action": "stale_callback", "user_id": user_id}
 
         # Unknown command
         import html as html_mod
@@ -886,16 +898,55 @@ class CommunicationAgent:
 
     def _handle_feedback(self, chat_id: int | str, user_id: str,
                          text: str) -> dict[str, Any]:
-        """Apply user feedback to preferences with rich weight preview."""
+        """Apply user feedback to preferences with fuzzy matching and rich preview."""
+        import html as html_mod
+
+        # Collect known topics for fuzzy matching
+        profile = self._engine.preferences.get_or_create(user_id)
+        known_topics = set(profile.topic_weights.keys())
+        known_topics.update(self._default_topics.keys())
+
+        # Parse with fuzzy matching to catch typos
+        parse_result = parse_preference_commands_rich(
+            text, known_topics=known_topics,
+            deltas=getattr(self._engine, '_preference_deltas', None),
+        )
+
+        # Surface unrecognized values immediately
+        if parse_result.unrecognized and not parse_result.commands:
+            hints = "\n".join(
+                f"\u2022 {html_mod.escape(u)}" for u in parse_result.unrecognized
+            )
+            self._bot.send_message(chat_id, f"\u26a0\ufe0f {hints}")
+            return {"action": "feedback_invalid", "user_id": user_id,
+                    "errors": parse_result.unrecognized}
+
+        # Apply via engine (use standard path for actual application)
         results = self._engine.apply_user_feedback(
             user_id, text, is_admin=self._is_admin(user_id)
         )
 
+        # If rich parser corrected topics, re-apply with corrected topics
+        if parse_result.corrections and parse_result.commands:
+            for cmd in parse_result.commands:
+                if cmd.action == "topic_delta" and cmd.topic and cmd.value:
+                    delta = float(cmd.value)
+                    self._engine.preferences.apply_weight_adjustment(
+                        user_id, cmd.topic, delta)
+                    results[f"topic:{cmd.topic}"] = str(
+                        self._engine.preferences.get_or_create(user_id)
+                        .topic_weights.get(cmd.topic, 0.0))
+
         if results:
-            import html as html_mod
-            # Build rich confirmation with weight preview
+            # Refresh profile after changes
             profile = self._engine.preferences.get_or_create(user_id)
             lines: list[str] = ["<b>Preferences updated:</b>", ""]
+
+            # Show corrections first so user knows what happened
+            for correction in parse_result.corrections:
+                lines.append(f"\U0001f504 <i>{html_mod.escape(correction)}</i>")
+            if parse_result.corrections:
+                lines.append("")
 
             for key, val in results.items():
                 lines.append(f"\u2022 {html_mod.escape(str(key))} = {html_mod.escape(str(val))}")
@@ -911,7 +962,6 @@ class CommunicationAgent:
                     bar = "\u2588" * max(1, int(abs(weight) * 10))
                     lines.append(f"  {name}: {weight:.0%} {bar}")
                 lines.append("")
-                # Estimate effect on next briefing
                 total_items = profile.max_items
                 top_topic = sorted_topics[0][0].replace("_", " ").title() if sorted_topics else "general"
                 lines.append(
@@ -928,8 +978,15 @@ class CommunicationAgent:
                     label = "\u2191 boosted" if sw > 0 else "\u2193 demoted"
                     lines.append(f"  {html_mod.escape(src)}: {label}")
 
+            # Surface any unrecognized parts alongside successful changes
+            if parse_result.unrecognized:
+                lines.append("")
+                for u in parse_result.unrecognized:
+                    lines.append(f"\u26a0\ufe0f <i>{html_mod.escape(u)}</i>")
+
             self._bot.send_message(chat_id, "\n".join(lines))
-            return {"action": "feedback", "user_id": user_id, "changes": results}
+            return {"action": "feedback", "user_id": user_id, "changes": results,
+                    "corrections": parse_result.corrections}
 
         # No preference match — try conversational intent detection
         intent, arg = self._detect_intent(text)
@@ -2876,6 +2933,41 @@ class CommunicationAgent:
     # ──────────────────────────────────────────────────────────────
     # ADMIN COMMANDS — owner-only analytics dashboard via Telegram
     # ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _categorize_error(exc: Exception) -> str:
+        """Turn an exception into a user-friendly message.
+
+        Instead of generic "Something went wrong", tell the user what
+        class of problem occurred so they can decide whether to retry,
+        wait, or report.
+        """
+        name = type(exc).__name__
+        msg = str(exc)[:100] if str(exc) else ""
+
+        if "timeout" in name.lower() or "timeout" in msg.lower():
+            return (
+                "\u23f3 The request timed out. News sources may be slow right now. "
+                "Please try again in a moment."
+            )
+        if "connection" in name.lower() or "urlerror" in name.lower():
+            return (
+                "\U0001f310 Network error \u2014 couldn't reach news sources. "
+                "Check your connection and try again."
+            )
+        if "permission" in name.lower() or "auth" in name.lower():
+            return (
+                "\U0001f512 Access error. If this persists, contact the bot admin."
+            )
+        if isinstance(exc, (ValueError, TypeError, KeyError)):
+            return (
+                "\u26a0\ufe0f Something unexpected happened while processing your request. "
+                "Try again, or use /help to see available commands."
+            )
+        return (
+            "\u26a0\ufe0f Something went wrong. "
+            "Try again in a moment, or use /help for available commands."
+        )
 
     def _is_admin(self, user_id: str) -> bool:
         """Check if user is the admin/owner.
