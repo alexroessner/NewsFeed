@@ -6,8 +6,10 @@ generic endpoint that accepts JSON POST requests.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
+import socket
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -35,21 +37,79 @@ def validate_webhook_url(url: str) -> tuple[bool, str]:
         return False, "Only HTTPS URLs are allowed"
     if not parsed.hostname:
         return False, "URL must include a hostname"
-    # Block localhost/private IPs (RFC1918 + loopback + link-local)
+    # Block localhost/private IPs using the ipaddress module for comprehensive
+    # coverage of IPv4, IPv6, IPv4-mapped IPv6, ULA, link-local, and metadata IPs.
     hostname = parsed.hostname.lower()
-    if hostname in ("localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]"):
+    if hostname in ("localhost",):
         return False, "Localhost URLs are not allowed"
-    if hostname.startswith("10.") or hostname.startswith("192.168."):
-        return False, "Private network URLs are not allowed"
-    # 172.16.0.0/12 (172.16.x.x through 172.31.x.x)
-    if hostname.startswith("172."):
-        parts = hostname.split(".")
-        if len(parts) >= 2 and parts[1].isdigit() and 16 <= int(parts[1]) <= 31:
-            return False, "Private network URLs are not allowed"
-    # 169.254.x.x link-local
-    if hostname.startswith("169.254."):
-        return False, "Link-local URLs are not allowed"
+    # Resolve hostname to IP and check all resolved addresses
+    blocked, reason = _check_hostname_ip(hostname)
+    if blocked:
+        return False, reason
     return True, ""
+
+
+# Cloud metadata IPs that must be blocked (AWS, GCP, Azure)
+_METADATA_IPS = frozenset({
+    ipaddress.ip_address("169.254.169.254"),  # AWS/GCP metadata
+    ipaddress.ip_address("fd00:ec2::254"),    # AWS IPv6 metadata
+})
+
+
+def _check_hostname_ip(hostname: str) -> tuple[bool, str]:
+    """Resolve hostname and check if any IP is private/reserved/metadata.
+
+    Returns (blocked, reason). If blocked is True, the URL must be rejected.
+    """
+    # First check if hostname is already an IP literal
+    try:
+        addr = ipaddress.ip_address(hostname.strip("[]"))
+        return _is_blocked_ip(addr)
+    except ValueError:
+        pass  # Not an IP literal — resolve via DNS
+
+    try:
+        results = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+    except socket.gaierror:
+        return True, "Could not resolve hostname"
+
+    if not results:
+        return True, "Hostname resolved to no addresses"
+
+    for family, _, _, _, sockaddr in results:
+        try:
+            addr = ipaddress.ip_address(sockaddr[0])
+            blocked, reason = _is_blocked_ip(addr)
+            if blocked:
+                return True, reason
+        except ValueError:
+            continue
+
+    return False, ""
+
+
+def _is_blocked_ip(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> tuple[bool, str]:
+    """Check if an IP address is in a blocked range."""
+    # Handle IPv4-mapped IPv6 (::ffff:127.0.0.1) by extracting the IPv4 part
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
+        addr = addr.ipv4_mapped
+
+    if addr.is_loopback:
+        return True, "Loopback addresses are not allowed"
+    if addr.is_private:
+        return True, "Private network addresses are not allowed"
+    if addr.is_reserved:
+        return True, "Reserved addresses are not allowed"
+    if addr.is_link_local:
+        return True, "Link-local addresses are not allowed"
+    if addr.is_multicast:
+        return True, "Multicast addresses are not allowed"
+    if addr in _METADATA_IPS:
+        return True, "Cloud metadata addresses are not allowed"
+    # Block 0.0.0.0 explicitly (is_unspecified)
+    if addr.is_unspecified:
+        return True, "Unspecified addresses are not allowed"
+    return False, ""
 
 
 def _detect_platform(url: str) -> str:

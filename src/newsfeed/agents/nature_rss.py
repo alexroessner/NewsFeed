@@ -66,11 +66,16 @@ class NatureAgent(GenericRSSAgent):
             max_feeds=1,
         )
 
+    _MAX_FEED_BYTES = 5 * 1024 * 1024  # 5 MB
+
     def _fetch_feed(self, feed_name: str, url: str, task: ResearchTask) -> list[CandidateItem]:
         try:
             req = Request(url, headers={"User-Agent": "NewsFeed/1.0"})
             with urlopen(req, timeout=self._timeout) as resp:
-                xml_data = resp.read()
+                xml_data = resp.read(self._MAX_FEED_BYTES + 1)
+            if len(xml_data) > self._MAX_FEED_BYTES:
+                log.warning("Nature RSS feed too large for %s (%d bytes), skipping", feed_name, len(xml_data))
+                return []
         except (URLError, OSError) as e:
             log.error("Nature RSS fetch failed for %s: %s", feed_name, e)
             return []
@@ -98,16 +103,17 @@ class NatureAgent(GenericRSSAgent):
             title = title_el.text.strip() if title_el is not None and title_el.text else ""
             link = link_el.text.strip() if link_el is not None and link_el.text else ""
 
-            # Extract summary from content:encoded (strip HTML)
+            # Extract summary from content:encoded (unescape then strip HTML)
             summary = ""
             if content_el is not None and content_el.text:
-                summary = _HTML_TAG_RE.sub("", content_el.text).strip()
+                summary = content_el.text.strip()
 
             if not title:
                 continue
 
-            title = html.unescape(title)
-            summary = html.unescape(summary)
+            # Unescape entities first, then strip any resulting HTML tags
+            title = _HTML_TAG_RE.sub("", html.unescape(title)).strip()
+            summary = _HTML_TAG_RE.sub("", html.unescape(summary)).strip()
 
             created_at = datetime.now(timezone.utc)
             if date_el is not None and date_el.text:

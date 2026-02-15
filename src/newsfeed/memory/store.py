@@ -109,8 +109,11 @@ class PreferenceStore:
             profile.watchlist_stocks = stocks[:self._MAX_WATCHLIST_SIZE]
         return profile
 
+    _MAX_TIMEZONE_LEN = 50  # Longest IANA tz is ~32 chars (e.g. "America/Argentina/Buenos_Aires")
+
     def set_timezone(self, user_id: str, tz: str) -> UserProfile:
         profile = self.get_or_create(user_id)
+        tz = tz[:self._MAX_TIMEZONE_LEN]
         profile.timezone = tz
         return profile
 
@@ -186,8 +189,11 @@ class PreferenceStore:
             profile.bookmarks.pop(index - 1)
         return profile
 
+    _MAX_PRESET_NAME_LEN = 50  # Reasonable limit for a human-typed preset name
+
     def save_preset(self, user_id: str, name: str) -> UserProfile:
         """Save current preferences as a named preset."""
+        name = name[:self._MAX_PRESET_NAME_LEN]
         profile = self.get_or_create(user_id)
         profile.presets[name] = {
             "topic_weights": dict(profile.topic_weights),

@@ -16,10 +16,13 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
+import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
+from urllib.parse import urlparse
 
 from newsfeed.models.domain import CandidateItem
 
@@ -112,10 +115,44 @@ def _decode_entities(text: str) -> str:
 
 # ── Article fetching ──────────────────────────────────────────────
 
+_SAFE_FETCH_SCHEMES = frozenset({"http", "https"})
+
+# Per-domain rate limiting: avoid hammering the same news site when multiple
+# articles are fetched concurrently.  Minimum 0.5s between requests to any
+# single domain.  Thread-safe via lock.
+_domain_lock = threading.Lock()
+_domain_last_access: dict[str, float] = {}
+_DOMAIN_MIN_INTERVAL = 0.5  # seconds
+_DOMAIN_CACHE_MAX = 500  # prevent unbounded growth
+
+
+def _throttle_domain(url: str) -> None:
+    """Sleep if needed to enforce per-domain minimum interval."""
+    hostname = urlparse(url).hostname or ""
+    if not hostname:
+        return
+    with _domain_lock:
+        # Evict stale entries if cache grows too large
+        if len(_domain_last_access) > _DOMAIN_CACHE_MAX:
+            _domain_last_access.clear()
+        last = _domain_last_access.get(hostname, 0.0)
+        now = time.monotonic()
+        wait = _DOMAIN_MIN_INTERVAL - (now - last)
+        _domain_last_access[hostname] = max(now, last + _DOMAIN_MIN_INTERVAL)
+    if wait > 0:
+        time.sleep(wait)
+
+
 def fetch_article(url: str, timeout: int = 8) -> str:
     """Fetch article HTML from a URL. Returns empty string on failure."""
     if not url or url.startswith("https://example.com"):
         return ""
+    # Only allow http/https — block file://, ftp://, data://, gopher:// etc.
+    scheme = url.split(":", 1)[0].lower().strip() if ":" in url else ""
+    if scheme not in _SAFE_FETCH_SCHEMES:
+        log.debug("Blocked fetch for non-http scheme: %s", scheme)
+        return ""
+    _throttle_domain(url)
     try:
         req = urllib.request.Request(url, headers={
             "User-Agent": "Mozilla/5.0 (compatible; NewsFeed/1.0)",
@@ -318,9 +355,10 @@ def gemini_summary(
         f"{article_truncated}"
     )
 
+    # API key in header, not URL — URLs leak into logs, proxies, and error traces
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/{model}"
-        f":generateContent?key={api_key}"
+        f":generateContent"
     )
 
     try:
@@ -335,7 +373,10 @@ def gemini_summary(
         req = urllib.request.Request(
             url,
             data=body,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key,
+            },
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=20) as resp:

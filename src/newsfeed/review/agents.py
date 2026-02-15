@@ -485,7 +485,7 @@ def _parse_json(text: str) -> dict:
             return json.loads(match.group(1))
         except json.JSONDecodeError:
             pass
-    match = re.search(r"\{.*\}", text, re.DOTALL)
+    match = re.search(r"\{.*?\}", text, re.DOTALL)
     if match:
         try:
             return json.loads(match.group(0))

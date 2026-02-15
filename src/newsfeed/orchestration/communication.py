@@ -120,9 +120,10 @@ class CommunicationAgent:
         """Check if user is rate-limited for expensive commands.
 
         Returns True if the request should be BLOCKED (rate limited).
+        Uses monotonic clock so system time adjustments can't bypass limits.
         """
         import time
-        now = time.time()
+        now = time.monotonic()
         last = self._rate_limits.get(user_id, 0)
         if now - last < self._RATE_LIMIT_SECONDS:
             remaining = int(self._RATE_LIMIT_SECONDS - (now - last))
@@ -1176,7 +1177,7 @@ class CommunicationAgent:
 
         lines = [f"<b>\U0001f4cc Tracked Stories ({len(tracked)})</b>", ""]
         for i, t in enumerate(tracked, 1):
-            topic = t["topic"].replace("_", " ").title()
+            topic = html_mod.escape(t["topic"].replace("_", " ").title())
             headline = html_mod.escape(t["headline"][:80])
             lines.append(f"  {i}. <b>{headline}</b>")
             lines.append(f"     <i>{topic}</i>")

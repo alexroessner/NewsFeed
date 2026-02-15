@@ -15,6 +15,7 @@ from __future__ import annotations
 import html as html_mod
 import json
 import logging
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -583,6 +584,7 @@ class BriefingScheduler:
     """
 
     def __init__(self) -> None:
+        self._lock = threading.Lock()
         self._schedules: dict[str, dict[str, Any]] = {}
         self._last_sent: dict[str, float] = {}
         self._muted_until: dict[str, float] = {}  # user_id -> timestamp when mute expires
@@ -633,22 +635,26 @@ class BriefingScheduler:
         Compares the scheduled time against each user's local timezone,
         so a user in US/Eastern with schedule "08:00" gets their briefing
         at 8 AM Eastern, not 8 AM UTC.
+
+        Thread-safe: uses a lock to prevent duplicate sends from concurrent
+        callers (e.g. multiple polling threads or webhook handlers).
         """
         due: list[str] = []
 
-        for user_id, schedule in self._schedules.items():
-            if self.is_muted(user_id):
-                continue
+        with self._lock:
+            for user_id, schedule in self._schedules.items():
+                if self.is_muted(user_id):
+                    continue
 
-            if schedule["type"] == "realtime":
-                continue
+                if schedule["type"] == "realtime":
+                    continue
 
-            user_now = self._user_local_time(user_id)
-            if schedule["time"] == user_now:
-                last = self._last_sent.get(user_id, 0)
-                if time.time() - last > 120:
-                    due.append(user_id)
-                    self._last_sent[user_id] = time.time()
+                user_now = self._user_local_time(user_id)
+                if schedule["time"] == user_now:
+                    last = self._last_sent.get(user_id, 0)
+                    if time.time() - last > 120:
+                        due.append(user_id)
+                        self._last_sent[user_id] = time.time()
 
         return due
 

@@ -53,10 +53,14 @@ class ArXivAgent(ResearchAgent):
         query = self._build_query(task)
         url = f"{_API_BASE}?search_query={quote_plus(query)}&sortBy=submittedDate&sortOrder=descending&max_results={top_k * 2}"
 
+        _MAX_FEED_BYTES = 5 * 1024 * 1024  # 5 MB
         try:
             req = Request(url, headers={"User-Agent": "NewsFeed/1.0"})
             with urlopen(req, timeout=self._timeout) as resp:
-                xml_data = resp.read()
+                xml_data = resp.read(_MAX_FEED_BYTES + 1)
+            if len(xml_data) > _MAX_FEED_BYTES:
+                log.warning("arXiv API response too large (%d bytes), skipping", len(xml_data))
+                return []
         except (URLError, OSError) as e:
             log.error("arXiv API fetch failed: %s", e)
             return []

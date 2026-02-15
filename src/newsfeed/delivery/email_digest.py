@@ -36,6 +36,11 @@ def _safe_url(url: str) -> bool:
     return scheme in _SAFE_SCHEMES
 
 
+def _esc_attr(text: str) -> str:
+    """Escape text for use inside an HTML attribute (quotes must be escaped)."""
+    return html.escape(text, quote=True)
+
+
 def _confidence_label(item: ReportItem) -> str:
     if not item.confidence:
         return ""
@@ -258,7 +263,7 @@ class EmailDigest:
         if c.url and not c.url.startswith("https://example.com") and _safe_url(c.url):
             title_html = (
                 f'<div class="story-title">{tracked_badge}'
-                f'{index}. <a href="{_esc(c.url)}">{title_esc}</a></div>'
+                f'{index}. <a href="{_esc_attr(c.url)}">{title_esc}</a></div>'
             )
         else:
             title_html = f'<div class="story-title">{tracked_badge}{index}. {title_esc}</div>'

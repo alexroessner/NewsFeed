@@ -127,11 +127,16 @@ class GenericRSSAgent(ResearchAgent):
 
         return selected
 
+    _MAX_FEED_BYTES = 5 * 1024 * 1024  # 5 MB — legitimate RSS feeds are well under 1 MB
+
     def _fetch_feed(self, feed_name: str, url: str, task: ResearchTask) -> list[CandidateItem]:
         try:
             req = Request(url, headers={"User-Agent": "NewsFeed/1.0"})
             with urlopen(req, timeout=self._timeout) as resp:
-                xml_data = resp.read()
+                xml_data = resp.read(self._MAX_FEED_BYTES + 1)
+            if len(xml_data) > self._MAX_FEED_BYTES:
+                log.warning("%s RSS feed too large for %s (%d bytes), skipping", self.source, feed_name, len(xml_data))
+                return []
         except (URLError, OSError) as e:
             log.error("%s RSS fetch failed for %s: %s", self.source, feed_name, e)
             return []
@@ -158,8 +163,10 @@ class GenericRSSAgent(ResearchAgent):
             if not title:
                 continue
 
-            title = html.unescape(self._strip_html(title))
-            summary = html.unescape(self._strip_html(summary))
+            # Unescape entities FIRST (so &lt;b&gt; → <b>), THEN strip tags.
+            # Original order (strip then unescape) could revive encoded HTML.
+            title = self._strip_html(html.unescape(title))
+            summary = self._strip_html(html.unescape(summary))
 
             created_at = datetime.now(timezone.utc)
             if pub_date_el is not None and pub_date_el.text:

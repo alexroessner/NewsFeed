@@ -1,12 +1,28 @@
 from __future__ import annotations
 
 import logging
+import re
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
 log = logging.getLogger(__name__)
+
+# Strip Unicode control characters that could confuse display:
+# - Bidirectional overrides (U+202A-202E, U+2066-2069) reverse text rendering
+# - Zero-width chars (U+200B-200F, U+FEFF) can hide content
+# - Other C0/C1 controls (except tab, newline, carriage return)
+_CONTROL_CHAR_RE = re.compile(
+    r"[\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]"
+)
+
+
+def sanitize_text(text: str) -> str:
+    """Normalize Unicode and strip dangerous control characters."""
+    text = unicodedata.normalize("NFC", text)
+    return _CONTROL_CHAR_RE.sub("", text)
 
 # Module-level scoring config for convenience; engines can also pass config explicitly.
 _SCORING_CFG: dict[str, Any] = {}
@@ -129,6 +145,9 @@ class ResearchTask:
     weighted_topics: dict[str, float]
 
 
+_SAFE_URL_SCHEMES = frozenset({"http", "https", "ftp", ""})
+
+
 @dataclass(slots=True)
 class CandidateItem:
     candidate_id: str
@@ -148,6 +167,26 @@ class CandidateItem:
     regions: list[str] = field(default_factory=list)
     corroborated_by: list[str] = field(default_factory=list)
     contrarian_signal: str = ""
+
+    def __post_init__(self) -> None:
+        # Normalize Unicode and strip control characters from text fields
+        self.title = sanitize_text(self.title)
+        self.summary = sanitize_text(self.summary)
+        # Clamp scores to [0, 1] — agents may produce slight overshoots
+        self.evidence_score = max(0.0, min(1.0, self.evidence_score))
+        self.novelty_score = max(0.0, min(1.0, self.novelty_score))
+        self.preference_fit = max(0.0, min(1.0, self.preference_fit))
+        self.prediction_signal = max(0.0, min(1.0, self.prediction_signal))
+        # Enforce max lengths to prevent memory abuse from corrupted feeds
+        if len(self.title) > 500:
+            self.title = self.title[:500]
+        if len(self.summary) > 2000:
+            self.summary = self.summary[:2000]
+        # Reject dangerous URL schemes at the data layer
+        scheme = self.url.split(":", 1)[0].lower().strip() if ":" in self.url else ""
+        if scheme not in _SAFE_URL_SCHEMES:
+            log.warning("Rejected unsafe URL scheme %r in candidate %s", scheme, self.candidate_id)
+            self.url = ""
 
     def composite_score(self) -> float:
         weights = _get_scoring().get("composite_weights", {})

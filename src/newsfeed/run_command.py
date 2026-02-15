@@ -129,8 +129,8 @@ def main() -> None:
 
     if engine._comm_agent is None:
         log.error("No Telegram bot token configured — cannot process update")
-        log.error("api_keys.telegram_bot_token = %r",
-                  cfg.pipeline.get("api_keys", {}).get("telegram_bot_token", "")[:10] + "...")
+        has_token = bool(cfg.pipeline.get("api_keys", {}).get("telegram_bot_token"))
+        log.error("telegram_bot_token present in config: %s", has_token)
         _send_error_to_chat(update, token, "Bot token not found in config")
         sys.exit(1)
 
