@@ -303,10 +303,12 @@ class DomainModelTests(unittest.TestCase):
         self.assertEqual(issues, [])
 
     def test_validate_candidate_out_of_range(self) -> None:
+        # __post_init__ clamps scores to [0, 1], so validate_candidate
+        # should find no issues — the clamping IS the protection
         c = _make_candidate(evidence=1.5)
+        self.assertEqual(c.evidence_score, 1.0)  # clamped by __post_init__
         issues = validate_candidate(c)
-        self.assertEqual(len(issues), 1)
-        self.assertIn("evidence_score", issues[0])
+        self.assertEqual(len(issues), 0)
 
     def test_validate_candidate_empty_fields(self) -> None:
         c = _make_candidate(title="", source="")
