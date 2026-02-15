@@ -20,6 +20,8 @@ from newsfeed.models.domain import CandidateItem, ResearchTask
 
 log = logging.getLogger(__name__)
 
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
 _FEEDS: dict[str, str] = {
     "top": "https://feeds.bbci.co.uk/news/rss.xml",
     "world": "https://feeds.bbci.co.uk/news/world/rss.xml",
@@ -134,8 +136,9 @@ class BBCAgent(ResearchAgent):
             if not title:
                 continue
 
-            title = html.unescape(self._strip_html(title))
-            summary = html.unescape(self._strip_html(summary))
+            # Unescape entities first, then strip any resulting HTML tags
+            title = self._strip_html(html.unescape(title))
+            summary = self._strip_html(html.unescape(summary))
 
             created_at = datetime.now(timezone.utc)
             if pub_date_el is not None and pub_date_el.text:

@@ -105,9 +105,9 @@ class AlJazeeraAgent(ResearchAgent):
             if not title:
                 continue
 
-            # Decode HTML entities and strip tags
-            title = html.unescape(title)
-            summary = html.unescape(self._strip_html(summary))
+            # Unescape entities first, then strip any resulting HTML tags
+            title = self._strip_html(html.unescape(title))
+            summary = self._strip_html(html.unescape(summary))
 
             created_at = datetime.now(timezone.utc)
             if pub_date_el is not None and pub_date_el.text:

@@ -916,8 +916,27 @@ class GenericRSSAgentTests(unittest.TestCase):
     @patch("newsfeed.agents.rss_generic.urlopen")
     def test_generic_rss_novelty_decreases(self, mock_urlopen) -> None:
         """Novelty score should decrease for items lower in the feed."""
+        from email.utils import format_datetime
         from newsfeed.agents.npr import NPRAgent
-        self._mock_urlopen(mock_urlopen)
+        # Generate RSS with fresh dates so novelty stays above the 0.3 floor
+        now = datetime.now(timezone.utc)
+        d1 = format_datetime(now.replace(hour=max(0, now.hour - 1), minute=0))
+        d2 = format_datetime(now.replace(hour=max(0, now.hour - 6), minute=0))
+        d3 = format_datetime(now.replace(hour=max(0, now.hour - 12), minute=0))
+        rss = f"""<?xml version="1.0"?><rss version="2.0"><channel>
+            <title>Test</title>
+            <item><title>Story A</title><description>Desc A</description>
+                <link>https://example-source.com/a</link><pubDate>{d1}</pubDate></item>
+            <item><title>Story B</title><description>Desc B</description>
+                <link>https://example-source.com/b</link><pubDate>{d2}</pubDate></item>
+            <item><title>Story C</title><description>Desc C</description>
+                <link>https://example-source.com/c</link><pubDate>{d3}</pubDate></item>
+        </channel></rss>"""
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = rss.encode("utf-8")
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_resp
         agent = NPRAgent("npr1", "Track news")
         items = agent._fetch_feed("world", "https://feeds.npr.org/1004/rss.xml", self.task)
         self.assertGreater(items[0].novelty_score, items[2].novelty_score)
