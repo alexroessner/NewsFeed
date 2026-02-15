@@ -912,3 +912,182 @@ class AnalyticsDB:
             rows = self._query(f"SELECT COUNT(*) as c FROM {table}")
             stats[key] = rows[0]["c"] if rows else 0
         return stats
+
+    # ──────────────────────────────────────────────────────────────
+    # RATING INSIGHTS — longitudinal preference analysis
+    # ──────────────────────────────────────────────────────────────
+
+    def get_rating_insights(self, user_id: str,
+                            days: int = 30) -> dict[str, Any]:
+        """Analyze a user's rating patterns over time.
+
+        Returns topic affinities, source preferences, and overall engagement.
+        """
+        cutoff = time.time() - (days * 86400)
+
+        # Topic affinity: net score per topic (ups - downs)
+        topic_rows = self._query(
+            """SELECT topic,
+                      SUM(CASE WHEN direction='up' THEN 1 ELSE 0 END) as ups,
+                      SUM(CASE WHEN direction='down' THEN 1 ELSE 0 END) as downs,
+                      COUNT(*) as total
+               FROM ratings
+               WHERE user_id = ? AND ts > ? AND topic IS NOT NULL
+               GROUP BY topic
+               ORDER BY total DESC""",
+            (user_id, cutoff),
+        )
+
+        # Source affinity: net score per source
+        source_rows = self._query(
+            """SELECT source,
+                      SUM(CASE WHEN direction='up' THEN 1 ELSE 0 END) as ups,
+                      SUM(CASE WHEN direction='down' THEN 1 ELSE 0 END) as downs,
+                      COUNT(*) as total
+               FROM ratings
+               WHERE user_id = ? AND ts > ? AND source IS NOT NULL
+               GROUP BY source
+               ORDER BY total DESC""",
+            (user_id, cutoff),
+        )
+
+        # Overall stats
+        overall = self._query(
+            """SELECT COUNT(*) as total,
+                      SUM(CASE WHEN direction='up' THEN 1 ELSE 0 END) as ups,
+                      SUM(CASE WHEN direction='down' THEN 1 ELSE 0 END) as downs
+               FROM ratings
+               WHERE user_id = ? AND ts > ?""",
+            (user_id, cutoff),
+        )
+        stats = overall[0] if overall else {"total": 0, "ups": 0, "downs": 0}
+
+        return {
+            "topics": topic_rows,
+            "sources": source_rows,
+            "total_ratings": stats["total"],
+            "total_ups": stats["ups"],
+            "total_downs": stats["downs"],
+            "days": days,
+        }
+
+    def get_story_timeline(self, user_id: str, topic: str,
+                           keywords: list[str],
+                           limit: int = 20) -> list[dict]:
+        """Find past briefing items matching a tracked story's topic + keywords.
+
+        Returns items sorted chronologically (oldest first) to show
+        how the story evolved over time.
+        """
+        items = self._query(
+            """SELECT title, source, topic, url, summary, why_it_matters,
+                      predictive_outlook, delivered_at
+               FROM briefing_items
+               WHERE user_id = ? AND topic = ?
+               ORDER BY delivered_at ASC""",
+            (user_id, topic),
+        )
+
+        # Filter: title must share at least 2 keywords with tracked story
+        keyword_set = set(keywords)
+        import re as _re
+        matched = []
+        for item in items:
+            title = item.get("title", "")
+            title_words = set(_re.findall(r"[a-zA-Z]+", title.lower()))
+            if len(title_words & keyword_set) >= 2:
+                matched.append(item)
+            if len(matched) >= limit:
+                break
+
+        return matched
+
+    def get_weekly_summary(self, user_id: str, days: int = 7) -> dict[str, Any]:
+        """Build a weekly intelligence digest from analytics data.
+
+        Aggregates: top stories, topic distribution, source breakdown,
+        trend momentum, geo-risk changes, and user engagement stats.
+        """
+        cutoff = time.time() - (days * 86400)
+
+        # Top stories delivered (by topic)
+        topic_dist = self._query(
+            """SELECT topic, COUNT(*) as count
+               FROM briefing_items
+               WHERE user_id = ? AND delivered_at > ?
+               GROUP BY topic
+               ORDER BY count DESC""",
+            (user_id, cutoff),
+        )
+
+        # Top sources
+        source_dist = self._query(
+            """SELECT source, COUNT(*) as count
+               FROM briefing_items
+               WHERE user_id = ? AND delivered_at > ?
+               GROUP BY source
+               ORDER BY count DESC LIMIT 10""",
+            (user_id, cutoff),
+        )
+
+        # Total briefings and stories
+        briefing_stats = self._query(
+            """SELECT COUNT(DISTINCT request_id) as briefings,
+                      COUNT(*) as stories
+               FROM briefing_items
+               WHERE user_id = ? AND delivered_at > ?""",
+            (user_id, cutoff),
+        )
+        stats = briefing_stats[0] if briefing_stats else {"briefings": 0, "stories": 0}
+
+        # Rating activity
+        rating_stats = self._query(
+            """SELECT COUNT(*) as total,
+                      SUM(CASE WHEN direction='up' THEN 1 ELSE 0 END) as ups,
+                      SUM(CASE WHEN direction='down' THEN 1 ELSE 0 END) as downs
+               FROM ratings
+               WHERE user_id = ? AND ts > ?""",
+            (user_id, cutoff),
+        )
+        ratings = rating_stats[0] if rating_stats else {"total": 0, "ups": 0, "downs": 0}
+
+        # Top-rated stories (most upvoted topics)
+        top_rated = self._query(
+            """SELECT topic, title, source
+               FROM ratings
+               WHERE user_id = ? AND ts > ? AND direction = 'up'
+               ORDER BY ts DESC LIMIT 5""",
+            (user_id, cutoff),
+        )
+
+        # Geo-risk summary (latest snapshot)
+        georisks = self._query(
+            """SELECT region, risk_level, escalation_delta
+               FROM georisk_snapshots
+               WHERE ts > ?
+               ORDER BY ts DESC LIMIT 10""",
+            (cutoff,),
+        )
+
+        # Trend summary (latest emerging)
+        trends = self._query(
+            """SELECT topic, anomaly_score
+               FROM trend_snapshots
+               WHERE ts > ? AND is_emerging = 1
+               ORDER BY anomaly_score DESC LIMIT 5""",
+            (cutoff,),
+        )
+
+        return {
+            "topic_distribution": topic_dist,
+            "source_distribution": source_dist,
+            "briefing_count": stats["briefings"],
+            "story_count": stats["stories"],
+            "rating_total": ratings["total"],
+            "rating_ups": ratings["ups"],
+            "rating_downs": ratings["downs"],
+            "top_rated": top_rated,
+            "georisks": georisks,
+            "trends": trends,
+            "days": days,
+        }

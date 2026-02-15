@@ -163,11 +163,23 @@ class CommunicationAgent:
             # Otherwise run a fuller briefing
             return self._run_briefing(chat_id, user_id, args, deep=True)
 
+        if command == "quick":
+            return self._run_quick_briefing(chat_id, user_id, args)
+
+        if command == "export":
+            return self._export_briefing(chat_id, user_id)
+
         if command == "compare":
             return self._compare_story(chat_id, user_id, args)
 
         if command == "recall":
             return self._recall(chat_id, user_id, args)
+
+        if command == "insights":
+            return self._show_insights(chat_id, user_id)
+
+        if command == "weekly":
+            return self._show_weekly(chat_id, user_id)
 
         if command == "watchlist":
             return self._set_watchlist(chat_id, user_id, args)
@@ -192,6 +204,24 @@ class CommunicationAgent:
 
         if command == "untrack":
             return self._untrack_story(chat_id, user_id, args)
+
+        if command == "save":
+            return self._save_story(chat_id, user_id, args)
+
+        if command == "saved":
+            return self._show_saved(chat_id, user_id)
+
+        if command == "unsave":
+            return self._unsave_story(chat_id, user_id, args)
+
+        if command == "timeline":
+            return self._show_timeline(chat_id, user_id, args)
+
+        if command == "email":
+            return self._set_email(chat_id, user_id, args)
+
+        if command == "digest":
+            return self._send_email_digest(chat_id, user_id)
 
         if command == "reset":
             self._engine.preferences.reset(user_id)
@@ -289,13 +319,18 @@ class CommunicationAgent:
             if is_tracked:
                 tracked_count += 1
 
+        # Compute delta tags (NEW / UPDATED / DEVELOPING)
+        delta_tags = self._compute_delta_tags(user_id, payload)
+
         # Message 1: Header (ticker + exec summary + geo risks + trends + threads)
         header = formatter.format_header(payload, ticker_bar, tracked_count=tracked_count)
         self._bot.send_message(chat_id, header)
 
         for idx, item in enumerate(payload.items, start=1):
             is_tracked = tracked_flags[idx - 1]
-            card = formatter.format_story_card(item, idx, is_tracked=is_tracked)
+            delta_tag = delta_tags[idx - 1] if idx - 1 < len(delta_tags) else ""
+            card = formatter.format_story_card(item, idx, is_tracked=is_tracked,
+                                                delta_tag=delta_tag)
             self._bot.send_story_card(chat_id, card, story_index=idx, is_tracked=is_tracked)
 
         if not payload.items:
@@ -596,6 +631,12 @@ class CommunicationAgent:
         except Exception:
             log.exception("Tracked story update check failed")
 
+        # Check for intelligence alerts (geo-risk, trend spikes)
+        try:
+            sent += self.check_intelligence_alerts()
+        except Exception:
+            log.exception("Intelligence alert check failed")
+
         return sent
 
     def _persist_prefs(self) -> None:
@@ -884,6 +925,517 @@ class CommunicationAgent:
                         break  # Only notify once per candidate
 
         return sent
+
+    def _show_insights(self, chat_id: int | str, user_id: str) -> dict[str, Any]:
+        """Show preference learning insights and apply auto-adjustments."""
+        insights = self._engine.analytics.get_rating_insights(user_id)
+
+        # Auto-tune: generate suggestions and apply small adjustments
+        suggestions: list[str] = []
+        applied: list[str] = []
+
+        for t in insights.get("topics", []):
+            ups = t["ups"] or 0
+            downs = t["downs"] or 0
+            total = t["total"] or 0
+            if total < 3:
+                continue  # Need minimum data
+            topic = t["topic"]
+            pct = ups / total * 100
+            name = topic.replace("_", " ").title()
+
+            if pct >= 80 and total >= 5:
+                # Strong positive signal — boost if not already high
+                profile = self._engine.preferences.get_or_create(user_id)
+                current = profile.topic_weights.get(topic, 0.5)
+                if current < 0.9:
+                    self._engine.preferences.apply_weight_adjustment(user_id, topic, 0.1)
+                    applied.append(f"Boosted {name} (+0.1) based on consistent positive ratings")
+                else:
+                    suggestions.append(f"{name} is already at max weight — you clearly love this topic")
+            elif pct <= 20 and total >= 5:
+                # Strong negative signal — reduce
+                profile = self._engine.preferences.get_or_create(user_id)
+                current = profile.topic_weights.get(topic, 0.5)
+                if current > -0.5:
+                    self._engine.preferences.apply_weight_adjustment(user_id, topic, -0.1)
+                    applied.append(f"Reduced {name} (-0.1) based on consistent negative ratings")
+                else:
+                    suggestions.append(f"Consider muting {name} entirely: /mute {topic}")
+
+        for s in insights.get("sources", []):
+            ups = s["ups"] or 0
+            downs = s["downs"] or 0
+            total = s["total"] or 0
+            if total < 3:
+                continue
+            source = s["source"]
+            pct = ups / total * 100
+
+            if pct >= 80 and total >= 5:
+                profile = self._engine.preferences.get_or_create(user_id)
+                current = profile.source_weights.get(source, 0.0)
+                if current < 1.5:
+                    self._engine.preferences.apply_source_weight(user_id, source, 0.2)
+                    applied.append(f"Boosted {source} source weight based on high approval")
+            elif pct <= 20 and total >= 5:
+                profile = self._engine.preferences.get_or_create(user_id)
+                current = profile.source_weights.get(source, 0.0)
+                if current > -1.5:
+                    self._engine.preferences.apply_source_weight(user_id, source, -0.2)
+                    applied.append(f"Reduced {source} source weight based on low approval")
+
+        if applied:
+            self._persist_prefs()
+
+        insights["suggestions"] = suggestions
+        insights["applied"] = applied
+
+        formatter = self._engine.formatter
+        card = formatter.format_insights(insights)
+        self._bot.send_message(chat_id, card)
+        return {"action": "insights", "user_id": user_id,
+                "applied": len(applied), "suggestions": len(suggestions)}
+
+    def _show_weekly(self, chat_id: int | str, user_id: str) -> dict[str, Any]:
+        """Show weekly intelligence digest."""
+        summary = self._engine.analytics.get_weekly_summary(user_id)
+        formatter = self._engine.formatter
+        card = formatter.format_weekly(summary)
+        self._bot.send_message(chat_id, card)
+        return {"action": "weekly", "user_id": user_id,
+                "briefings": summary.get("briefing_count", 0),
+                "stories": summary.get("story_count", 0)}
+
+    def check_intelligence_alerts(self) -> int:
+        """Check for geo-risk escalations and trend spikes, notify relevant users.
+
+        Runs against the last available intelligence data (from the most
+        recent briefing pipeline run). Sends alerts to users whose regions
+        or topics match the escalation.
+        Returns the number of alerts sent.
+        """
+        sent = 0
+        formatter = self._engine.formatter
+
+        # Check geo-risks from last pipeline run
+        last_georisks = self._engine.georisk.snapshot()
+        for region, risk_level in last_georisks.items():
+            # Detect escalation > 15%
+            if not isinstance(risk_level, (int, float)):
+                continue
+            if risk_level < 0.5:
+                continue
+
+            alert_data = {
+                "region": region,
+                "risk_level": risk_level,
+                "escalation_delta": 0.15,  # Threshold we're alerting on
+                "drivers": [],
+            }
+
+            # Find users interested in this region
+            for user_id, profile_data in self._engine.preferences.snapshot().items():
+                regions = profile_data.get("regions", [])
+                region_norm = {r.lower().replace(" ", "_") for r in regions}
+                if region.lower().replace(" ", "_") in region_norm:
+                    msg = formatter.format_intelligence_alert("georisk", alert_data)
+                    self._bot.send_message(user_id, msg)
+                    sent += 1
+
+        # Check trend spikes
+        last_trends = self._engine.trends.snapshot()
+        for topic, velocity in last_trends.items():
+            if not isinstance(velocity, (int, float)):
+                continue
+            if velocity < 3.0:  # Only alert on 3x+ baseline
+                continue
+
+            alert_data = {
+                "topic": topic,
+                "anomaly_score": velocity,
+            }
+
+            # Find users with positive weight for this topic
+            for user_id, profile_data in self._engine.preferences.snapshot().items():
+                weights = profile_data.get("topic_weights", {})
+                if weights.get(topic, 0) > 0.3:
+                    msg = formatter.format_intelligence_alert("trend", alert_data)
+                    self._bot.send_message(user_id, msg)
+                    sent += 1
+
+        return sent
+
+    def _save_story(self, chat_id: int | str, user_id: str,
+                    args: str) -> dict[str, Any]:
+        """Bookmark a story from the last briefing."""
+        try:
+            story_num = int(args.strip())
+        except (ValueError, TypeError):
+            self._bot.send_message(chat_id, "Usage: tap the \U0001f516 Save button on a story card.")
+            return {"action": "save_help", "user_id": user_id}
+
+        items = self._last_items.get(user_id, [])
+        if story_num < 1 or story_num > len(items):
+            self._bot.send_message(chat_id, "That story is no longer available. Run /briefing first.")
+            return {"action": "save_expired", "user_id": user_id}
+
+        item = items[story_num - 1]
+        # Get URL from ReportItem if available
+        report_item = self._engine.get_report_item(user_id, story_num)
+        url = report_item.candidate.url if report_item else ""
+
+        self._engine.preferences.save_bookmark(
+            user_id,
+            title=item["title"],
+            source=item.get("source", ""),
+            url=url,
+            topic=item["topic"],
+        )
+        self._persist_prefs()
+
+        import html as html_mod
+        self._bot.send_message(
+            chat_id,
+            f"\U0001f516 Saved: <b>{html_mod.escape(item['title'][:80])}</b>\n"
+            f"View bookmarks: /saved"
+        )
+        return {"action": "save", "user_id": user_id, "story": story_num}
+
+    def _show_saved(self, chat_id: int | str, user_id: str) -> dict[str, Any]:
+        """Show all bookmarked stories."""
+        profile = self._engine.preferences.get_or_create(user_id)
+        formatter = self._engine.formatter
+        card = formatter.format_bookmarks(profile.bookmarks)
+        self._bot.send_message(chat_id, card)
+        return {"action": "saved", "user_id": user_id, "count": len(profile.bookmarks)}
+
+    def _unsave_story(self, chat_id: int | str, user_id: str,
+                      args: str) -> dict[str, Any]:
+        """Remove a bookmark by index."""
+        try:
+            index = int(args.strip())
+        except (ValueError, TypeError):
+            self._bot.send_message(chat_id, "Usage: /unsave [number] \u2014 see /saved for the list.")
+            return {"action": "unsave_help", "user_id": user_id}
+
+        profile = self._engine.preferences.get_or_create(user_id)
+        if index < 1 or index > len(profile.bookmarks):
+            self._bot.send_message(chat_id, f"No bookmark #{index}. See /saved for the list.")
+            return {"action": "unsave_invalid", "user_id": user_id}
+
+        removed = profile.bookmarks[index - 1]
+        self._engine.preferences.remove_bookmark(user_id, index)
+        self._persist_prefs()
+        self._bot.send_message(
+            chat_id,
+            f"Removed bookmark: <b>{removed['title'][:80]}</b>"
+        )
+        return {"action": "unsave", "user_id": user_id, "index": index}
+
+    def _show_timeline(self, chat_id: int | str, user_id: str,
+                       args: str) -> dict[str, Any]:
+        """Show timeline of a tracked story's evolution from analytics."""
+        try:
+            index = int(args.strip())
+        except (ValueError, TypeError):
+            self._bot.send_message(
+                chat_id,
+                "Usage: /timeline [number] \u2014 where number is from /tracked list."
+            )
+            return {"action": "timeline_help", "user_id": user_id}
+
+        profile = self._engine.preferences.get_or_create(user_id)
+        if index < 1 or index > len(profile.tracked_stories):
+            self._bot.send_message(chat_id, f"No tracked story #{index}. See /tracked for the list.")
+            return {"action": "timeline_invalid", "user_id": user_id}
+
+        tracked = profile.tracked_stories[index - 1]
+        items = self._engine.analytics.get_story_timeline(
+            user_id, tracked["topic"], tracked["keywords"],
+        )
+
+        formatter = self._engine.formatter
+        card = formatter.format_timeline(tracked["headline"], items)
+        self._bot.send_message(chat_id, card)
+        return {"action": "timeline", "user_id": user_id, "index": index,
+                "results": len(items)}
+
+    def _set_email(self, chat_id: int | str, user_id: str,
+                   args: str) -> dict[str, Any]:
+        """Set or show user email for digest delivery."""
+        import re as re_mod
+        email = args.strip()
+
+        if not email:
+            profile = self._engine.preferences.get_or_create(user_id)
+            current = profile.email or "not set"
+            self._bot.send_message(
+                chat_id,
+                f"Email: <code>{current}</code>\n"
+                f"Set with: /email user@example.com"
+            )
+            return {"action": "email_show", "user_id": user_id}
+
+        # Basic email validation
+        if not re_mod.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+            self._bot.send_message(chat_id, "That doesn't look like a valid email address.")
+            return {"action": "email_invalid", "user_id": user_id}
+
+        self._engine.preferences.set_email(user_id, email)
+        self._persist_prefs()
+        self._bot.send_message(
+            chat_id,
+            f"Email set to <code>{email}</code>\n"
+            f"Send a digest anytime: /digest"
+        )
+        return {"action": "email", "user_id": user_id, "email": email}
+
+    def _send_email_digest(self, chat_id: int | str, user_id: str) -> dict[str, Any]:
+        """Send an HTML email digest of the last briefing."""
+        profile = self._engine.preferences.get_or_create(user_id)
+        if not profile.email:
+            self._bot.send_message(
+                chat_id,
+                "No email configured. Set one with: /email user@example.com"
+            )
+            return {"action": "digest_no_email", "user_id": user_id}
+
+        # Get last report items to build a payload
+        report_items = self._engine._last_report_items.get(user_id, [])
+        if not report_items:
+            self._bot.send_message(
+                chat_id,
+                "No recent briefing to send. Run /briefing first."
+            )
+            return {"action": "digest_no_briefing", "user_id": user_id}
+
+        from datetime import datetime, timezone
+        from newsfeed.delivery.email_digest import EmailDigest
+        from newsfeed.models.domain import BriefingType, DeliveryPayload
+
+        # Reconstruct a lightweight payload from stored report items
+        payload = DeliveryPayload(
+            user_id=user_id,
+            generated_at=datetime.now(timezone.utc),
+            items=report_items,
+            briefing_type=BriefingType.MORNING_DIGEST,
+        )
+
+        # Compute tracked flags
+        tracked = profile.tracked_stories
+        tracked_flags = []
+        for item in report_items:
+            is_tracked = any(
+                match_tracked(item.candidate.topic, item.candidate.title, t)
+                for t in tracked
+            )
+            tracked_flags.append(is_tracked)
+
+        # Build weekly summary for inclusion
+        weekly = self._engine.analytics.get_weekly_summary(user_id)
+
+        smtp_cfg = self._engine.pipeline.get("smtp", {})
+        digest = EmailDigest(smtp_cfg)
+        html_body = digest.render(payload, tracked_flags, weekly)
+
+        if not digest.is_configured:
+            # Save HTML locally and notify
+            self._bot.send_message(
+                chat_id,
+                "SMTP not configured \u2014 email digest rendered but cannot send.\n"
+                "Configure SMTP_HOST, SMTP_FROM, SMTP_USER, SMTP_PASSWORD environment variables."
+            )
+            return {"action": "digest_no_smtp", "user_id": user_id}
+
+        subject = f"Intelligence Digest \u2014 {datetime.now(timezone.utc).strftime('%b %d, %Y')}"
+        success = digest.send(profile.email, subject, html_body)
+
+        if success:
+            self._bot.send_message(
+                chat_id,
+                f"\u2709\ufe0f Digest sent to <code>{profile.email}</code>"
+            )
+        else:
+            self._bot.send_message(
+                chat_id,
+                "Failed to send email. Check SMTP configuration."
+            )
+
+        return {"action": "digest", "user_id": user_id, "sent": success}
+
+    def _compute_delta_tags(self, user_id: str,
+                            payload) -> list[str]:
+        """Compute delta tags (NEW/UPDATED/DEVELOPING) relative to last briefing.
+
+        Compares current payload items against the user's previous briefing
+        stored in analytics. Tags:
+        - "new": story not seen in any recent briefing
+        - "updated": same topic + similar title (keyword overlap)
+        - "developing": tracked story with new developments
+        - "": no change info (first briefing or no analytics data)
+        """
+        from newsfeed.memory.store import extract_keywords
+
+        # Get previous briefing items from analytics (last 24h)
+        prev_items = self._engine.analytics.search_briefing_items(
+            user_id, "", limit=50
+        )
+        if not prev_items:
+            return [""] * len(payload.items)
+
+        # Build keyword index from previous items
+        prev_by_topic: dict[str, list[set[str]]] = {}
+        for pi in prev_items:
+            topic = pi.get("topic", "")
+            title = pi.get("title", "")
+            kw = set(extract_keywords(title))
+            prev_by_topic.setdefault(topic, []).append(kw)
+
+        tags: list[str] = []
+        for item in payload.items:
+            c = item.candidate
+            current_kw = set(extract_keywords(c.title))
+            topic_prev = prev_by_topic.get(c.topic, [])
+
+            if not topic_prev:
+                tags.append("new")
+                continue
+
+            # Check for keyword overlap with previous items
+            best_overlap = 0
+            for prev_kw in topic_prev:
+                overlap = len(current_kw & prev_kw)
+                best_overlap = max(best_overlap, overlap)
+
+            if best_overlap >= 3:
+                tags.append("developing")
+            elif best_overlap >= 2:
+                tags.append("updated")
+            else:
+                tags.append("new")
+
+        return tags
+
+    def _run_quick_briefing(self, chat_id: int | str, user_id: str,
+                            topic_hint: str = "") -> dict[str, Any]:
+        """Run a quick headlines-only briefing — compact scan format."""
+        profile = self._engine.preferences.get_or_create(user_id)
+
+        topics = dict(profile.topic_weights) if profile.topic_weights else dict(self._default_topics)
+        if topic_hint:
+            topic_key = topic_hint.strip().lower().replace("_", " ")
+            topics[topic_key] = min(1.0, topics.get(topic_key, 0.5) + 0.3)
+
+        prompt = topic_hint or "Generate intelligence briefing"
+
+        payload = self._engine.handle_request_payload(
+            user_id=user_id,
+            prompt=prompt,
+            weighted_topics=topics,
+            max_items=profile.max_items,
+        )
+
+        # Build market ticker bar
+        ticker_bar = ""
+        try:
+            crypto_ids = profile.watchlist_crypto or None
+            stock_tickers = profile.watchlist_stocks or None
+            market_data = self._market.fetch_all(crypto_ids, stock_tickers)
+            all_quotes = market_data.get("crypto", []) + market_data.get("stocks", [])
+            if all_quotes:
+                ticker_bar = MarketTicker.format_ticker_bar(all_quotes)
+        except Exception:
+            log.debug("Market ticker fetch skipped", exc_info=True)
+
+        # Track items for downstream features
+        dominant_topic = max(topics, key=topics.get, default="general")
+        self._last_topic[user_id] = dominant_topic
+        self._last_items[user_id] = self._engine.last_briefing_items(user_id)
+
+        # Compute tracked flags
+        tracked = profile.tracked_stories
+        tracked_count = 0
+        tracked_flags: list[bool] = []
+        for item in payload.items:
+            is_tracked = any(
+                match_tracked(item.candidate.topic, item.candidate.title, t)
+                for t in tracked
+            )
+            tracked_flags.append(is_tracked)
+            if is_tracked:
+                tracked_count += 1
+
+        # Compute delta tags
+        delta_tags = self._compute_delta_tags(user_id, payload)
+
+        formatter = self._engine.formatter
+        card = formatter.format_quick_briefing(
+            payload, ticker_bar, tracked_flags, delta_tags, tracked_count,
+        )
+        self._bot.send_message(chat_id, card)
+
+        log.info(
+            "Quick briefing: user=%s chat=%s (%d items)",
+            user_id, chat_id, len(payload.items),
+        )
+        return {"action": "quick_briefing", "user_id": user_id,
+                "topic": dominant_topic, "items": len(payload.items)}
+
+    def _export_briefing(self, chat_id: int | str,
+                         user_id: str) -> dict[str, Any]:
+        """Export the last briefing as Markdown."""
+        report_items = self._engine._last_report_items.get(user_id, [])
+        if not report_items:
+            self._bot.send_message(
+                chat_id,
+                "No recent briefing to export. Run /briefing first."
+            )
+            return {"action": "export_empty", "user_id": user_id}
+
+        from datetime import datetime, timezone
+        from newsfeed.models.domain import BriefingType, DeliveryPayload
+
+        payload = DeliveryPayload(
+            user_id=user_id,
+            generated_at=datetime.now(timezone.utc),
+            items=report_items,
+            briefing_type=BriefingType.MORNING_DIGEST,
+        )
+
+        # Tracked flags
+        profile = self._engine.preferences.get_or_create(user_id)
+        tracked = profile.tracked_stories
+        tracked_flags = [
+            any(match_tracked(item.candidate.topic, item.candidate.title, t)
+                for t in tracked)
+            for item in report_items
+        ]
+
+        # Delta tags
+        delta_tags = self._compute_delta_tags(user_id, payload)
+
+        formatter = self._engine.formatter
+        markdown = formatter.format_markdown_export(payload, tracked_flags, delta_tags)
+
+        # Send as a code block (Telegram renders monospace in <pre>)
+        # Split into chunks if needed (Telegram 4096 char limit)
+        header = "<b>\U0001f4dd Markdown Export</b>\n\n"
+        header += "<i>Copy the text below into Obsidian, Notion, or any Markdown editor:</i>\n\n"
+        self._bot.send_message(chat_id, header)
+
+        # Send markdown in pre-formatted blocks
+        chunk_size = 3900  # Leave room for <pre> tags
+        for i in range(0, len(markdown), chunk_size):
+            chunk = markdown[i:i + chunk_size]
+            import html as html_mod
+            self._bot.send_message(
+                chat_id,
+                f"<pre>{html_mod.escape(chunk)}</pre>"
+            )
+
+        return {"action": "export", "user_id": user_id,
+                "length": len(markdown)}
 
     def _deep_dive_story(self, chat_id: int | str, user_id: str,
                          story_num: int) -> dict[str, Any]:

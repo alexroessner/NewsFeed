@@ -93,6 +93,11 @@ class UserProfile:
     # Tracked stories: user follows developing narratives across briefings
     # Each entry: {"topic": str, "keywords": [str], "headline": str, "tracked_at": float}
     tracked_stories: list[dict[str, Any]] = field(default_factory=list)
+    # Bookmarked stories: saved for later reading
+    # Each entry: {"title": str, "source": str, "url": str, "topic": str, "saved_at": float}
+    bookmarks: list[dict[str, Any]] = field(default_factory=list)
+    # Email address for email digest delivery
+    email: str = ""
 
 
 @dataclass(slots=True)

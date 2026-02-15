@@ -247,18 +247,31 @@ class TelegramFormatter:
         return "\n".join(lines).strip()
 
     def format_story_card(self, item: ReportItem, index: int,
-                          is_tracked: bool = False) -> str:
+                          is_tracked: bool = False,
+                          delta_tag: str = "") -> str:
         """Format a single story as a rich, readable news card.
 
         Includes the full intelligence context: summary, why it matters,
         what changed, predictive outlook, confidence, and related reads.
         Each card is sent as a separate Telegram message (~4096 char limit).
+
+        delta_tag can be "new", "updated", or "developing" to show how
+        this story relates to the user's previous briefing.
         """
         lines: list[str] = []
         c = item.candidate
 
         # ── Tracked badge ──
         tracked_badge = "\U0001f4cc " if is_tracked else ""
+
+        # ── Delta tag ──
+        tag_str = ""
+        if delta_tag == "new":
+            tag_str = " <b>[NEW]</b>"
+        elif delta_tag == "updated":
+            tag_str = " <b>[UPDATED]</b>"
+        elif delta_tag == "developing":
+            tag_str = " <b>[DEVELOPING]</b>"
 
         # ── Title + source ──
         title_esc = _esc(c.title)
@@ -271,7 +284,7 @@ class TelegramFormatter:
             title_line = f"<b>{tracked_badge}{index}. {title_esc}</b>"
 
         source_tag = f"<i>[{_esc(c.source)}]</i>"
-        lines.append(f"{title_line} {source_tag}")
+        lines.append(f"{title_line} {source_tag}{tag_str}")
 
         # ── Summary ──
         body = c.summary.strip() if c.summary else ""
@@ -377,6 +390,204 @@ class TelegramFormatter:
         lines.append("<i>Sources: /feedback prefer [source] or demote [source]</i>")
 
         return "\n".join(lines).strip()
+
+    def format_quick_card(self, item: ReportItem, index: int,
+                          is_tracked: bool = False,
+                          delta_tag: str = "") -> str:
+        """Format a compact headline-only story card for /quick mode.
+
+        One-line title + source + optional delta tag. No summary, no analysis.
+        Designed for a fast scan before diving into specific stories.
+        """
+        c = item.candidate
+        tracked_badge = "\U0001f4cc " if is_tracked else ""
+
+        # Delta tag (NEW / UPDATED / DEVELOPING)
+        tag = ""
+        if delta_tag == "new":
+            tag = " <b>[NEW]</b>"
+        elif delta_tag == "updated":
+            tag = " <b>[UPDATED]</b>"
+        elif delta_tag == "developing":
+            tag = " <b>[DEVELOPING]</b>"
+
+        title_esc = _esc(c.title)
+        if c.url and not c.url.startswith("https://example.com"):
+            title_part = f'<a href="{_esc_url(c.url)}">{title_esc}</a>'
+        else:
+            title_part = title_esc
+
+        # Compact one-liner with metadata
+        urgency_icon = _URGENCY_ICON.get(c.urgency, "")
+        if urgency_icon:
+            urgency_icon += " "
+
+        # Build a one-line context (why_it_matters truncated to ~100 chars)
+        context = ""
+        if item.why_it_matters:
+            snippet = item.why_it_matters[:100]
+            if len(item.why_it_matters) > 100:
+                cut = snippet.rfind(" ")
+                snippet = snippet[:cut] + "..." if cut > 50 else snippet + "..."
+            context = f"\n   <i>{_esc(snippet)}</i>"
+
+        conf = _confidence_label(item)
+        source_tag = f"<i>[{_esc(c.source)}]</i>"
+        conf_tag = f" <i>\u00b7 {conf}</i>" if conf else ""
+
+        return (
+            f"{tracked_badge}{urgency_icon}<b>{index}.</b> {title_part}"
+            f" {source_tag}{tag}{conf_tag}{context}"
+        )
+
+    def format_quick_briefing(self, payload: DeliveryPayload,
+                               ticker_bar: str = "",
+                               tracked_flags: list[bool] | None = None,
+                               delta_tags: list[str] | None = None,
+                               tracked_count: int = 0) -> str:
+        """Format a complete quick-scan briefing as a single message.
+
+        Headline + one-liner for each story. Fits in one Telegram message
+        for up to ~15 stories.
+        """
+        if tracked_flags is None:
+            tracked_flags = [False] * len(payload.items)
+        if delta_tags is None:
+            delta_tags = [""] * len(payload.items)
+
+        lines: list[str] = []
+        icon = _BRIEFING_ICON.get(payload.briefing_type, "\U0001f4cb")
+        header = _BRIEFING_HEADER.get(payload.briefing_type, "NewsFeed Brief")
+        lines.append(f"<b>{icon} {header} \u2014 Quick Scan</b>")
+        lines.append(f"<i>{_human_time(payload.generated_at)}</i>")
+
+        if payload.items:
+            summary = self._build_exec_summary(payload, tracked_count)
+            lines.append("")
+            lines.append(summary)
+
+        if ticker_bar:
+            lines.append("")
+            lines.append(ticker_bar)
+
+        lines.append("")
+        for idx, item in enumerate(payload.items):
+            is_tracked = tracked_flags[idx] if idx < len(tracked_flags) else False
+            tag = delta_tags[idx] if idx < len(delta_tags) else ""
+            lines.append(self.format_quick_card(item, idx + 1, is_tracked, tag))
+            lines.append("")
+
+        if not payload.items:
+            lines.append("<i>No stories matched your current filters.</i>")
+
+        lines.append(f"<i>Tap /briefing for full analysis \u00b7 /deep_dive [N] for details</i>")
+
+        return "\n".join(lines).strip()
+
+    def format_markdown_export(self, payload: DeliveryPayload,
+                                tracked_flags: list[bool] | None = None,
+                                delta_tags: list[str] | None = None) -> str:
+        """Export the briefing as clean Markdown for note-taking apps."""
+        if tracked_flags is None:
+            tracked_flags = [False] * len(payload.items)
+        if delta_tags is None:
+            delta_tags = [""] * len(payload.items)
+
+        lines: list[str] = []
+
+        # Title
+        ts = payload.generated_at.strftime("%B %d, %Y %H:%M UTC")
+        lines.append(f"# Intelligence Digest")
+        lines.append(f"*{ts}*")
+        lines.append("")
+
+        # Executive summary
+        from collections import Counter
+        topics = Counter(item.candidate.topic for item in payload.items)
+        top = topics.most_common(5)
+        topic_parts = [
+            f"{count} {topic.replace('_', ' ')}" if count > 1 else topic.replace("_", " ")
+            for topic, count in top
+        ]
+        lines.append(f"**{len(payload.items)} stories:** {', '.join(topic_parts)}")
+        lines.append("")
+
+        # Geo-risk alerts
+        escalating = [r for r in payload.geo_risks if r.is_escalating()]
+        if escalating:
+            lines.append("## Geo-Risk Alerts")
+            for risk in escalating[:4]:
+                region = risk.region.replace("_", " ").title()
+                lines.append(f"- **{region}**: {risk.risk_level:.0%} risk (+{risk.escalation_delta:.0%})")
+            lines.append("")
+
+        # Trends
+        emerging = [t for t in payload.trends if t.is_emerging]
+        if emerging:
+            lines.append("## Emerging Trends")
+            for t in emerging[:4]:
+                lines.append(f"- **{t.topic}**: {t.anomaly_score:.1f}x baseline")
+            lines.append("")
+
+        # Stories
+        lines.append("## Stories")
+        lines.append("")
+
+        for idx, item in enumerate(payload.items):
+            c = item.candidate
+            is_tracked = tracked_flags[idx] if idx < len(tracked_flags) else False
+            tag = delta_tags[idx] if idx < len(delta_tags) else ""
+
+            # Title line
+            tracked_mark = " [TRACKED]" if is_tracked else ""
+            delta_mark = f" [{tag.upper()}]" if tag else ""
+            if c.url and not c.url.startswith("https://example.com"):
+                lines.append(f"### {idx + 1}. [{c.title}]({c.url}){tracked_mark}{delta_mark}")
+            else:
+                lines.append(f"### {idx + 1}. {c.title}{tracked_mark}{delta_mark}")
+
+            lines.append(f"*{c.source}*")
+            lines.append("")
+
+            # Summary
+            if c.summary:
+                summary = c.summary.strip()
+                if len(summary) > 800:
+                    cut = summary[:800].rfind(".")
+                    summary = summary[:cut + 1] if cut > 300 else summary[:797] + "..."
+                lines.append(summary)
+                lines.append("")
+
+            # Analysis
+            if item.why_it_matters:
+                lines.append(f"**Why it matters:** {item.why_it_matters}")
+                lines.append("")
+            if item.what_changed:
+                lines.append(f"**What changed:** {item.what_changed}")
+                lines.append("")
+            if item.predictive_outlook:
+                lines.append(f"> {item.predictive_outlook}")
+                lines.append("")
+
+            # Confidence
+            conf = _confidence_label(item)
+            meta = []
+            if conf:
+                meta.append(conf)
+            if c.regions:
+                meta.append(", ".join(r.replace("_", " ").title() for r in c.regions[:3]))
+            if c.corroborated_by:
+                meta.append(f"Verified by {', '.join(c.corroborated_by[:3])}")
+            if meta:
+                lines.append(f"*{' · '.join(meta)}*")
+                lines.append("")
+
+            lines.append("---")
+            lines.append("")
+
+        lines.append(f"*Generated by NewsFeed Intelligence*")
+
+        return "\n".join(lines)
 
     def format_deep_dive(self, item: ReportItem, index: int) -> str:
         """Format a full deep-dive analysis of a single story.
@@ -588,4 +799,263 @@ class TelegramFormatter:
         if not items:
             lines.append("<i>No matching stories found in your briefing history.</i>")
 
+        return "\n".join(lines).strip()
+
+    def format_insights(self, insights: dict) -> str:
+        """Format preference learning insights for the user."""
+        lines: list[str] = []
+        lines.append("<b>\U0001f9e0 Your Intelligence Profile</b>")
+        lines.append(f"<i>Based on {insights['total_ratings']} ratings over {insights['days']} days</i>")
+        lines.append("")
+
+        if not insights["total_ratings"]:
+            lines.append("<i>Not enough data yet. Rate stories with \U0001f44d/\U0001f44e to build your profile.</i>")
+            return "\n".join(lines)
+
+        # Topic affinities
+        topics = insights.get("topics", [])
+        if topics:
+            lines.append("<b>Topic Affinities</b>")
+            for t in topics[:8]:
+                ups = t["ups"] or 0
+                downs = t["downs"] or 0
+                net = ups - downs
+                total = t["total"] or 1
+                pct = ups / total * 100
+                name = t["topic"].replace("_", " ").title()
+                if net > 0:
+                    indicator = "\u2191"
+                elif net < 0:
+                    indicator = "\u2193"
+                else:
+                    indicator = "\u2192"
+                lines.append(f"  {indicator} <b>{_esc(name)}</b>: {ups}\U0001f44d {downs}\U0001f44e ({pct:.0f}% positive)")
+            lines.append("")
+
+        # Source preferences
+        sources = insights.get("sources", [])
+        if sources:
+            lines.append("<b>Source Preferences</b>")
+            for s in sources[:8]:
+                ups = s["ups"] or 0
+                downs = s["downs"] or 0
+                total = s["total"] or 1
+                pct = ups / total * 100
+                src = _esc(s["source"])
+                if pct >= 70:
+                    indicator = "\u2705"
+                elif pct <= 30:
+                    indicator = "\u274c"
+                else:
+                    indicator = "\u2796"
+                lines.append(f"  {indicator} <b>{src}</b>: {pct:.0f}% approval ({total} ratings)")
+            lines.append("")
+
+        # Suggestions based on patterns
+        suggestions = insights.get("suggestions", [])
+        if suggestions:
+            lines.append("<b>Suggestions</b>")
+            for s in suggestions:
+                lines.append(f"  \u2022 {_esc(s)}")
+            lines.append("")
+
+        # Applied adjustments
+        applied = insights.get("applied", [])
+        if applied:
+            lines.append("<b>Auto-adjusted</b>")
+            for a in applied:
+                lines.append(f"  \u2022 {_esc(a)}")
+
+        return "\n".join(lines).strip()
+
+    def format_weekly(self, summary: dict) -> str:
+        """Format a weekly intelligence digest."""
+        lines: list[str] = []
+        days = summary.get("days", 7)
+        lines.append("<b>\U0001f4ca Weekly Intelligence Digest</b>")
+        lines.append(f"<i>Past {days} days</i>")
+        lines.append("")
+
+        briefings = summary.get("briefing_count", 0)
+        stories = summary.get("story_count", 0)
+        if not stories:
+            lines.append("<i>No briefings delivered this week. Run /briefing to get started.</i>")
+            return "\n".join(lines)
+
+        lines.append(f"<b>{briefings} briefings</b> delivered \u00b7 <b>{stories} stories</b> total")
+        lines.append("")
+
+        # Topic breakdown
+        topic_dist = summary.get("topic_distribution", [])
+        if topic_dist:
+            lines.append(_section("Coverage by Topic"))
+            for t in topic_dist[:8]:
+                name = t["topic"].replace("_", " ").title()
+                count = t["count"]
+                bar = "\u2588" * max(1, min(count, 15))
+                lines.append(f"  {_esc(name)}: {count} {bar}")
+            lines.append("")
+
+        # Source breakdown
+        source_dist = summary.get("source_distribution", [])
+        if source_dist:
+            lines.append(_section("Top Sources"))
+            for s in source_dist[:6]:
+                lines.append(f"  {_esc(s['source'])}: {s['count']} stories")
+            lines.append("")
+
+        # Engagement stats
+        rating_total = summary.get("rating_total", 0)
+        if rating_total:
+            ups = summary.get("rating_ups", 0)
+            downs = summary.get("rating_downs", 0)
+            lines.append(_section("Your Engagement"))
+            lines.append(f"  {rating_total} ratings: {ups} \U0001f44d {downs} \U0001f44e")
+            # Top rated stories
+            top_rated = summary.get("top_rated", [])
+            if top_rated:
+                lines.append("  <b>Your favorites:</b>")
+                for tr in top_rated[:3]:
+                    title = _esc(tr.get("title", "")[:60])
+                    lines.append(f"    \u2022 {title}")
+            lines.append("")
+
+        # Trends
+        trends = summary.get("trends", [])
+        if trends:
+            lines.append(_section("Trending This Week"))
+            for t in trends:
+                name = t["topic"].replace("_", " ").title()
+                score = t["anomaly_score"]
+                lines.append(f"  \U0001f4c8 <b>{_esc(name)}</b>: {score:.1f}x baseline")
+            lines.append("")
+
+        # Geo-risk summary
+        georisks = summary.get("georisks", [])
+        escalating = [g for g in georisks if g.get("escalation_delta", 0) > 0.05]
+        if escalating:
+            lines.append(_section("Geo Risk Watch"))
+            for g in escalating[:4]:
+                region = _format_region(g["region"])
+                level = g["risk_level"]
+                delta = g["escalation_delta"]
+                lines.append(f"  \u26a0\ufe0f <b>{_esc(region)}</b>: {level:.0%} (\u2191{delta:.0%})")
+            lines.append("")
+
+        lines.append("<i>Adjust coverage: /feedback more [topic] or less [topic]</i>")
+
+        return "\n".join(lines).strip()
+
+    def format_intelligence_alert(self, alert_type: str,
+                                  data: dict) -> str:
+        """Format a proactive intelligence alert (geo-risk or trend spike)."""
+        lines: list[str] = []
+
+        if alert_type == "georisk":
+            region = _format_region(data["region"])
+            level = data["risk_level"]
+            delta = data["escalation_delta"]
+            lines.append(f"<b>\U0001f6a8 Geo-Risk Alert: {_esc(region)}</b>")
+            lines.append(f"Risk level: <b>{level:.0%}</b> (\u2191{delta:.0%} change)")
+            drivers = data.get("drivers", [])
+            if drivers:
+                lines.append("")
+                lines.append("<b>Drivers:</b>")
+                for d in drivers[:3]:
+                    lines.append(f"  \u2022 {_esc(d)}")
+            lines.append("")
+            lines.append("<i>Run /briefing for full analysis</i>")
+
+        elif alert_type == "trend":
+            topic = data["topic"].replace("_", " ").title()
+            score = data["anomaly_score"]
+            lines.append(f"<b>\U0001f4c8 Trend Alert: {_esc(topic)}</b>")
+            lines.append(f"Activity at <b>{score:.1f}x</b> baseline")
+            lines.append("")
+            lines.append("<i>Run /briefing for full coverage</i>")
+
+        return "\n".join(lines).strip()
+
+    def format_timeline(self, headline: str, items: list[dict]) -> str:
+        """Format a chronological timeline for a tracked story."""
+        lines: list[str] = []
+        lines.append(f"<b>\U0001f4c5 Story Timeline</b>")
+        lines.append(f"<i>Tracking: {_esc(headline[:80])}</i>")
+        lines.append(f"<i>{len(items)} related stories found</i>")
+        lines.append("")
+
+        if not items:
+            lines.append("<i>No matching stories found in your briefing history yet.</i>")
+            lines.append("<i>Keep tracking \u2014 the timeline builds as you receive briefings.</i>")
+            return "\n".join(lines).strip()
+
+        for i, item in enumerate(items[:15], 1):
+            title = _esc(item.get("title", ""))
+            source = _esc(item.get("source", ""))
+            url = item.get("url", "")
+
+            # Date marker
+            delivered = item.get("delivered_at", "")
+            if delivered:
+                try:
+                    from datetime import datetime, timezone as tz
+                    if isinstance(delivered, (int, float)):
+                        dt = datetime.fromtimestamp(delivered, tz=tz.utc)
+                    else:
+                        dt = datetime.fromisoformat(str(delivered))
+                    date_str = dt.strftime("%b %d, %H:%M")
+                except (ValueError, TypeError):
+                    date_str = ""
+            else:
+                date_str = ""
+
+            # Timeline entry
+            if url and not url.startswith("https://example.com"):
+                lines.append(f'\u2502 <a href="{_esc_url(url)}">{title}</a>')
+            else:
+                lines.append(f"\u2502 <b>{title}</b>")
+            meta = f"<i>[{source}]</i>"
+            if date_str:
+                meta += f" <i>{date_str}</i>"
+            lines.append(f"\u2502 {meta}")
+
+            # Brief context
+            context = item.get("why_it_matters") or item.get("summary", "")
+            if context:
+                lines.append(f"\u2502 {_esc(context[:120])}")
+
+            # Connector
+            if i < len(items) and i < 15:
+                lines.append("\u2502")
+            lines.append("")
+
+        return "\n".join(lines).strip()
+
+    def format_bookmarks(self, bookmarks: list[dict]) -> str:
+        """Format saved bookmarks for display."""
+        lines: list[str] = []
+        lines.append(f"<b>\U0001f516 Saved Stories ({len(bookmarks)})</b>")
+        lines.append("")
+
+        if not bookmarks:
+            lines.append("<i>No saved stories yet.</i>")
+            lines.append("<i>Tap \U0001f516 Save on a story card to bookmark it.</i>")
+            return "\n".join(lines).strip()
+
+        for i, b in enumerate(bookmarks, 1):
+            title = _esc(b.get("title", "")[:80])
+            source = _esc(b.get("source", ""))
+            url = b.get("url", "")
+            topic = b.get("topic", "").replace("_", " ").title()
+
+            if url and not url.startswith("https://example.com"):
+                lines.append(f'{i}. <a href="{_esc_url(url)}">{title}</a> <i>[{source}]</i>')
+            else:
+                lines.append(f"{i}. <b>{title}</b> <i>[{source}]</i>")
+
+            if topic:
+                lines.append(f"   <i>{topic}</i>")
+            lines.append("")
+
+        lines.append("<i>Remove: /unsave [number]</i>")
         return "\n".join(lines).strip()
