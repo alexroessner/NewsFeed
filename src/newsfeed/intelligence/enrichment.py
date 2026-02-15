@@ -112,9 +112,17 @@ def _decode_entities(text: str) -> str:
 
 # ── Article fetching ──────────────────────────────────────────────
 
+_SAFE_FETCH_SCHEMES = frozenset({"http", "https"})
+
+
 def fetch_article(url: str, timeout: int = 8) -> str:
     """Fetch article HTML from a URL. Returns empty string on failure."""
     if not url or url.startswith("https://example.com"):
+        return ""
+    # Only allow http/https — block file://, ftp://, data://, gopher:// etc.
+    scheme = url.split(":", 1)[0].lower().strip() if ":" in url else ""
+    if scheme not in _SAFE_FETCH_SCHEMES:
+        log.debug("Blocked fetch for non-http scheme: %s", scheme)
         return ""
     try:
         req = urllib.request.Request(url, headers={

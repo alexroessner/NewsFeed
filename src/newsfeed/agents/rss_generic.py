@@ -158,8 +158,10 @@ class GenericRSSAgent(ResearchAgent):
             if not title:
                 continue
 
-            title = html.unescape(self._strip_html(title))
-            summary = html.unescape(self._strip_html(summary))
+            # Unescape entities FIRST (so &lt;b&gt; → <b>), THEN strip tags.
+            # Original order (strip then unescape) could revive encoded HTML.
+            title = self._strip_html(html.unescape(title))
+            summary = self._strip_html(html.unescape(summary))
 
             created_at = datetime.now(timezone.utc)
             if pub_date_el is not None and pub_date_el.text:

@@ -126,8 +126,9 @@ class WebSearchAgent(ResearchAgent):
             if not title:
                 continue
 
-            # Clean HTML entities from title and summary
-            title = html.unescape(title)
+            # Clean HTML entities and tags from title and summary.
+            # Unescape first (so encoded tags become real tags), then strip.
+            title = self._strip_html(html.unescape(title))
             summary = self._strip_html(html.unescape(summary))
 
             created_at = datetime.now(timezone.utc)
