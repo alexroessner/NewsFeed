@@ -173,6 +173,53 @@ class PreferenceStore:
             profile.bookmarks.pop(index - 1)
         return profile
 
+    def save_preset(self, user_id: str, name: str) -> UserProfile:
+        """Save current preferences as a named preset."""
+        profile = self.get_or_create(user_id)
+        profile.presets[name] = {
+            "topic_weights": dict(profile.topic_weights),
+            "source_weights": dict(profile.source_weights),
+            "tone": profile.tone,
+            "format": profile.format,
+            "max_items": profile.max_items,
+            "regions": list(profile.regions_of_interest),
+            "confidence_min": profile.confidence_min,
+            "urgency_min": profile.urgency_min,
+            "max_per_source": profile.max_per_source,
+            "muted_topics": list(profile.muted_topics),
+        }
+        # Cap at 10 presets
+        if len(profile.presets) > 10:
+            oldest = next(iter(profile.presets))
+            del profile.presets[oldest]
+        return profile
+
+    def load_preset(self, user_id: str, name: str) -> UserProfile | None:
+        """Load a named preset, replacing current preferences."""
+        profile = self.get_or_create(user_id)
+        preset = profile.presets.get(name)
+        if not preset:
+            return None
+        profile.topic_weights = dict(preset.get("topic_weights", {}))
+        profile.source_weights = dict(preset.get("source_weights", {}))
+        profile.tone = preset.get("tone", "concise")
+        profile.format = preset.get("format", "bullet")
+        profile.max_items = preset.get("max_items", 10)
+        profile.regions_of_interest = list(preset.get("regions", []))
+        profile.confidence_min = preset.get("confidence_min", 0.0)
+        profile.urgency_min = preset.get("urgency_min", "")
+        profile.max_per_source = preset.get("max_per_source", 0)
+        profile.muted_topics = list(preset.get("muted_topics", []))
+        return profile
+
+    def delete_preset(self, user_id: str, name: str) -> bool:
+        """Delete a named preset. Returns True if it existed."""
+        profile = self.get_or_create(user_id)
+        if name in profile.presets:
+            del profile.presets[name]
+            return True
+        return False
+
     def set_filter(self, user_id: str, field: str, value: str) -> UserProfile:
         """Set an advanced briefing filter."""
         profile = self.get_or_create(user_id)
@@ -184,6 +231,10 @@ class PreferenceStore:
                 profile.urgency_min = value.lower()
         elif field == "max_per_source":
             profile.max_per_source = max(0, min(int(value), 10))
+        elif field == "georisk":
+            profile.alert_georisk_threshold = max(0.1, min(float(value), 1.0))
+        elif field == "trend":
+            profile.alert_trend_threshold = max(1.5, min(float(value), 10.0))
         return profile
 
     def set_email(self, user_id: str, email: str) -> UserProfile:
@@ -207,6 +258,8 @@ class PreferenceStore:
         profile.confidence_min = 0.0
         profile.urgency_min = ""
         profile.max_per_source = 0
+        profile.alert_georisk_threshold = 0.5
+        profile.alert_trend_threshold = 3.0
         # Keep watchlists, tracked stories, bookmarks, and email on reset — those are data, not weights
         return profile
 
@@ -231,6 +284,9 @@ class PreferenceStore:
                 "confidence_min": p.confidence_min,
                 "urgency_min": p.urgency_min,
                 "max_per_source": p.max_per_source,
+                "alert_georisk_threshold": p.alert_georisk_threshold,
+                "alert_trend_threshold": p.alert_trend_threshold,
+                "presets": dict(p.presets),
             }
         return result
 

@@ -58,7 +58,9 @@ BOT_COMMANDS = [
     {"command": "email", "description": "Set email for digest delivery (e.g. /email user@example.com)"},
     {"command": "digest", "description": "Send email digest of your latest briefing"},
     {"command": "export", "description": "Export last briefing as Markdown"},
+    {"command": "sources", "description": "View source reliability, bias, and trust ratings"},
     {"command": "filter", "description": "Set briefing filters (e.g. /filter confidence 0.7)"},
+    {"command": "preset", "description": "Save/load briefing presets (e.g. /preset save Work)"},
     {"command": "help", "description": "Show available commands and usage"},
 ]
 
@@ -461,6 +463,23 @@ class TelegramBot:
                 lines.append(f"  Urgency: \u2265 {urg_min}")
             if mps:
                 lines.append(f"  Max per source: {mps}")
+
+        # Alert thresholds (only show if non-default)
+        geo_t = profile.get("alert_georisk_threshold", 0.5)
+        trend_t = profile.get("alert_trend_threshold", 3.0)
+        if geo_t != 0.5 or trend_t != 3.0:
+            lines.append("")
+            lines.append("<b>Alert Sensitivity:</b>")
+            if geo_t != 0.5:
+                lines.append(f"  Geo-risk at: {geo_t:.0%}")
+            if trend_t != 3.0:
+                lines.append(f"  Trend spike at: {trend_t:.1f}x")
+
+        # Presets
+        presets = profile.get("presets", {})
+        if presets:
+            lines.append("")
+            lines.append(f"<b>Saved Presets:</b> {', '.join(presets.keys())}")
 
         crypto = profile.get("watchlist_crypto", [])
         stocks = profile.get("watchlist_stocks", [])

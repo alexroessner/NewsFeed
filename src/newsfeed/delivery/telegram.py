@@ -1059,3 +1059,72 @@ class TelegramFormatter:
 
         lines.append("<i>Remove: /unsave [number]</i>")
         return "\n".join(lines).strip()
+
+    def format_sources(self, sources: list[dict],
+                       user_weights: dict[str, float] | None = None) -> str:
+        """Format source credibility dashboard showing reliability, bias, and trust."""
+        lines: list[str] = []
+        lines.append("<b>\U0001f50e Source Intelligence Dashboard</b>")
+        lines.append(f"<i>{len(sources)} sources tracked</i>")
+        lines.append("")
+
+        if not sources:
+            lines.append("<i>No source data available yet. Run /briefing first.</i>")
+            return "\n".join(lines).strip()
+
+        # Tier groupings
+        tier_labels = {
+            "tier_1": "\U0001f947 Tier 1 — Wire Services & Prestige",
+            "tier_1b": "\U0001f948 Tier 1b — Major International",
+            "tier_academic": "\U0001f393 Academic & Research",
+            "tier_2": "\U0001f310 Tier 2 — Community & Aggregators",
+            "unknown": "\u2753 Other",
+        }
+
+        by_tier: dict[str, list[dict]] = {}
+        for s in sources:
+            tier = s.get("tier", "unknown")
+            by_tier.setdefault(tier, []).append(s)
+
+        tier_order = ["tier_1", "tier_1b", "tier_academic", "tier_2", "unknown"]
+        for tier in tier_order:
+            tier_sources = by_tier.get(tier, [])
+            if not tier_sources:
+                continue
+
+            lines.append(f"<b>{tier_labels.get(tier, tier)}</b>")
+
+            for s in sorted(tier_sources, key=lambda x: x.get("reliability", 0), reverse=True):
+                name = _esc(s["source_id"])
+                reliability = s.get("reliability", 0)
+                bias = s.get("bias", "unrated")
+                trust = s.get("trust_factor", 0)
+                seen = s.get("items_seen", 0)
+                corr = s.get("corroboration_rate", 0)
+
+                # Reliability bar
+                filled = round(reliability * 10)
+                bar = "\u2588" * filled + "\u2591" * (10 - filled)
+
+                # User weight indicator
+                weight_str = ""
+                if user_weights and name.lower() in user_weights:
+                    w = user_weights[name.lower()]
+                    if w > 0:
+                        weight_str = f" \u2191{w:+.1f}"
+                    elif w < 0:
+                        weight_str = f" \u2193{w:+.1f}"
+
+                lines.append(
+                    f"  <b>{name}</b>{weight_str}\n"
+                    f"    {bar} {reliability:.0%} reliable\n"
+                    f"    Bias: <i>{_esc(bias)}</i> \u00b7 "
+                    f"Trust: {trust:.0%} \u00b7 "
+                    f"Corr: {corr:.0%}"
+                )
+                if seen:
+                    lines.append(f"    <i>{seen} stories processed</i>")
+                lines.append("")
+
+        lines.append("<i>Adjust: /feedback prefer [source] or demote [source]</i>")
+        return "\n".join(lines).strip()
