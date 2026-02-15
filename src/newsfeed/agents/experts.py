@@ -343,6 +343,12 @@ class ExpertCouncil:
             # Try to extract JSON from response
             parsed = self._parse_llm_json(content)
 
+            # If LLM returned garbage (empty parse), fall back to heuristic
+            # instead of blindly defaulting to keep=True
+            if not parsed:
+                log.warning("LLM returned unparseable response for %s, falling back to heuristic", expert_id)
+                return self._vote_heuristic(expert_id, candidate)
+
             # Robust boolean parsing — LLM may return "false"/"true" as strings
             raw_keep = parsed.get("keep", True)
             if isinstance(raw_keep, str):

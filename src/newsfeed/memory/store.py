@@ -110,6 +110,14 @@ class PreferenceStore:
 
     MAX_WEIGHTS = 100  # Max distinct topic/source weight entries per user
 
+    @staticmethod
+    def _prune_zero_weights(weights: dict[str, float]) -> int:
+        """Remove zero-weight entries that waste slots. Returns count pruned."""
+        dead = [k for k, v in weights.items() if v == 0.0]
+        for k in dead:
+            del weights[k]
+        return len(dead)
+
     def apply_weight_adjustment(self, user_id: str, topic: str,
                                delta: float) -> tuple[UserProfile, str]:
         """Apply a weight delta to a topic.
@@ -121,10 +129,13 @@ class PreferenceStore:
         current = profile.topic_weights.get(topic, 0.0)
         # Reject new entries if at cap (updates to existing keys are always allowed)
         if topic not in profile.topic_weights and len(profile.topic_weights) >= self.MAX_WEIGHTS:
-            return profile, (
-                f"You've reached the {self.MAX_WEIGHTS}-topic limit. "
-                f"Use /feedback reset preferences or reduce an existing topic to add new ones."
-            )
+            # Try pruning zero-weight entries first before rejecting
+            pruned = self._prune_zero_weights(profile.topic_weights)
+            if pruned == 0 or len(profile.topic_weights) >= self.MAX_WEIGHTS:
+                return profile, (
+                    f"You've reached the {self.MAX_WEIGHTS}-topic limit. "
+                    f"Use /feedback reset preferences or reduce an existing topic to add new ones."
+                )
         new_val = round(max(min(current + delta, 1.0), -1.0), 3)
         profile.topic_weights[topic] = new_val
         hint = ""
@@ -157,13 +168,29 @@ class PreferenceStore:
         profile.max_items = max(1, min(max_items, 50))
         return profile
 
-    def apply_source_weight(self, user_id: str, source: str, delta: float) -> UserProfile:
+    def apply_source_weight(self, user_id: str, source: str,
+                            delta: float) -> tuple[UserProfile, str]:
+        """Apply a weight delta to a source.
+
+        Returns (profile, hint) where hint is a user-facing message if
+        the cap was hit or the weight saturated, or empty string otherwise.
+        """
         profile = self.get_or_create(user_id)
         current = profile.source_weights.get(source, 0.0)
         if source not in profile.source_weights and len(profile.source_weights) >= self.MAX_WEIGHTS:
-            return profile
-        profile.source_weights[source] = round(max(min(current + delta, 2.0), -2.0), 3)
-        return profile
+            self._prune_zero_weights(profile.source_weights)
+            if len(profile.source_weights) >= self.MAX_WEIGHTS:
+                return profile, (
+                    f"You've reached the {self.MAX_WEIGHTS}-source limit. "
+                    f"Use /feedback reset preferences to free up slots."
+                )
+        new_val = round(max(min(current + delta, 2.0), -2.0), 3)
+        profile.source_weights[source] = new_val
+        hint = ""
+        if new_val == current:
+            direction = "maximum" if delta > 0 else "minimum"
+            hint = f'Source "{source}" is already at {direction} weight ({new_val}).'
+        return profile, hint
 
     def remove_region(self, user_id: str, region: str) -> UserProfile:
         profile = self.get_or_create(user_id)
@@ -263,10 +290,21 @@ class PreferenceStore:
         return profile
 
     _MAX_PRESET_NAME_LEN = 50  # Reasonable limit for a human-typed preset name
+    _PRESET_NAME_RE = re.compile(r"^[a-zA-Z0-9_\- ]+$")
 
-    def save_preset(self, user_id: str, name: str) -> UserProfile:
-        """Save current preferences as a named preset."""
-        name = name[:self._MAX_PRESET_NAME_LEN]
+    def save_preset(self, user_id: str, name: str) -> tuple[UserProfile, str]:
+        """Save current preferences as a named preset.
+
+        Returns (profile, error_message). Error is empty on success.
+        """
+        name = name.strip()[:self._MAX_PRESET_NAME_LEN].strip()
+        if not name:
+            return self.get_or_create(user_id), "Preset name cannot be empty."
+        if not self._PRESET_NAME_RE.match(name):
+            return self.get_or_create(user_id), (
+                "Preset names may only contain letters, numbers, "
+                "spaces, hyphens, and underscores."
+            )
         profile = self.get_or_create(user_id)
         profile.presets[name] = {
             "topic_weights": dict(profile.topic_weights),
@@ -286,7 +324,7 @@ class PreferenceStore:
             if first_key is None:
                 break
             del profile.presets[first_key]
-        return profile
+        return profile, ""
 
     def load_preset(self, user_id: str, name: str) -> UserProfile | None:
         """Load a named preset, replacing current preferences."""
