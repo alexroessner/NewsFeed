@@ -730,8 +730,10 @@ class NewsFeedEngine:
         for cmd in commands:
             if cmd.action == "topic_delta" and cmd.topic and cmd.value:
                 delta = float(cmd.value)
-                updated = self.preferences.apply_weight_adjustment(user_id, cmd.topic, delta)
+                updated, hint = self.preferences.apply_weight_adjustment(user_id, cmd.topic, delta)
                 results[f"topic:{cmd.topic}"] = str(updated.topic_weights.get(cmd.topic, 0.0))
+                if hint:
+                    results[f"hint:{cmd.topic}"] = hint
             elif cmd.action == "tone" and cmd.value:
                 self.preferences.apply_style_update(user_id, tone=cmd.value)
                 results["tone"] = cmd.value

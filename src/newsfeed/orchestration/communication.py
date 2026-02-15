@@ -931,11 +931,13 @@ class CommunicationAgent:
             for cmd in parse_result.commands:
                 if cmd.action == "topic_delta" and cmd.topic and cmd.value:
                     delta = float(cmd.value)
-                    self._engine.preferences.apply_weight_adjustment(
+                    _, hint = self._engine.preferences.apply_weight_adjustment(
                         user_id, cmd.topic, delta)
                     results[f"topic:{cmd.topic}"] = str(
                         self._engine.preferences.get_or_create(user_id)
                         .topic_weights.get(cmd.topic, 0.0))
+                    if hint:
+                        results[f"hint:{cmd.topic}"] = hint
 
         if results:
             # Refresh profile after changes
@@ -949,7 +951,10 @@ class CommunicationAgent:
                 lines.append("")
 
             for key, val in results.items():
-                lines.append(f"\u2022 {html_mod.escape(str(key))} = {html_mod.escape(str(val))}")
+                if key.startswith("hint:"):
+                    lines.append(f"\u26a0\ufe0f <i>{html_mod.escape(str(val))}</i>")
+                else:
+                    lines.append(f"\u2022 {html_mod.escape(str(key))} = {html_mod.escape(str(val))}")
 
             # Show updated topic balance if any topic changes
             topic_changes = [k for k in results if k.startswith("topic:")]
@@ -1495,9 +1500,22 @@ class CommunicationAgent:
             self._bot.send_message(
                 chat_id,
                 f"Current timezone: <code>{profile.timezone}</code>\n"
-                f"Set with: /timezone US/Eastern"
+                f"Set with: /timezone America/New_York"
             )
             return {"action": "timezone_show", "user_id": user_id}
+
+        # Validate timezone against zoneinfo database before accepting
+        try:
+            from zoneinfo import ZoneInfo
+            ZoneInfo(tz)  # Raises KeyError if invalid
+        except (KeyError, Exception):
+            import html as html_mod
+            self._bot.send_message(
+                chat_id,
+                f"Unknown timezone <code>{html_mod.escape(tz)}</code>.\n"
+                f"Examples: America/New_York, Europe/London, Asia/Tokyo, UTC"
+            )
+            return {"action": "timezone_invalid", "user_id": user_id}
 
         self._engine.preferences.set_timezone(user_id, tz)
         self._persist_prefs()
@@ -1634,7 +1652,7 @@ class CommunicationAgent:
                     self._engine.preferences.apply_weight_adjustment(user_id, topic, 0.1)
                     applied.append(f"Boosted {name} (+0.1) based on consistent positive ratings")
                 else:
-                    suggestions.append(f"{name} is already at max weight — you clearly love this topic")
+                    suggestions.append(f"{name} is already at max weight \u2014 you clearly love this topic")
             elif pct <= 20 and total >= 5:
                 # Strong negative signal — reduce
                 profile = self._engine.preferences.get_or_create(user_id)
@@ -2819,7 +2837,7 @@ class CommunicationAgent:
 
         if field == "confidence":
             try:
-                val = float(value)
+                val = max(0.0, min(float(value), 1.0))
                 self._engine.preferences.set_filter(user_id, "confidence", str(val))
                 self._persist_prefs()
                 label = f"{val:.0%}" if val > 0 else "off"
@@ -2853,6 +2871,7 @@ class CommunicationAgent:
         if field in ("max_per_source", "source_limit"):
             try:
                 val = int(value) if value.lower() != "off" else 0
+                val = max(0, min(val, 10))
                 self._engine.preferences.set_filter(user_id, "max_per_source", str(val))
                 self._persist_prefs()
                 label = str(val) if val > 0 else "off"
@@ -2866,7 +2885,7 @@ class CommunicationAgent:
 
         if field == "georisk":
             try:
-                val = float(value)
+                val = max(0.1, min(float(value), 1.0))
                 self._engine.preferences.set_filter(user_id, "georisk", str(val))
                 self._persist_prefs()
                 self._bot.send_message(
@@ -2880,7 +2899,7 @@ class CommunicationAgent:
 
         if field == "trend":
             try:
-                val = float(value)
+                val = max(1.5, min(float(value), 10.0))
                 self._engine.preferences.set_filter(user_id, "trend", str(val))
                 self._persist_prefs()
                 self._bot.send_message(

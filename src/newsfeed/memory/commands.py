@@ -75,11 +75,15 @@ def _fuzzy_match_value(raw: str, valid: tuple[str, ...],
     return matches[0] if matches else None
 
 
+_MAX_INPUT_LEN = 500  # Cap input before regex to prevent ReDoS
+
+
 def parse_preference_commands(text: str, deltas: dict[str, float] | None = None) -> list[PreferenceCommand]:
     d = deltas or {}
     more_delta = str(d.get("more", 0.2))
     less_delta = str(d.get("less", -0.2))
 
+    text = text[:_MAX_INPUT_LEN]
     commands: list[PreferenceCommand] = []
 
     for m in _MORE_RE.finditer(text):
@@ -143,6 +147,7 @@ def parse_preference_commands_rich(
     Like parse_preference_commands but returns corrections and hints
     when the user makes typos or uses invalid values.
     """
+    text = text[:_MAX_INPUT_LEN]
     d = deltas or {}
     more_delta = str(d.get("more", 0.2))
     less_delta = str(d.get("less", -0.2))
