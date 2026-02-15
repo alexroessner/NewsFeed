@@ -140,8 +140,11 @@ class SystemConfigurator:
         self._personas = personas_cfg
         self._change_history: list[ConfigChange] = []
 
+    _MAX_TEXT_LEN = 5000  # Defense-in-depth; Telegram caps at 4096 chars
+
     def parse_and_apply(self, text: str, source: str = "user_command") -> list[ConfigChange]:
         """Parse natural language text and apply all recognized configuration changes."""
+        text = text[:self._MAX_TEXT_LEN]
         changes: list[ConfigChange] = []
         text_lower = text.lower()
 
