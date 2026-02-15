@@ -15,6 +15,29 @@ if TYPE_CHECKING:
     from newsfeed.orchestration.engine import NewsFeedEngine
 
 from newsfeed.delivery.market import MarketTicker
+from newsfeed.orchestration.handlers import HandlerContext
+from newsfeed.orchestration.handlers.analysis import (
+    handle_compare as _h_compare,
+    handle_deep_dive_story as _h_deep_dive_story,
+    handle_recall as _h_recall,
+    handle_timeline as _h_timeline,
+)
+from newsfeed.orchestration.handlers.management import (
+    handle_save as _h_save,
+    handle_saved as _h_saved,
+    handle_track as _h_track,
+    handle_tracked as _h_tracked,
+    handle_unsave as _h_unsave,
+    handle_untrack as _h_untrack,
+)
+from newsfeed.delivery.onboarding import (
+    OnboardingState,
+    apply_onboarding_profile,
+    build_completion_message,
+    build_detail_message,
+    build_role_message,
+    build_welcome_message,
+)
 from newsfeed.memory.store import BoundedUserDict, match_tracked
 
 log = logging.getLogger(__name__)
@@ -63,6 +86,16 @@ class CommunicationAgent:
         # Per-user rate limiting for resource-intensive commands
         self._rate_limits: BoundedUserDict[float] = BoundedUserDict(maxlen=500)
         self._RATE_LIMIT_SECONDS = 15  # Min seconds between briefing/sitrep/quick
+        # Onboarding state for interactive setup flow
+        self._onboarding: BoundedUserDict[OnboardingState] = BoundedUserDict(maxlen=500)
+        # Handler context for delegated command modules
+        self._ctx = HandlerContext(
+            engine=engine, bot=bot, scheduler=scheduler,
+            default_topics=self._default_topics,
+            shown_ids=self._shown_ids,
+            last_topic=self._last_topic,
+            last_items=self._last_items,
+        )
 
     def handle_update(self, update: dict) -> dict[str, Any] | None:
         """Process a single Telegram update end-to-end.
@@ -101,6 +134,9 @@ class CommunicationAgent:
 
             elif cmd_type == "rate":
                 result = self._handle_rate(chat_id, user_id, command)
+
+            elif cmd_type == "onboard":
+                result = self._handle_onboard_callback(chat_id, user_id, command)
 
         except Exception:
             log.exception("Error handling update for user=%s", user_id)
@@ -186,7 +222,7 @@ class CommunicationAgent:
             # If args is a story number, deep dive on that specific story
             try:
                 story_num = int(args.strip())
-                return self._deep_dive_story(chat_id, user_id, story_num)
+                return _h_deep_dive_story(self._ctx, chat_id, user_id, story_num)
             except (ValueError, TypeError):
                 pass
             # Otherwise run a fuller briefing
@@ -208,10 +244,10 @@ class CommunicationAgent:
             return self._show_entities(chat_id, user_id)
 
         if command == "compare":
-            return self._compare_story(chat_id, user_id, args)
+            return _h_compare(self._ctx, chat_id, user_id, args)
 
         if command == "recall":
-            return self._recall(chat_id, user_id, args)
+            return _h_recall(self._ctx, chat_id, user_id, args)
 
         if command == "insights":
             return self._show_insights(chat_id, user_id)
@@ -235,25 +271,25 @@ class CommunicationAgent:
             return self._send_rate_prompt(chat_id, user_id)
 
         if command == "track":
-            return self._track_story(chat_id, user_id, args)
+            return _h_track(self._ctx, chat_id, user_id, args)
 
         if command == "tracked":
-            return self._show_tracked(chat_id, user_id)
+            return _h_tracked(self._ctx, chat_id, user_id)
 
         if command == "untrack":
-            return self._untrack_story(chat_id, user_id, args)
+            return _h_untrack(self._ctx, chat_id, user_id, args)
 
         if command == "save":
-            return self._save_story(chat_id, user_id, args)
+            return _h_save(self._ctx, chat_id, user_id, args)
 
         if command == "saved":
-            return self._show_saved(chat_id, user_id)
+            return _h_saved(self._ctx, chat_id, user_id)
 
         if command == "unsave":
-            return self._unsave_story(chat_id, user_id, args)
+            return _h_unsave(self._ctx, chat_id, user_id, args)
 
         if command == "timeline":
-            return self._show_timeline(chat_id, user_id, args)
+            return _h_timeline(self._ctx, chat_id, user_id, args)
 
         if command == "email":
             return self._set_email(chat_id, user_id, args)
@@ -291,6 +327,9 @@ class CommunicationAgent:
             self._bot.send_message(chat_id, "All preferences reset to defaults.")
             return {"action": "reset", "user_id": user_id}
 
+        if command == "transparency":
+            return self._show_transparency(chat_id, user_id)
+
         if command == "admin":
             return self._handle_admin(chat_id, user_id, args)
 
@@ -300,29 +339,111 @@ class CommunicationAgent:
         return {"action": "unknown_command", "user_id": user_id, "command": command}
 
     def _onboard(self, chat_id: int | str, user_id: str) -> dict[str, Any]:
-        """Welcome a new user and create their default profile."""
+        """Welcome a new user with interactive onboarding flow.
+
+        Starts a 3-step personalization: topics -> role -> detail level.
+        Seeds the profile in ~30 seconds instead of requiring iterative /feedback.
+        """
         self._engine.preferences.get_or_create(user_id)
         self._engine.analytics.record_user_seen(user_id, chat_id)
-        self._bot.send_message(
-            chat_id,
-            "<b>\U0001f4e1 Welcome to NewsFeed Intelligence</b>\n\n"
-            "Personalized news briefings from 23+ sources "
-            "across geopolitics, AI, technology, markets, and more.\n\n"
-            "<b>Quick start:</b>\n"
-            "\u2022 /briefing \u2014 Full intelligence briefing\n"
-            "\u2022 /quick \u2014 Fast headlines-only scan\n"
-            "\u2022 /schedule morning 08:00 \u2014 Daily delivery\n\n"
-            "<b>Just ask me anything:</b>\n"
-            "\u2022 \"What's happening with AI?\"\n"
-            "\u2022 \"Show me geopolitics news\"\n"
-            "\u2022 \"What's trending?\"\n\n"
-            "<b>Customize:</b>\n"
-            "\u2022 Type \"more AI, less crypto\" to adjust\n"
-            "\u2022 /filter confidence 0.7 \u2014 Quality filter\n"
-            "\u2022 /watchlist crypto BTC ETH \u2014 Market tickers\n"
-            "\u2022 /help \u2014 Full command list"
-        )
+
+        # Initialize onboarding state
+        self._onboarding[user_id] = OnboardingState()
+
+        text, keyboard = build_welcome_message()
+        self._bot.send_message(chat_id, text, reply_markup=keyboard)
         return {"action": "onboard", "user_id": user_id}
+
+    def _handle_onboard_callback(self, chat_id: int | str, user_id: str,
+                                  callback_data: str) -> dict[str, Any]:
+        """Handle onboarding inline keyboard callbacks.
+
+        Callback data format: "onboard:topic:geopolitics", "onboard:topics_done",
+        "onboard:role:investor", "onboard:detail:standard"
+        """
+        state = self._onboarding.get(user_id)
+        if not state:
+            # No active onboarding — start fresh
+            return self._onboard(chat_id, user_id)
+
+        parts = callback_data.split(":")
+        if len(parts) < 2:
+            return {"action": "onboard_error", "user_id": user_id}
+
+        action = parts[1] if len(parts) >= 2 else ""
+        value = parts[2] if len(parts) >= 3 else ""
+
+        import html as html_mod
+
+        if action == "topic" and value:
+            # Toggle topic selection
+            if value in state.selected_topics:
+                state.selected_topics.remove(value)
+            else:
+                if len(state.selected_topics) < 5:
+                    state.selected_topics.append(value)
+                else:
+                    self._bot.send_message(chat_id, "Max 5 topics. Deselect one first, or tap 'Done'.")
+                    return {"action": "onboard_topic_max", "user_id": user_id}
+
+            # Show updated selection
+            if state.selected_topics:
+                from newsfeed.delivery.onboarding import TOPIC_OPTIONS
+                names = [dict(TOPIC_OPTIONS).get(t, t) for t in state.selected_topics]
+                self._bot.send_message(
+                    chat_id,
+                    f"Selected: <b>{html_mod.escape(', '.join(names))}</b> "
+                    f"({len(state.selected_topics)}/5)\n"
+                    "Tap more topics or 'Done selecting topics \u2192'"
+                )
+            return {"action": "onboard_topic_toggle", "user_id": user_id,
+                    "topics": list(state.selected_topics)}
+
+        if action == "topics_done":
+            if len(state.selected_topics) < 1:
+                self._bot.send_message(chat_id, "Please select at least 1 topic.")
+                return {"action": "onboard_topics_empty", "user_id": user_id}
+
+            state.step = "role"
+            text, keyboard = build_role_message(state.selected_topics)
+            self._bot.send_message(chat_id, text, reply_markup=keyboard)
+            return {"action": "onboard_topics_done", "user_id": user_id,
+                    "topics": list(state.selected_topics)}
+
+        if action == "role" and value:
+            state.role = value
+            state.step = "detail"
+            text, keyboard = build_detail_message(value)
+            self._bot.send_message(chat_id, text, reply_markup=keyboard)
+            return {"action": "onboard_role", "user_id": user_id, "role": value}
+
+        if action == "detail" and value:
+            state.detail_level = value
+            state.step = "done"
+
+            # Apply all selections to profile
+            effective_weights = apply_onboarding_profile(
+                self._engine.preferences,
+                user_id,
+                state.selected_topics,
+                state.role,
+                state.detail_level,
+            )
+            self._persist_prefs()
+
+            # Send completion message
+            msg = build_completion_message(
+                state.selected_topics, state.role, state.detail_level,
+                effective_weights,
+            )
+            self._bot.send_message(chat_id, msg)
+
+            # Clean up onboarding state
+            self._onboarding.pop(user_id, None)
+
+            return {"action": "onboard_complete", "user_id": user_id,
+                    "topics": state.selected_topics, "role": state.role,
+                    "detail": state.detail_level}
 
     def _run_sitrep(self, chat_id: int | str, user_id: str,
                     args: str = "") -> dict[str, Any]:
@@ -602,6 +723,14 @@ class CommunicationAgent:
                 "No stories matched your current filters. Try /feedback to adjust."
             )
 
+        # Topic discovery — surface emerging trends the user doesn't track
+        if payload.trends and payload.items:
+            emerging = [t.topic for t in payload.trends if t.is_emerging]
+            user_weights = dict(profile.topic_weights) if profile.topic_weights else dict(topics)
+            discovery_msg = formatter.format_topic_discovery(emerging, user_weights)
+            if discovery_msg:
+                self._bot.send_message(chat_id, discovery_msg)
+
         # Closing message: weightings + action buttons
         if payload.items:
             closing = formatter.format_closing(
@@ -702,15 +831,49 @@ class CommunicationAgent:
 
     def _handle_feedback(self, chat_id: int | str, user_id: str,
                          text: str) -> dict[str, Any]:
-        """Apply user feedback to preferences, or detect conversational intent."""
+        """Apply user feedback to preferences with rich weight preview."""
         results = self._engine.apply_user_feedback(
             user_id, text, is_admin=self._is_admin(user_id)
         )
 
         if results:
             import html as html_mod
-            changes = ", ".join(f"{html_mod.escape(str(k))}={html_mod.escape(str(v))}" for k, v in results.items())
-            self._bot.send_message(chat_id, f"Preferences updated: {changes}")
+            # Build rich confirmation with weight preview
+            profile = self._engine.preferences.get_or_create(user_id)
+            lines: list[str] = ["<b>Preferences updated:</b>", ""]
+
+            for key, val in results.items():
+                lines.append(f"\u2022 {html_mod.escape(str(key))} = {html_mod.escape(str(val))}")
+
+            # Show updated topic balance if any topic changes
+            topic_changes = [k for k in results if k.startswith("topic:")]
+            if topic_changes and profile.topic_weights:
+                lines.append("")
+                lines.append("<b>Your topic balance:</b>")
+                sorted_topics = sorted(profile.topic_weights.items(), key=lambda x: x[1], reverse=True)
+                for topic, weight in sorted_topics[:6]:
+                    name = html_mod.escape(topic.replace("_", " ").title())
+                    bar = "\u2588" * max(1, int(abs(weight) * 10))
+                    lines.append(f"  {name}: {weight:.0%} {bar}")
+                lines.append("")
+                # Estimate effect on next briefing
+                total_items = profile.max_items
+                top_topic = sorted_topics[0][0].replace("_", " ").title() if sorted_topics else "general"
+                lines.append(
+                    f"<i>Next briefing (~{total_items} stories) will favor "
+                    f"{html_mod.escape(top_topic)}</i>"
+                )
+
+            # Show source weight changes
+            source_changes = [k for k in results if k.startswith("source:")]
+            if source_changes and profile.source_weights:
+                lines.append("")
+                lines.append("<b>Source preferences:</b>")
+                for src, sw in sorted(profile.source_weights.items(), key=lambda x: -x[1]):
+                    label = "\u2191 boosted" if sw > 0 else "\u2193 demoted"
+                    lines.append(f"  {html_mod.escape(src)}: {label}")
+
+            self._bot.send_message(chat_id, "\n".join(lines))
             return {"action": "feedback", "user_id": user_id, "changes": results}
 
         # No preference match — try conversational intent detection
@@ -897,6 +1060,121 @@ class CommunicationAgent:
         status = self._engine.engine_status()
         self._bot.send_message(chat_id, self._bot.format_status(status))
         return {"action": "status", "user_id": user_id}
+
+    def _show_transparency(self, chat_id: int | str, user_id: str) -> dict[str, Any]:
+        """Show pipeline trace for the last briefing — full decision transparency.
+
+        Exposes the audit trail data that the pipeline already tracks:
+        - How many candidates were researched and from which agents
+        - Intelligence pipeline timing
+        - Expert council voting breakdown (agreements, rejections, arbitrations)
+        - Editorial review changes
+        """
+        import html as html_mod
+
+        # Get the most recent request from audit trail
+        recent = self._engine.audit.get_recent_requests(limit=1)
+        if not recent:
+            self._bot.send_message(
+                chat_id,
+                "No pipeline data available yet. Run /briefing first."
+            )
+            return {"action": "transparency_empty", "user_id": user_id}
+
+        request_id = recent[0]
+        trace = self._engine.audit.get_request_trace(request_id)
+        if not trace:
+            self._bot.send_message(chat_id, "No trace data for last request.")
+            return {"action": "transparency_empty", "user_id": user_id}
+
+        # Parse trace into sections
+        research_events = [e for e in trace if e["type"] == "research"]
+        vote_events = [e for e in trace if e["type"] == "vote"]
+        selection_events = [e for e in trace if e["type"] == "selection"]
+        review_events = [e for e in trace if e["type"] == "review"]
+        delivery_events = [e for e in trace if e["type"] == "delivery"]
+
+        lines: list[str] = []
+        lines.append("<b>Pipeline Transparency Report</b>")
+        lines.append("")
+
+        # Research phase
+        if research_events:
+            total_candidates = sum(e.get("candidate_count", 0) for e in research_events)
+            avg_latency = (
+                sum(e.get("latency_ms", 0) for e in research_events) / len(research_events)
+            ) if research_events else 0
+            lines.append(f"<b>Research:</b> {total_candidates} candidates from "
+                         f"{len(research_events)} agents ({avg_latency:.0f}ms avg)")
+            # Top contributing agents
+            top_agents = sorted(research_events, key=lambda e: e.get("candidate_count", 0), reverse=True)[:5]
+            for e in top_agents:
+                agent = html_mod.escape(e.get("agent_id", "?"))
+                count = e.get("candidate_count", 0)
+                lines.append(f"  \u2022 {agent}: {count} candidates")
+
+        # Expert council
+        if vote_events:
+            keeps = sum(1 for v in vote_events if v.get("keep"))
+            drops = sum(1 for v in vote_events if not v.get("keep"))
+            arbitrated = sum(1 for v in vote_events if v.get("arbitrated"))
+            lines.append("")
+            lines.append(f"<b>Expert Council:</b> {len(vote_events)} votes "
+                         f"({keeps} keep, {drops} drop)")
+            if arbitrated:
+                lines.append(f"  \u2022 {arbitrated} votes revised through arbitration")
+
+            # Expert disagreement summary
+            from collections import defaultdict
+            candidate_votes: dict[str, dict] = defaultdict(lambda: {"keep": 0, "drop": 0})
+            for v in vote_events:
+                cid = v.get("candidate_id", "?")
+                if v.get("keep"):
+                    candidate_votes[cid]["keep"] += 1
+                else:
+                    candidate_votes[cid]["drop"] += 1
+
+            contested = [
+                (cid, cv) for cid, cv in candidate_votes.items()
+                if cv["keep"] > 0 and cv["drop"] > 0
+            ]
+            if contested:
+                lines.append(f"  \u2022 {len(contested)} stories had split votes (experts disagreed)")
+
+        # Selection
+        if selection_events:
+            selected = sum(1 for s in selection_events if s.get("selected"))
+            rejected = sum(1 for s in selection_events if not s.get("selected"))
+            lines.append("")
+            lines.append(f"<b>Selection:</b> {selected} stories selected, "
+                         f"{rejected} filtered out")
+
+        # Editorial review
+        if review_events:
+            rewrites = sum(1 for r in review_events if r.get("changed"))
+            lines.append("")
+            lines.append(f"<b>Editorial Review:</b> {rewrites}/{len(review_events)} "
+                         f"fields rewritten by review agents")
+
+        # Delivery timing
+        if delivery_events:
+            elapsed = delivery_events[0].get("total_elapsed_s", 0)
+            items = delivery_events[0].get("item_count", 0)
+            lines.append("")
+            lines.append(f"<b>Delivery:</b> {items} stories in {elapsed:.2f}s total")
+
+        # Last briefing's pipeline_trace from metadata (if available)
+        report_items = self._engine.last_report_items(user_id)
+        if not report_items and not research_events:
+            lines.append("")
+            lines.append("<i>Run /briefing to generate pipeline data.</i>")
+
+        lines.append("")
+        lines.append("<i>The audit trail tracks every decision. "
+                     "This is the reasoning behind your briefing.</i>")
+
+        self._bot.send_message(chat_id, "\n".join(lines))
+        return {"action": "transparency", "user_id": user_id}
 
     def _show_topics(self, chat_id: int | str, user_id: str) -> dict[str, Any]:
         """Display available topics with effective weights (defaults + user overrides)."""
