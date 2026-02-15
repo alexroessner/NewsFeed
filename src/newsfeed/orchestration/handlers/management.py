@@ -34,7 +34,7 @@ def handle_track(ctx: HandlerContext, chat_id: int | str,
     headline = item["title"]
 
     ctx.engine.preferences.track_story(user_id, topic, headline)
-    ctx.persist_prefs()
+    ctx.persist_prefs(chat_id)
     track_count = len(ctx.engine.preferences.get_or_create(user_id).tracked_stories)
     ctx.bot.send_message(
         chat_id,
@@ -88,7 +88,7 @@ def handle_untrack(ctx: HandlerContext, chat_id: int | str,
 
     removed = profile.tracked_stories[index - 1]
     ctx.engine.preferences.untrack_story(user_id, index)
-    ctx.persist_prefs()
+    ctx.persist_prefs(chat_id)
     ctx.bot.send_message(
         chat_id,
         f"Stopped tracking: <b>{html_mod.escape(removed['headline'][:80])}</b>"
@@ -121,7 +121,7 @@ def handle_save(ctx: HandlerContext, chat_id: int | str,
         url=url,
         topic=item["topic"],
     )
-    ctx.persist_prefs()
+    ctx.persist_prefs(chat_id)
 
     bookmark_count = len(ctx.engine.preferences.get_or_create(user_id).bookmarks)
     ctx.bot.send_message(
@@ -159,7 +159,7 @@ def handle_unsave(ctx: HandlerContext, chat_id: int | str,
 
     removed = profile.bookmarks[index - 1]
     ctx.engine.preferences.remove_bookmark(user_id, index)
-    ctx.persist_prefs()
+    ctx.persist_prefs(chat_id)
     ctx.bot.send_message(
         chat_id,
         f"Removed bookmark: <b>{html_mod.escape(removed['title'][:80])}</b>"

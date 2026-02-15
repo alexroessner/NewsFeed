@@ -36,10 +36,24 @@ class HandlerContext:
     last_topic: BoundedUserDict
     last_items: BoundedUserDict
 
-    def persist_prefs(self) -> None:
-        """Persist preferences immediately."""
+    def persist_prefs(self, chat_id: int | str | None = None) -> bool:
+        """Persist preferences immediately. Returns True on success.
+
+        If chat_id is provided and persistence fails, notifies the user.
+        """
         try:
             self.engine.persist_preferences()
+            return True
         except Exception:
             import logging
             logging.getLogger(__name__).exception("Failed to persist preferences")
+            if chat_id is not None:
+                try:
+                    self.bot.send_message(
+                        chat_id,
+                        "\u26a0\ufe0f Your change was applied but could not be saved to disk. "
+                        "It may be lost if the system restarts. Please try again."
+                    )
+                except Exception:
+                    pass
+            return False

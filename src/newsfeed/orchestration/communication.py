@@ -225,8 +225,27 @@ class CommunicationAgent:
                 return _h_deep_dive_story(self._ctx, chat_id, user_id, story_num)
             except (ValueError, TypeError):
                 pass
-            # Otherwise run a fuller briefing
-            return self._run_briefing(chat_id, user_id, args, deep=True)
+            # No story number — prompt user to pick one
+            items = self._last_items.get(user_id, [])
+            if items:
+                import html as html_mod
+                lines = [
+                    "<b>\U0001f50d Which story to dive into?</b>",
+                    "",
+                ]
+                for i, item in enumerate(items[:10], 1):
+                    title = html_mod.escape(item.get("title", "")[:60])
+                    lines.append(f"  {i}. {title}")
+                lines.append("")
+                lines.append("<i>Tap \U0001f50d Dive deeper on a card, or type /deep_dive [number]</i>")
+                self._bot.send_message(chat_id, "\n".join(lines))
+            else:
+                self._bot.send_message(
+                    chat_id,
+                    "No stories to dive into. Run /briefing first, "
+                    "then tap \U0001f50d Dive deeper on any story card."
+                )
+            return {"action": "deep_dive_prompt", "user_id": user_id}
 
         if command == "quick":
             return self._run_quick_briefing(chat_id, user_id, args)
@@ -924,7 +943,7 @@ class CommunicationAgent:
             return self._show_weekly(chat_id, user_id)
 
         if intent == "search_query":
-            return self._recall(chat_id, user_id, arg)
+            return _h_recall(self._ctx, chat_id, user_id, arg)
 
         if intent == "help_query":
             self._bot.send_message(chat_id, self._bot.format_help())
@@ -1329,12 +1348,27 @@ class CommunicationAgent:
 
         return sent
 
-    def _persist_prefs(self) -> None:
-        """Persist preferences immediately."""
+    def _persist_prefs(self, chat_id: int | str | None = None) -> bool:
+        """Persist preferences immediately. Returns True on success.
+
+        If chat_id is provided and persistence fails, notifies the user
+        so they know their change may not survive a restart.
+        """
         try:
             self._engine.persist_preferences()
+            return True
         except Exception:
             log.exception("Failed to persist preferences")
+            if chat_id is not None:
+                try:
+                    self._bot.send_message(
+                        chat_id,
+                        "\u26a0\ufe0f Your change was applied but could not be saved to disk. "
+                        "It may be lost if the system restarts. Please try again."
+                    )
+                except Exception:
+                    pass
+            return False
 
     def _set_watchlist(self, chat_id: int | str, user_id: str,
                        args: str) -> dict[str, Any]:
@@ -1466,128 +1500,6 @@ class CommunicationAgent:
         keyboard = {"inline_keyboard": rows}
         self._bot.send_message(chat_id, "\n".join(lines), reply_markup=keyboard)
         return {"action": "rate_prompt", "user_id": user_id}
-
-    def _track_story(self, chat_id: int | str, user_id: str,
-                     args: str) -> dict[str, Any]:
-        """Track a story from the last briefing for cross-session continuity."""
-        try:
-            story_num = int(args.strip())
-        except (ValueError, TypeError):
-            self._bot.send_message(chat_id, "Usage: tap the \U0001f4cc Track button on a story card.")
-            return {"action": "track_help", "user_id": user_id}
-
-        items = self._last_items.get(user_id, [])
-        if story_num < 1 or story_num > len(items):
-            self._bot.send_message(chat_id, "That story is no longer available. Run /briefing first.")
-            return {"action": "track_expired", "user_id": user_id}
-
-        item = items[story_num - 1]
-        topic = item["topic"]
-        headline = item["title"]
-
-        self._engine.preferences.track_story(user_id, topic, headline)
-        self._persist_prefs()
-        track_count = len(self._engine.preferences.get_or_create(user_id).tracked_stories)
-        import html as html_mod
-        self._bot.send_message(
-            chat_id,
-            f"\U0001f4cc Now tracking: <b>{html_mod.escape(headline)}</b>\n"
-            f"You'll see \U0001f4cc badges when new developments appear in future briefings.\n"
-            f"View tracked stories: /tracked\n"
-            f"<i>Tip: Use /timeline {track_count} to see this story's evolution over time</i>"
-        )
-        return {"action": "track", "user_id": user_id, "story": story_num}
-
-    def _show_tracked(self, chat_id: int | str, user_id: str) -> dict[str, Any]:
-        """Show all stories the user is currently tracking."""
-        import html as html_mod
-        profile = self._engine.preferences.get_or_create(user_id)
-        tracked = profile.tracked_stories
-
-        if not tracked:
-            self._bot.send_message(
-                chat_id,
-                "You're not tracking any stories yet.\n"
-                "Tap \U0001f4cc Track on a story card to follow it across briefings."
-            )
-            return {"action": "tracked_empty", "user_id": user_id}
-
-        lines = [f"<b>\U0001f4cc Tracked Stories ({len(tracked)})</b>", ""]
-        for i, t in enumerate(tracked, 1):
-            topic = html_mod.escape(t["topic"].replace("_", " ").title())
-            headline = html_mod.escape(t["headline"][:80])
-            lines.append(f"  {i}. <b>{headline}</b>")
-            lines.append(f"     <i>{topic}</i>")
-        lines.append("")
-        lines.append("<i>Untrack: /untrack [number]</i>")
-        self._bot.send_message(chat_id, "\n".join(lines))
-        return {"action": "tracked", "user_id": user_id, "count": len(tracked)}
-
-    def _untrack_story(self, chat_id: int | str, user_id: str,
-                       args: str) -> dict[str, Any]:
-        """Stop tracking a story by its position in /tracked list."""
-        try:
-            index = int(args.strip())
-        except (ValueError, TypeError):
-            self._bot.send_message(chat_id, "Usage: /untrack [number] — see /tracked for the list.")
-            return {"action": "untrack_help", "user_id": user_id}
-
-        profile = self._engine.preferences.get_or_create(user_id)
-        if index < 1 or index > len(profile.tracked_stories):
-            self._bot.send_message(chat_id, f"No tracked story #{index}. See /tracked for the list.")
-            return {"action": "untrack_invalid", "user_id": user_id}
-
-        removed = profile.tracked_stories[index - 1]
-        self._engine.preferences.untrack_story(user_id, index)
-        self._persist_prefs()
-        import html as html_mod
-        self._bot.send_message(
-            chat_id,
-            f"Stopped tracking: <b>{html_mod.escape(removed['headline'][:80])}</b>"
-        )
-        return {"action": "untrack", "user_id": user_id, "index": index}
-
-    def _compare_story(self, chat_id: int | str, user_id: str,
-                       args: str) -> dict[str, Any]:
-        """Show how different sources cover the same story."""
-        try:
-            story_num = int(args.strip())
-        except (ValueError, TypeError):
-            self._bot.send_message(chat_id, "Usage: /compare [story number]")
-            return {"action": "compare_help", "user_id": user_id}
-
-        item, others = self._engine.get_story_thread(user_id, story_num)
-        if not item:
-            self._bot.send_message(
-                chat_id,
-                f"Story #{story_num} not found. Run /briefing first."
-            )
-            return {"action": "compare_not_found", "user_id": user_id}
-
-        formatter = self._engine.formatter
-        card = formatter.format_comparison(item, others, story_num)
-        self._bot.send_message(chat_id, card)
-        return {"action": "compare", "user_id": user_id, "story": story_num,
-                "source_count": 1 + len(others)}
-
-    def _recall(self, chat_id: int | str, user_id: str,
-                args: str) -> dict[str, Any]:
-        """Search past briefing history for a keyword."""
-        keyword = args.strip()
-        if not keyword:
-            self._bot.send_message(
-                chat_id,
-                "Usage: /recall [keyword]\n"
-                "Example: /recall AI regulation"
-            )
-            return {"action": "recall_help", "user_id": user_id}
-
-        items = self._engine.analytics.search_briefing_items(user_id, keyword)
-        formatter = self._engine.formatter
-        card = formatter.format_recall(keyword, items)
-        self._bot.send_message(chat_id, card)
-        return {"action": "recall", "user_id": user_id, "keyword": keyword,
-                "results": len(items)}
 
     def check_tracked_updates(self) -> int:
         """Check for proactive tracked story updates across all users.
@@ -1767,104 +1679,6 @@ class CommunicationAgent:
                     sent += 1
 
         return sent
-
-    def _save_story(self, chat_id: int | str, user_id: str,
-                    args: str) -> dict[str, Any]:
-        """Bookmark a story from the last briefing."""
-        try:
-            story_num = int(args.strip())
-        except (ValueError, TypeError):
-            self._bot.send_message(chat_id, "Usage: tap the \U0001f516 Save button on a story card.")
-            return {"action": "save_help", "user_id": user_id}
-
-        items = self._last_items.get(user_id, [])
-        if story_num < 1 or story_num > len(items):
-            self._bot.send_message(chat_id, "That story is no longer available. Run /briefing first.")
-            return {"action": "save_expired", "user_id": user_id}
-
-        item = items[story_num - 1]
-        # Get URL from ReportItem if available
-        report_item = self._engine.get_report_item(user_id, story_num)
-        url = report_item.candidate.url if report_item else ""
-
-        self._engine.preferences.save_bookmark(
-            user_id,
-            title=item["title"],
-            source=item.get("source", ""),
-            url=url,
-            topic=item["topic"],
-        )
-        self._persist_prefs()
-
-        import html as html_mod
-        bookmark_count = len(self._engine.preferences.get_or_create(user_id).bookmarks)
-        self._bot.send_message(
-            chat_id,
-            f"\U0001f516 Saved: <b>{html_mod.escape(item['title'][:80])}</b>\n"
-            f"View bookmarks: /saved ({bookmark_count} total)\n"
-            f"<i>Tip: /export to get all stories as Markdown for your notes app</i>"
-        )
-        return {"action": "save", "user_id": user_id, "story": story_num}
-
-    def _show_saved(self, chat_id: int | str, user_id: str) -> dict[str, Any]:
-        """Show all bookmarked stories."""
-        profile = self._engine.preferences.get_or_create(user_id)
-        formatter = self._engine.formatter
-        card = formatter.format_bookmarks(profile.bookmarks)
-        self._bot.send_message(chat_id, card)
-        return {"action": "saved", "user_id": user_id, "count": len(profile.bookmarks)}
-
-    def _unsave_story(self, chat_id: int | str, user_id: str,
-                      args: str) -> dict[str, Any]:
-        """Remove a bookmark by index."""
-        try:
-            index = int(args.strip())
-        except (ValueError, TypeError):
-            self._bot.send_message(chat_id, "Usage: /unsave [number] \u2014 see /saved for the list.")
-            return {"action": "unsave_help", "user_id": user_id}
-
-        profile = self._engine.preferences.get_or_create(user_id)
-        if index < 1 or index > len(profile.bookmarks):
-            self._bot.send_message(chat_id, f"No bookmark #{index}. See /saved for the list.")
-            return {"action": "unsave_invalid", "user_id": user_id}
-
-        removed = profile.bookmarks[index - 1]
-        self._engine.preferences.remove_bookmark(user_id, index)
-        self._persist_prefs()
-        import html as html_mod
-        self._bot.send_message(
-            chat_id,
-            f"Removed bookmark: <b>{html_mod.escape(removed['title'][:80])}</b>"
-        )
-        return {"action": "unsave", "user_id": user_id, "index": index}
-
-    def _show_timeline(self, chat_id: int | str, user_id: str,
-                       args: str) -> dict[str, Any]:
-        """Show timeline of a tracked story's evolution from analytics."""
-        try:
-            index = int(args.strip())
-        except (ValueError, TypeError):
-            self._bot.send_message(
-                chat_id,
-                "Usage: /timeline [number] \u2014 where number is from /tracked list."
-            )
-            return {"action": "timeline_help", "user_id": user_id}
-
-        profile = self._engine.preferences.get_or_create(user_id)
-        if index < 1 or index > len(profile.tracked_stories):
-            self._bot.send_message(chat_id, f"No tracked story #{index}. See /tracked for the list.")
-            return {"action": "timeline_invalid", "user_id": user_id}
-
-        tracked = profile.tracked_stories[index - 1]
-        items = self._engine.analytics.get_story_timeline(
-            user_id, tracked["topic"], tracked["keywords"],
-        )
-
-        formatter = self._engine.formatter
-        card = formatter.format_timeline(tracked["headline"], items)
-        self._bot.send_message(chat_id, card)
-        return {"action": "timeline", "user_id": user_id, "index": index,
-                "results": len(items)}
 
     def _set_email(self, chat_id: int | str, user_id: str,
                    args: str) -> dict[str, Any]:
@@ -2353,35 +2167,6 @@ class CommunicationAgent:
 
         return {"action": "export", "user_id": user_id,
                 "length": len(markdown)}
-
-    def _deep_dive_story(self, chat_id: int | str, user_id: str,
-                         story_num: int) -> dict[str, Any]:
-        """Deep dive into a specific story from the last briefing.
-
-        Shows full analysis: confidence band, key assumptions,
-        evidence/novelty breakdown, discovery agent, lifecycle stage.
-        """
-        item = self._engine.get_report_item(user_id, story_num)
-        if not item:
-            self._bot.send_message(
-                chat_id,
-                f"Story #{story_num} not found. Run /briefing first, then tap Dive deeper."
-            )
-            return {"action": "deep_dive_not_found", "user_id": user_id}
-
-        formatter = self._engine.formatter
-        card = formatter.format_deep_dive(item, story_num)
-        self._bot.send_message(chat_id, card)
-
-        self._engine.analytics.record_interaction(
-            user_id=user_id, chat_id=chat_id,
-            interaction_type="deep_dive", command="deep_dive",
-            args=str(story_num), raw_text="",
-            result_action="deep_dive_story",
-            result_data={"story": story_num, "title": item.candidate.title},
-        )
-
-        return {"action": "deep_dive_story", "user_id": user_id, "story": story_num}
 
     def _show_stats(self, chat_id: int | str,
                     user_id: str) -> dict[str, Any]:
