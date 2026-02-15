@@ -262,6 +262,12 @@ class CommunicationAgent:
         if command == "stats":
             return self._show_stats(chat_id, user_id)
 
+        if command == "alert":
+            return self._manage_alert(chat_id, user_id, args)
+
+        if command == "source":
+            return self._manage_source(chat_id, user_id, args)
+
         if command == "sources":
             return self._show_sources(chat_id, user_id)
 
@@ -2236,6 +2242,286 @@ class CommunicationAgent:
             "Example: /preset save Work"
         )
         return {"action": "preset_help", "user_id": user_id}
+
+    def _manage_alert(self, chat_id: int | str, user_id: str,
+                      args: str) -> dict[str, Any]:
+        """Handle /alert add|list|remove commands for keyword alerts."""
+        import html as html_mod
+
+        parts = args.strip().split(maxsplit=1)
+        subcmd = parts[0].lower() if parts else ""
+        subargs = parts[1].strip() if len(parts) > 1 else ""
+
+        if subcmd == "add":
+            if not subargs:
+                self._bot.send_message(chat_id, "Usage: /alert add <keyword or phrase>")
+                return {"action": "alert_add_help", "user_id": user_id}
+            _, error = self._engine.preferences.add_alert_keyword(user_id, subargs)
+            if error:
+                self._bot.send_message(chat_id, f"\u274c {html_mod.escape(error)}")
+                return {"action": "alert_add_failed", "user_id": user_id}
+            self._persist_prefs()
+            self._bot.send_message(
+                chat_id,
+                f"\u2705 Alert set for '<code>{html_mod.escape(subargs.lower()[:50])}</code>'.\n"
+                "Matching stories will be priority-boosted and flagged in your briefings."
+            )
+            return {"action": "alert_added", "user_id": user_id, "keyword": subargs}
+
+        if subcmd == "remove":
+            if not subargs:
+                self._bot.send_message(chat_id, "Usage: /alert remove <keyword>")
+                return {"action": "alert_remove_help", "user_id": user_id}
+            _, removed = self._engine.preferences.remove_alert_keyword(user_id, subargs)
+            if removed:
+                self._persist_prefs()
+                self._bot.send_message(
+                    chat_id,
+                    f"\u2705 Alert for '<code>{html_mod.escape(subargs.lower())}</code>' removed."
+                )
+                return {"action": "alert_removed", "user_id": user_id}
+            self._bot.send_message(
+                chat_id,
+                f"No alert found for '<code>{html_mod.escape(subargs.lower())}</code>'."
+            )
+            return {"action": "alert_not_found", "user_id": user_id}
+
+        if subcmd == "list":
+            profile = self._engine.preferences.get_or_create(user_id)
+            keywords = profile.alert_keywords
+            if not keywords:
+                self._bot.send_message(
+                    chat_id,
+                    "<b>\U0001f514 Keyword Alerts</b>\n\n"
+                    "No alerts set.\n\n"
+                    "Add one with: /alert add <keyword or phrase>"
+                )
+                return {"action": "alert_list_empty", "user_id": user_id}
+            lines = [f"<b>\U0001f514 Keyword Alerts</b> ({len(keywords)}/20)", ""]
+            for i, kw in enumerate(keywords, 1):
+                lines.append(f"{i}. <code>{html_mod.escape(kw)}</code>")
+            lines.extend(["", "Remove with: /alert remove <keyword>"])
+            self._bot.send_message(chat_id, "\n".join(lines))
+            return {"action": "alert_list", "user_id": user_id, "count": len(keywords)}
+
+        # Default: show help
+        self._bot.send_message(
+            chat_id,
+            "<b>\U0001f514 Keyword Alerts</b>\n\n"
+            "Get priority-boosted stories when specific keywords appear.\n"
+            "Works across all topics and sources.\n\n"
+            "<b>Commands:</b>\n"
+            "/alert add <keyword> \u2014 Add a keyword alert\n"
+            "/alert list \u2014 View active alerts\n"
+            "/alert remove <keyword> \u2014 Remove an alert\n\n"
+            "<b>Examples:</b>\n"
+            "<code>/alert add quantum computing</code>\n"
+            "<code>/alert add SEC regulation</code>\n"
+            "<code>/alert add TSMC</code>"
+        )
+        return {"action": "alert_help", "user_id": user_id}
+
+    def _manage_source(self, chat_id: int | str, user_id: str,
+                       args: str) -> dict[str, Any]:
+        """Handle /source add|list|remove|test commands for custom RSS feeds."""
+        import html as html_mod
+        from newsfeed.agents.dynamic_sources import (
+            MAX_CUSTOM_SOURCES_PER_USER,
+            discover_feed,
+            validate_source_name,
+        )
+
+        parts = args.strip().split(maxsplit=1)
+        subcmd = parts[0].lower() if parts else ""
+        subargs = parts[1].strip() if len(parts) > 1 else ""
+
+        if subcmd == "add":
+            return self._source_add(chat_id, user_id, subargs)
+
+        if subcmd == "list":
+            sources = self._engine.preferences.get_custom_sources(user_id)
+            if not sources:
+                self._bot.send_message(
+                    chat_id,
+                    "<b>\U0001f4e1 Custom Sources</b>\n\n"
+                    "No custom sources added yet.\n\n"
+                    "Add one with: /source add https://example.com [name]"
+                )
+                return {"action": "source_list_empty", "user_id": user_id}
+            lines = [
+                f"<b>\U0001f4e1 Custom Sources</b> "
+                f"({len(sources)}/{MAX_CUSTOM_SOURCES_PER_USER})",
+                "",
+            ]
+            for i, src in enumerate(sources, 1):
+                title = html_mod.escape(src.get("feed_title") or src["name"])
+                name = html_mod.escape(src["name"])
+                topics = ", ".join(src.get("topics", ["general"]))
+                lines.append(
+                    f"{i}. <b>{title}</b> (<code>{name}</code>)\n"
+                    f"   Topics: {html_mod.escape(topics)}\n"
+                    f"   Feed: <code>{html_mod.escape(src['feed_url'][:80])}</code>"
+                )
+            lines.extend([
+                "",
+                "Remove with: /source remove [name]",
+                "Test with: /source test [name]",
+            ])
+            self._bot.send_message(chat_id, "\n".join(lines))
+            return {"action": "source_list", "user_id": user_id, "count": len(sources)}
+
+        if subcmd == "remove":
+            if not subargs:
+                self._bot.send_message(chat_id, "Usage: /source remove [name]")
+                return {"action": "source_remove_help", "user_id": user_id}
+            name = subargs.split()[0].lower()
+            _, removed = self._engine.preferences.remove_custom_source(user_id, name)
+            if removed:
+                self._persist_prefs()
+                self._bot.send_message(
+                    chat_id,
+                    f"\u2705 Source '<code>{html_mod.escape(name)}</code>' removed."
+                )
+                return {"action": "source_removed", "user_id": user_id, "name": name}
+            self._bot.send_message(
+                chat_id,
+                f"Source '<code>{html_mod.escape(name)}</code>' not found. "
+                "Use /source list to see your sources."
+            )
+            return {"action": "source_not_found", "user_id": user_id, "name": name}
+
+        if subcmd == "test":
+            if not subargs:
+                self._bot.send_message(chat_id, "Usage: /source test [name]")
+                return {"action": "source_test_help", "user_id": user_id}
+            name = subargs.split()[0].lower()
+            sources = self._engine.preferences.get_custom_sources(user_id)
+            src = next((s for s in sources if s["name"].lower() == name), None)
+            if not src:
+                self._bot.send_message(
+                    chat_id,
+                    f"Source '<code>{html_mod.escape(name)}</code>' not found."
+                )
+                return {"action": "source_test_notfound", "user_id": user_id}
+            result = discover_feed(src["feed_url"])
+            if result.valid:
+                self._bot.send_message(
+                    chat_id,
+                    f"\u2705 <b>{html_mod.escape(src['name'])}</b> is healthy.\n"
+                    f"Feed: {html_mod.escape(result.feed_title or 'untitled')}\n"
+                    f"Items: {result.item_count}"
+                )
+            else:
+                self._bot.send_message(
+                    chat_id,
+                    f"\u26a0\ufe0f <b>{html_mod.escape(src['name'])}</b> "
+                    f"may be down.\n{html_mod.escape(result.error)}"
+                )
+            return {"action": "source_test", "user_id": user_id, "valid": result.valid}
+
+        # Default: show help
+        self._bot.send_message(
+            chat_id,
+            "<b>\U0001f4e1 Custom Source Management</b>\n\n"
+            "Add your own RSS feeds to your intelligence pipeline.\n"
+            "Custom sources start at low trust and earn credibility over time.\n\n"
+            "<b>Commands:</b>\n"
+            "/source add https://example.com [name] \u2014 Add a source\n"
+            "/source list \u2014 View your custom sources\n"
+            "/source remove [name] \u2014 Remove a source\n"
+            "/source test [name] \u2014 Check if a source is healthy\n\n"
+            "<b>Examples:</b>\n"
+            "<code>/source add https://techcrunch.com techcrunch</code>\n"
+            "<code>/source add https://feeds.arstechnica.com/arstechnica/index ars</code>\n\n"
+            f"You can add up to {MAX_CUSTOM_SOURCES_PER_USER} custom sources."
+        )
+        return {"action": "source_help", "user_id": user_id}
+
+    def _source_add(self, chat_id: int | str, user_id: str,
+                    args: str) -> dict[str, Any]:
+        """Handle /source add <url> [name] — discover, validate, and register a feed."""
+        import html as html_mod
+        from urllib.parse import urlparse
+
+        from newsfeed.agents.dynamic_sources import (
+            discover_feed,
+            validate_source_name,
+        )
+
+        if not args:
+            self._bot.send_message(
+                chat_id,
+                "Usage: /source add <url> [name]\n"
+                "Example: /source add https://techcrunch.com techcrunch"
+            )
+            return {"action": "source_add_help", "user_id": user_id}
+
+        parts = args.split(maxsplit=1)
+        url = parts[0]
+        explicit_name = parts[1].strip().split()[0].lower() if len(parts) > 1 else ""
+
+        # Show a "working" message since feed discovery can take a few seconds
+        self._bot.send_message(chat_id, "\U0001f50d Discovering feed...")
+
+        # Discover and probe the feed
+        result = discover_feed(url)
+        if not result.valid:
+            self._bot.send_message(
+                chat_id,
+                f"\u274c Could not find a valid feed.\n{html_mod.escape(result.error)}"
+            )
+            return {"action": "source_add_failed", "user_id": user_id, "error": result.error}
+
+        # Derive name from explicit arg, feed title, or hostname
+        if explicit_name:
+            name = explicit_name
+        elif result.feed_title:
+            # Sanitize feed title to a valid source name
+            import re
+            name = re.sub(r"[^a-zA-Z0-9_-]", "", result.feed_title.lower().replace(" ", "-"))[:30]
+        else:
+            name = (urlparse(url).hostname or "custom").replace("www.", "").split(".")[0]
+
+        if not name:
+            name = "custom-feed"
+
+        valid_name, name_error = validate_source_name(name)
+        if not valid_name:
+            self._bot.send_message(
+                chat_id,
+                f"\u274c Invalid source name: {html_mod.escape(name_error)}\n"
+                "Try: /source add <url> <name>"
+            )
+            return {"action": "source_add_bad_name", "user_id": user_id}
+
+        # Register the source
+        _, error = self._engine.preferences.add_custom_source(
+            user_id=user_id,
+            name=name,
+            feed_url=result.feed_url,
+            site_url=url,
+            feed_title=result.feed_title,
+        )
+        if error:
+            self._bot.send_message(chat_id, f"\u274c {html_mod.escape(error)}")
+            return {"action": "source_add_dup", "user_id": user_id, "error": error}
+
+        self._persist_prefs()
+
+        self._bot.send_message(
+            chat_id,
+            f"\u2705 <b>Source added!</b>\n\n"
+            f"Name: <code>{html_mod.escape(name)}</code>\n"
+            f"Feed: {html_mod.escape(result.feed_title or 'untitled')}\n"
+            f"Items found: {result.item_count}\n"
+            f"URL: <code>{html_mod.escape(result.feed_url[:80])}</code>\n\n"
+            "This source will appear in your next briefing with low initial trust. "
+            "It earns credibility as its stories get corroborated by established sources."
+        )
+        return {
+            "action": "source_added", "user_id": user_id,
+            "name": name, "feed_url": result.feed_url,
+        }
 
     def _show_sources(self, chat_id: int | str,
                      user_id: str) -> dict[str, Any]:

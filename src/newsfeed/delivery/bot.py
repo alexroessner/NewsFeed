@@ -65,6 +65,8 @@ BOT_COMMANDS = [
     {"command": "export", "description": "Export last briefing as Markdown"},
     {"command": "stats", "description": "View your personal engagement analytics"},
     {"command": "webhook", "description": "Set webhook URL for Slack/Discord/custom delivery"},
+    {"command": "alert", "description": "Keyword alerts (e.g. /alert add quantum computing)"},
+    {"command": "source", "description": "Manage custom RSS sources (e.g. /source add https://...)"},
     {"command": "sources", "description": "View source reliability, bias, and trust ratings"},
     {"command": "filter", "description": "Set briefing filters (e.g. /filter confidence 0.7)"},
     {"command": "preset", "description": "Save/load briefing presets (e.g. /preset save Work)"},

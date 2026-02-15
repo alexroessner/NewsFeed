@@ -135,6 +135,13 @@ class UserProfile:
     presets: dict[str, dict[str, Any]] = field(default_factory=dict)
     # Outbound webhook URL for pushing briefings/alerts as structured JSON
     webhook_url: str = ""
+    # User-added custom RSS sources — dynamically injected into research pipeline
+    # Each entry: {"name": str, "feed_url": str, "site_url": str,
+    #   "feed_title": str, "topics": [str], "added_at": float, "items_seen": int}
+    custom_sources: list[dict[str, Any]] = field(default_factory=list)
+    # Keyword alerts — stories matching these keywords get priority-boosted
+    # and flagged in briefings (cross-topic, case-insensitive)
+    alert_keywords: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
