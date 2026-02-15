@@ -260,7 +260,8 @@ class CommunicationAgent:
             return self._handle_admin(chat_id, user_id, args)
 
         # Unknown command
-        self._bot.send_message(chat_id, f"Unknown command: /{command}. Try /help")
+        import html as html_mod
+        self._bot.send_message(chat_id, f"Unknown command: /{html_mod.escape(command)}. Try /help")
         return {"action": "unknown_command", "user_id": user_id, "command": command}
 
     def _onboard(self, chat_id: int | str, user_id: str) -> dict[str, Any]:
@@ -609,7 +610,8 @@ class CommunicationAgent:
             return {"action": "show_more", "user_id": user_id, "count": len(more)}
 
         # Cache empty — run a fresh mini-cycle
-        self._bot.send_message(chat_id, f"Searching for more on {topic}...")
+        import html as html_mod
+        self._bot.send_message(chat_id, f"Searching for more on {html_mod.escape(topic)}...")
         return self._run_briefing(chat_id, user_id, topic_hint=topic)
 
     def _detect_intent(self, text: str) -> tuple[str, str]:
@@ -669,7 +671,8 @@ class CommunicationAgent:
         results = self._engine.apply_user_feedback(user_id, text)
 
         if results:
-            changes = ", ".join(f"{k}={v}" for k, v in results.items())
+            import html as html_mod
+            changes = ", ".join(f"{html_mod.escape(str(k))}={html_mod.escape(str(v))}" for k, v in results.items())
             self._bot.send_message(chat_id, f"Preferences updated: {changes}")
             return {"action": "feedback", "user_id": user_id, "changes": results}
 
@@ -677,7 +680,8 @@ class CommunicationAgent:
         intent, arg = self._detect_intent(text)
 
         if intent == "briefing_query":
-            self._bot.send_message(chat_id, f"Pulling intelligence on {arg}...")
+            import html as html_mod
+            self._bot.send_message(chat_id, f"Pulling intelligence on {html_mod.escape(arg)}...")
             return self._run_briefing(chat_id, user_id, topic_hint=arg)
 
         if intent == "trending":
@@ -728,8 +732,9 @@ class CommunicationAgent:
                     source="more_similar_button",
                 )
                 adjustments.append(topic)
+            import html as html_mod
             topic_list = ", ".join(adjustments)
-            self._bot.send_message(chat_id, f"Got it — boosting {topic_list} in future briefings.")
+            self._bot.send_message(chat_id, f"Got it — boosting {html_mod.escape(topic_list)} in future briefings.")
             return {"action": "pref_more", "user_id": user_id, "topics": adjustments}
 
         if pref_command == "less_similar":
@@ -742,8 +747,9 @@ class CommunicationAgent:
                     source="less_similar_button",
                 )
                 adjustments.append(topic)
+            import html as html_mod
             topic_list = ", ".join(adjustments)
-            self._bot.send_message(chat_id, f"Understood — reducing {topic_list} weight.")
+            self._bot.send_message(chat_id, f"Understood — reducing {html_mod.escape(topic_list)} weight.")
             return {"action": "pref_less", "user_id": user_id, "topics": adjustments}
 
         return {"action": "pref_unknown", "user_id": user_id, "command": pref_command}
@@ -794,12 +800,14 @@ class CommunicationAgent:
             self._engine.apply_user_feedback(user_id, f"more {topic}")
             if item.get("source"):
                 self._engine.preferences.apply_source_weight(user_id, item["source"], 0.3)
-            self._bot.send_message(chat_id, f"\U0001f44d Boosted {topic} (story #{item_num})")
+            import html as html_mod
+            self._bot.send_message(chat_id, f"\U0001f44d Boosted {html_mod.escape(topic)} (story #{item_num})")
         elif direction == "down":
             self._engine.apply_user_feedback(user_id, f"less {topic}")
             if item.get("source"):
                 self._engine.preferences.apply_source_weight(user_id, item["source"], -0.3)
-            self._bot.send_message(chat_id, f"\U0001f44e Reduced {topic} (story #{item_num})")
+            import html as html_mod
+            self._bot.send_message(chat_id, f"\U0001f44e Reduced {html_mod.escape(topic)} (story #{item_num})")
         else:
             return {"action": "rate_error", "user_id": user_id}
 
@@ -870,16 +878,18 @@ class CommunicationAgent:
             is_custom = topic in profile.topic_weights
             bar = "\u2588" * max(1, int(abs(weight) * 10))
             sign = "+" if weight > 0 else "" if weight == 0 else ""
+            import html as html_mod
             custom_tag = " (custom)" if is_custom else " (default)"
-            lines.append(f"  {topic}: {sign}{weight:.1f} {bar}{custom_tag}")
+            lines.append(f"  {html_mod.escape(topic)}: {sign}{weight:.1f} {bar}{custom_tag}")
 
         # Show source weights if any
         if profile.source_weights:
             lines.append("")
             lines.append("<b>Source Preferences:</b>")
             for src, sw in sorted(profile.source_weights.items(), key=lambda x: -x[1]):
+                import html as html_mod
                 label = "boosted" if sw > 0 else "demoted"
-                lines.append(f"  {src}: {label} ({sw:+.1f})")
+                lines.append(f"  {html_mod.escape(src)}: {label} ({sw:+.1f})")
 
         lines.extend([
             "",
@@ -987,14 +997,16 @@ class CommunicationAgent:
             cleaned = [t.lower() for t in tickers]
             self._engine.preferences.set_watchlist(user_id, crypto=cleaned)
             self._persist_prefs()
-            self._bot.send_message(chat_id, f"Crypto watchlist: {', '.join(t.upper() for t in cleaned)}")
+            import html as html_mod
+            self._bot.send_message(chat_id, f"Crypto watchlist: {html_mod.escape(', '.join(t.upper() for t in cleaned))}")
             return {"action": "watchlist_crypto", "user_id": user_id}
 
         if category == "stocks" and tickers:
             cleaned = [t.upper() for t in tickers]
             self._engine.preferences.set_watchlist(user_id, stocks=cleaned)
             self._persist_prefs()
-            self._bot.send_message(chat_id, f"Stock watchlist: {', '.join(cleaned)}")
+            import html as html_mod
+            self._bot.send_message(chat_id, f"Stock watchlist: {html_mod.escape(', '.join(cleaned))}")
             return {"action": "watchlist_stocks", "user_id": user_id}
 
         self._bot.send_message(
@@ -1021,7 +1033,8 @@ class CommunicationAgent:
         # Sync timezone to scheduler so scheduled briefings fire at user-local time
         if self._scheduler:
             self._scheduler.set_user_timezone(user_id, tz)
-        self._bot.send_message(chat_id, f"Timezone set to <code>{tz}</code>. Scheduled briefings now use your local time.")
+        import html as html_mod
+        self._bot.send_message(chat_id, f"Timezone set to <code>{html_mod.escape(tz)}</code>. Scheduled briefings now use your local time.")
         return {"action": "timezone", "user_id": user_id, "tz": tz}
 
     def _mute_topic(self, chat_id: int | str, user_id: str,
@@ -1030,17 +1043,19 @@ class CommunicationAgent:
         topic = args.strip().lower().replace(" ", "_")
         if not topic:
             profile = self._engine.preferences.get_or_create(user_id)
+            import html as html_mod
             muted = ", ".join(profile.muted_topics) or "none"
             self._bot.send_message(
                 chat_id,
-                f"Muted topics: <code>{muted}</code>\n"
+                f"Muted topics: <code>{html_mod.escape(muted)}</code>\n"
                 f"Mute with: /mute crypto"
             )
             return {"action": "mute_show", "user_id": user_id}
 
         self._engine.preferences.mute_topic(user_id, topic)
         self._persist_prefs()
-        self._bot.send_message(chat_id, f"Topic <code>{topic}</code> muted. /unmute {topic} to reverse.")
+        import html as html_mod
+        self._bot.send_message(chat_id, f"Topic <code>{html_mod.escape(topic)}</code> muted. /unmute {html_mod.escape(topic)} to reverse.")
         return {"action": "mute_topic", "user_id": user_id, "topic": topic}
 
     def _unmute_topic(self, chat_id: int | str, user_id: str,
@@ -1053,7 +1068,8 @@ class CommunicationAgent:
 
         self._engine.preferences.unmute_topic(user_id, topic)
         self._persist_prefs()
-        self._bot.send_message(chat_id, f"Topic <code>{topic}</code> unmuted.")
+        import html as html_mod
+        self._bot.send_message(chat_id, f"Topic <code>{html_mod.escape(topic)}</code> unmuted.")
         return {"action": "unmute_topic", "user_id": user_id, "topic": topic}
 
     def _send_rate_prompt(self, chat_id: int | str, user_id: str) -> dict[str, Any]:
@@ -1106,9 +1122,10 @@ class CommunicationAgent:
         self._engine.preferences.track_story(user_id, topic, headline)
         self._persist_prefs()
         track_count = len(self._engine.preferences.get_or_create(user_id).tracked_stories)
+        import html as html_mod
         self._bot.send_message(
             chat_id,
-            f"\U0001f4cc Now tracking: <b>{headline}</b>\n"
+            f"\U0001f4cc Now tracking: <b>{html_mod.escape(headline)}</b>\n"
             f"You'll see \U0001f4cc badges when new developments appear in future briefings.\n"
             f"View tracked stories: /tracked\n"
             f"<i>Tip: Use /timeline {track_count} to see this story's evolution over time</i>"
@@ -1157,9 +1174,10 @@ class CommunicationAgent:
         removed = profile.tracked_stories[index - 1]
         self._engine.preferences.untrack_story(user_id, index)
         self._persist_prefs()
+        import html as html_mod
         self._bot.send_message(
             chat_id,
-            f"Stopped tracking: <b>{removed['headline'][:80]}</b>"
+            f"Stopped tracking: <b>{html_mod.escape(removed['headline'][:80])}</b>"
         )
         return {"action": "untrack", "user_id": user_id, "index": index}
 
@@ -1447,9 +1465,10 @@ class CommunicationAgent:
         removed = profile.bookmarks[index - 1]
         self._engine.preferences.remove_bookmark(user_id, index)
         self._persist_prefs()
+        import html as html_mod
         self._bot.send_message(
             chat_id,
-            f"Removed bookmark: <b>{removed['title'][:80]}</b>"
+            f"Removed bookmark: <b>{html_mod.escape(removed['title'][:80])}</b>"
         )
         return {"action": "unsave", "user_id": user_id, "index": index}
 
@@ -1489,10 +1508,11 @@ class CommunicationAgent:
 
         if not email:
             profile = self._engine.preferences.get_or_create(user_id)
+            import html as html_mod
             current = profile.email or "not set"
             self._bot.send_message(
                 chat_id,
-                f"Email: <code>{current}</code>\n"
+                f"Email: <code>{html_mod.escape(current)}</code>\n"
                 f"Set with: /email user@example.com"
             )
             return {"action": "email_show", "user_id": user_id}
@@ -1504,9 +1524,10 @@ class CommunicationAgent:
 
         self._engine.preferences.set_email(user_id, email)
         self._persist_prefs()
+        import html as html_mod
         self._bot.send_message(
             chat_id,
-            f"Email set to <code>{email}</code>\n"
+            f"Email set to <code>{html_mod.escape(email)}</code>\n"
             f"Send a digest anytime: /digest"
         )
         return {"action": "email", "user_id": user_id, "email": email}
@@ -1520,11 +1541,12 @@ class CommunicationAgent:
         profile = self._engine.preferences.get_or_create(user_id)
 
         if not url:
+            import html as html_mod
             current = profile.webhook_url or "not set"
             self._bot.send_message(
                 chat_id,
                 "<b>\U0001f517 Webhook Delivery</b>\n\n"
-                f"URL: <code>{current}</code>\n\n"
+                f"URL: <code>{html_mod.escape(current)}</code>\n\n"
                 "Briefings and alerts are pushed as structured JSON.\n"
                 "Compatible with Slack, Discord, and custom endpoints.\n\n"
                 "<b>Commands:</b>\n"
@@ -1564,10 +1586,11 @@ class CommunicationAgent:
 
         profile.webhook_url = url
         self._persist_prefs()
+        import html as html_mod
         self._bot.send_message(
             chat_id,
             f"\U0001f517 Webhook set.\n"
-            f"URL: <code>{url[:60]}...</code>\n\n"
+            f"URL: <code>{html_mod.escape(url[:60])}...</code>\n\n"
             "Briefings and alerts will be pushed automatically.\n"
             "Test it: /webhook test"
         )
@@ -1634,9 +1657,10 @@ class CommunicationAgent:
         success = digest.send(profile.email, subject, html_body)
 
         if success:
+            import html as html_mod
             self._bot.send_message(
                 chat_id,
-                f"\u2709\ufe0f Digest sent to <code>{profile.email}</code>"
+                f"\u2709\ufe0f Digest sent to <code>{html_mod.escape(profile.email)}</code>"
             )
         else:
             self._bot.send_message(
@@ -2394,14 +2418,16 @@ class CommunicationAgent:
     # ──────────────────────────────────────────────────────────────
 
     def _is_admin(self, user_id: str) -> bool:
-        """Check if user is the admin/owner."""
+        """Check if user is the admin/owner.
+
+        SECURITY: Requires explicit TELEGRAM_OWNER_ID configuration.
+        If not set, admin access is denied entirely — no fallback to
+        'first user' which would allow arbitrary privilege escalation.
+        """
         import os
         owner_id = os.environ.get("TELEGRAM_OWNER_ID", "")
         if not owner_id:
-            # If no owner configured, allow the first registered user
-            users = self._engine.analytics.get_all_users()
-            if users:
-                owner_id = users[-1]["user_id"]  # oldest user
+            return False
         return str(user_id) == str(owner_id)
 
     def _handle_admin(self, chat_id: int | str, user_id: str,
