@@ -287,6 +287,7 @@ class PreferenceStore:
                 "alert_georisk_threshold": p.alert_georisk_threshold,
                 "alert_trend_threshold": p.alert_trend_threshold,
                 "presets": dict(p.presets),
+                "webhook_url": p.webhook_url,
             }
         return result
 

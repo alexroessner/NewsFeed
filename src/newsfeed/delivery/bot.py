@@ -58,6 +58,8 @@ BOT_COMMANDS = [
     {"command": "email", "description": "Set email for digest delivery (e.g. /email user@example.com)"},
     {"command": "digest", "description": "Send email digest of your latest briefing"},
     {"command": "export", "description": "Export last briefing as Markdown"},
+    {"command": "stats", "description": "View your personal engagement analytics"},
+    {"command": "webhook", "description": "Set webhook URL for Slack/Discord/custom delivery"},
     {"command": "sources", "description": "View source reliability, bias, and trust ratings"},
     {"command": "filter", "description": "Set briefing filters (e.g. /filter confidence 0.7)"},
     {"command": "preset", "description": "Save/load briefing presets (e.g. /preset save Work)"},
