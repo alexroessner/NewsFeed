@@ -392,7 +392,16 @@ class TelegramBot:
                     "args": "",
                     "text": "",
                 }
-            return None
+            # Unknown callback — log and surface as stale action
+            log.warning("Unknown callback_data: %r from user=%s", data, user_id)
+            return {
+                "type": "command",
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "command": "_stale_callback",
+                "args": data,
+                "text": "",
+            }
 
         # Handle text messages
         msg = update.get("message", {})

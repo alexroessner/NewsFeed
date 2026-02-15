@@ -72,13 +72,26 @@ def match_tracked(story_topic: str, story_title: str,
                   tracked: dict) -> bool:
     """Check if a story matches a tracked item.
 
-    Matches if same topic AND at least 2 keyword overlaps.
+    Uses tiered matching to handle headline evolution over time:
+    1. Same topic + 2+ keyword overlaps = strong match
+    2. Same topic + 1 keyword overlap (if keyword is 5+ chars) = weak match
+
+    This prevents tracking from breaking when headlines evolve naturally
+    (e.g., "China Taiwan tensions escalate" -> "Beijing Taipei stakes raised").
     """
     if story_topic != tracked["topic"]:
         return False
     story_words = set(extract_keywords(story_title))
     tracked_words = set(tracked["keywords"])
-    return len(story_words & tracked_words) >= 2
+    overlap = story_words & tracked_words
+    if len(overlap) >= 2:
+        return True
+    # Weak match: 1 overlap allowed if the shared keyword is substantial
+    if len(overlap) == 1:
+        shared = next(iter(overlap))
+        if len(shared) >= 5:
+            return True
+    return False
 
 
 class PreferenceStore:
