@@ -34,12 +34,13 @@ def _send_error_to_chat(update: dict, token: str, error_msg: str) -> None:
     import traceback
     import urllib.request
     chat_id = None
+    _log = logging.getLogger("newsfeed.run_command")
     try:
         msg = update.get("message") or update.get("callback_query", {}).get("message")
         if msg:
             chat_id = msg.get("chat", {}).get("id")
     except Exception:
-        pass
+        _log.debug("Failed to extract chat_id from update", exc_info=True)
     if not chat_id or not token:
         return
     try:
@@ -56,7 +57,7 @@ def _send_error_to_chat(update: dict, token: str, error_msg: str) -> None:
         )
         urllib.request.urlopen(req, timeout=10)
     except Exception:
-        pass  # Best effort
+        _log.debug("Failed to send error notification to chat %s", chat_id, exc_info=True)
 
 
 def main() -> None:
@@ -101,7 +102,7 @@ def main() -> None:
             sdata = json.loads(secrets_path.read_text())
             log.info("Secrets available: %s", [k for k, v in sdata.items() if v])
         except Exception:
-            pass
+            log.debug("Failed to read secrets.json for logging", exc_info=True)
 
     try:
         cfg = load_runtime_config(config_dir)
@@ -127,7 +128,7 @@ def main() -> None:
         _send_error_to_chat(update, token, "Service temporarily unavailable. Please try again later.")
         sys.exit(1)
 
-    if engine._comm_agent is None:
+    if not engine.is_telegram_connected():
         log.error("No Telegram bot token configured — cannot process update")
         has_token = bool(cfg.pipeline.get("api_keys", {}).get("telegram_bot_token"))
         log.error("telegram_bot_token present in config: %s", has_token)
@@ -135,7 +136,7 @@ def main() -> None:
         sys.exit(1)
 
     try:
-        result = engine._comm_agent.handle_update(update)
+        result = engine.get_comm_agent().handle_update(update)
     except Exception as e:
         log.exception("handle_update failed")
         _send_error_to_chat(update, token, "Something went wrong. Please try again.")

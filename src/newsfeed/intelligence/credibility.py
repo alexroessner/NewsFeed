@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections import defaultdict
 from typing import Any
 
 from newsfeed.models.domain import CandidateItem, SourceReliability
@@ -131,34 +132,46 @@ def detect_cross_corroboration(candidates: list[CandidateItem]) -> list[Candidat
     similarity) between title+summary text, requiring a threshold of shared
     significant words.  Topic-level matching alone is NOT sufficient — simply
     covering the same broad topic (e.g. geopolitics) is not corroboration.
+
+    Optimization: candidates are pre-grouped by topic so only items within
+    the same topic are compared, reducing O(n²) to O(sum(k²)) where k
+    is the per-topic count — typically a 3-5x reduction.
     """
-    word_sets: list[tuple[CandidateItem, set[str]]] = []
+    # Pre-extract word sets and group by topic for efficient comparison
+    word_map: dict[str, set[str]] = {}
+    topic_groups: dict[str, list[CandidateItem]] = defaultdict(list)
     for c in candidates:
         # Simulated placeholders have synthetic text — skip them to avoid
         # false corroboration between "Simulated placeholder — reddit agent..."
         # and "Simulated placeholder — reuters agent..." (Jaccard ~0.75).
         if "example.com" in (c.url or ""):
-            word_sets.append((c, set()))
-            continue
-        words = _extract_significant_words(f"{c.title} {c.summary}")
-        word_sets.append((c, words))
+            word_map[c.candidate_id] = set()
+        else:
+            word_map[c.candidate_id] = _extract_significant_words(f"{c.title} {c.summary}")
+        topic_groups[c.topic].append(c)
 
-    # Compare every pair; only mark if from different sources and similar enough
-    for i, (ci, wi) in enumerate(word_sets):
-        corr_sources: set[str] = set()
-        for j, (cj, wj) in enumerate(word_sets):
-            if i >= j:
+    # Compare within each topic group — cross-topic items can't corroborate
+    for group in topic_groups.values():
+        for i, ci in enumerate(group):
+            wi = word_map[ci.candidate_id]
+            if not wi:
                 continue
-            if ci.source == cj.source:
-                continue
-            similarity = _jaccard(wi, wj)
-            if similarity >= 0.25:
-                corr_sources.add(cj.source)
-                # Also mark the other direction
-                if ci.source not in (cj.corroborated_by or []):
-                    cj.corroborated_by = list(set(cj.corroborated_by or []) | {ci.source})
-        if corr_sources:
-            ci.corroborated_by = list(set(ci.corroborated_by or []) | corr_sources)
+            corr_sources: set[str] = set()
+            for j in range(i + 1, len(group)):
+                cj = group[j]
+                if ci.source == cj.source:
+                    continue
+                wj = word_map[cj.candidate_id]
+                if not wj:
+                    continue
+                similarity = _jaccard(wi, wj)
+                if similarity >= 0.25:
+                    corr_sources.add(cj.source)
+                    # Also mark the other direction
+                    if ci.source not in (cj.corroborated_by or []):
+                        cj.corroborated_by = list(set(cj.corroborated_by or []) | {ci.source})
+            if corr_sources:
+                ci.corroborated_by = list(set(ci.corroborated_by or []) | corr_sources)
 
     return candidates
 

@@ -22,16 +22,21 @@ class StoryClustering:
         for c in candidates:
             by_topic[c.topic].append(c)
 
+        # Pre-compute composite scores once for all candidates.
+        # This avoids redundant dict-lookup + arithmetic across sorting,
+        # max(), confidence computation, and thread scoring (~4x per item).
+        score_cache: dict[str, float] = {c.candidate_id: c.composite_score() for c in candidates}
+
         threads: list[NarrativeThread] = []
         for topic, items in by_topic.items():
-            sub_clusters = self._cluster_within_topic(items)
+            sub_clusters = self._cluster_within_topic(items, score_cache)
             for idx, cluster_items in enumerate(sub_clusters):
                 sources = {c.source for c in cluster_items}
-                best = max(cluster_items, key=lambda c: c.composite_score())
+                best = max(cluster_items, key=lambda c: score_cache[c.candidate_id])
 
                 urgency = self._aggregate_urgency(cluster_items)
                 lifecycle = self._aggregate_lifecycle(cluster_items)
-                confidence = self._compute_confidence(cluster_items)
+                confidence = self._compute_confidence(cluster_items, score_cache)
 
                 thread_id = hashlib.sha256(
                     f"{topic}:{idx}:{best.candidate_id}".encode()
@@ -40,7 +45,7 @@ class StoryClustering:
                 threads.append(NarrativeThread(
                     thread_id=thread_id,
                     headline=best.title,
-                    candidates=sorted(cluster_items, key=lambda c: c.composite_score(), reverse=True),
+                    candidates=sorted(cluster_items, key=lambda c: score_cache[c.candidate_id], reverse=True),
                     lifecycle=lifecycle,
                     urgency=urgency,
                     source_count=len(sources),
@@ -50,14 +55,15 @@ class StoryClustering:
         threads.sort(key=lambda t: t.thread_score(), reverse=True)
         return threads
 
-    def _cluster_within_topic(self, items: list[CandidateItem]) -> list[list[CandidateItem]]:
+    def _cluster_within_topic(self, items: list[CandidateItem],
+                              score_cache: dict[str, float]) -> list[list[CandidateItem]]:
         if len(items) <= 1:
             return [items] if items else []
 
         clusters: list[list[CandidateItem]] = []
         assigned: set[str] = set()
 
-        sorted_items = sorted(items, key=lambda c: c.composite_score(), reverse=True)
+        sorted_items = sorted(items, key=lambda c: score_cache[c.candidate_id], reverse=True)
 
         for item in sorted_items:
             if item.candidate_id in assigned:
@@ -110,8 +116,9 @@ class StoryClustering:
         }
         return max((c.lifecycle for c in items), key=lambda l: priority.get(l, 0), default=StoryLifecycle.DEVELOPING)
 
-    def _compute_confidence(self, items: list[CandidateItem]) -> ConfidenceBand:
-        scores = [c.composite_score() for c in items]
+    def _compute_confidence(self, items: list[CandidateItem],
+                            score_cache: dict[str, float] | None = None) -> ConfidenceBand:
+        scores = [score_cache[c.candidate_id] if score_cache else c.composite_score() for c in items]
         sources = {c.source for c in items}
         avg = sum(scores) / len(scores)
         spread = max(scores) - min(scores) if len(scores) > 1 else 0.1
