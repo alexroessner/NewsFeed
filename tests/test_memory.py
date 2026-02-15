@@ -6,7 +6,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from newsfeed.memory.store import CandidateCache, PreferenceStore, StatePersistence
+from newsfeed.memory.store import BoundedUserDict, CandidateCache, PreferenceStore, StatePersistence
 from newsfeed.models.domain import CandidateItem
 
 
@@ -94,6 +94,75 @@ class CandidateCacheTests(unittest.TestCase):
     def test_empty_cache_returns_empty(self) -> None:
         cache = CandidateCache()
         self.assertEqual(cache.get_fresh("nobody", "nothing"), [])
+
+
+class BoundedUserDictTests(unittest.TestCase):
+    def test_basic_get_set(self) -> None:
+        d: BoundedUserDict[str] = BoundedUserDict(maxlen=5)
+        d["a"] = "alpha"
+        d["b"] = "beta"
+        self.assertEqual(d["a"], "alpha")
+        self.assertEqual(d["b"], "beta")
+        self.assertEqual(len(d), 2)
+
+    def test_evicts_oldest_when_over_cap(self) -> None:
+        d: BoundedUserDict[int] = BoundedUserDict(maxlen=3)
+        d["a"] = 1
+        d["b"] = 2
+        d["c"] = 3
+        d["d"] = 4  # should evict "a"
+        self.assertNotIn("a", d)
+        self.assertIn("b", d)
+        self.assertIn("d", d)
+        self.assertEqual(len(d), 3)
+
+    def test_access_refreshes_lru(self) -> None:
+        d: BoundedUserDict[int] = BoundedUserDict(maxlen=3)
+        d["a"] = 1
+        d["b"] = 2
+        d["c"] = 3
+        # Update "a" to refresh it
+        d["a"] = 10
+        d["d"] = 4  # should evict "b" (now oldest)
+        self.assertIn("a", d)
+        self.assertNotIn("b", d)
+        self.assertEqual(d["a"], 10)
+
+    def test_setdefault_works(self) -> None:
+        d: BoundedUserDict[set] = BoundedUserDict(maxlen=5)
+        s = d.setdefault("u1", set())
+        s.add("x")
+        self.assertIn("x", d["u1"])
+
+    def test_pop_works(self) -> None:
+        d: BoundedUserDict[str] = BoundedUserDict(maxlen=5)
+        d["a"] = "alpha"
+        val = d.pop("a", None)
+        self.assertEqual(val, "alpha")
+        self.assertNotIn("a", d)
+
+
+class CandidateCacheEvictionTests(unittest.TestCase):
+    def test_stale_entries_evicted_on_put(self) -> None:
+        cache = CandidateCache(stale_after_minutes=10)
+        # Set a low eviction interval to trigger on every put
+        cache._EVICTION_INTERVAL = 1
+        old = _make_candidate(cid="old", minutes_ago=60)
+        cache.put("u1", "geo", [old])
+        # Trigger eviction by putting another entry
+        fresh = _make_candidate(cid="new", minutes_ago=1)
+        cache.put("u2", "tech", [fresh])
+        # The stale entry for u1:geo should have been evicted
+        self.assertEqual(len(cache._entries), 1)
+        self.assertIn("u2:tech", cache._entries)
+
+    def test_max_slots_enforced(self) -> None:
+        cache = CandidateCache(stale_after_minutes=180)
+        cache._MAX_SLOTS = 5
+        cache._EVICTION_INTERVAL = 1
+        for i in range(8):
+            cache.put(f"u{i}", "geo", [_make_candidate(cid=f"c{i}")])
+        self.assertLessEqual(len(cache._entries), 5)
 
 
 class StatePersistenceTests(unittest.TestCase):

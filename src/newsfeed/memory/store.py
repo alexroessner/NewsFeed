@@ -1,13 +1,54 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
+from collections import OrderedDict
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import TypeVar
 
 from newsfeed.models.domain import CandidateItem, UserProfile
+
+log = logging.getLogger(__name__)
+
+# ── Bounded per-user cache ───────────────────────────────────────
+# Used throughout the engine and communication agent to prevent
+# unbounded per-user dict growth when many users interact.
+
+_VT = TypeVar("_VT")
+
+
+class BoundedUserDict(dict[str, _VT]):
+    """A dict that evicts least-recently-used entries when size exceeds a cap.
+
+    Drop-in replacement for ``dict[str, V]`` where keys are user IDs.
+    On every __setitem__ the key is moved to the end (most recently used);
+    when the population exceeds *maxlen* the oldest entry is evicted.
+    """
+
+    __slots__ = ("_maxlen",)
+
+    def __init__(self, maxlen: int = 500, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._maxlen = max(1, maxlen)
+
+    def __setitem__(self, key: str, value: _VT) -> None:
+        # Move existing key to end (refresh) or insert at end
+        if key in self:
+            super().__delitem__(key)
+        super().__setitem__(key, value)
+        # Evict oldest entries if over cap
+        while len(self) > self._maxlen:
+            oldest = next(iter(self))
+            super().__delitem__(oldest)
+
+    def setdefault(self, key: str, default: _VT = None) -> _VT:  # type: ignore[assignment]
+        if key not in self:
+            self[key] = default  # type: ignore[assignment]
+        return self[key]
 
 # Common stop words to exclude from keyword extraction
 _STOP_WORDS = frozenset({
@@ -387,15 +428,26 @@ class PreferenceStore:
 
 
 class CandidateCache:
+    # Maximum number of cache slots (user:topic keys) to prevent
+    # unbounded memory growth in multi-user deployments.
+    _MAX_SLOTS = 500
+    # Evict stale entries periodically — every N puts
+    _EVICTION_INTERVAL = 20
+
     def __init__(self, stale_after_minutes: int = 180) -> None:
         self._entries: dict[str, list[CandidateItem]] = {}
         self.stale_after = timedelta(minutes=stale_after_minutes)
+        self._eviction_counter = 0
 
     def key(self, user_id: str, topic: str) -> str:
         return f"{user_id}:{topic}"
 
     def put(self, user_id: str, topic: str, candidates: list[CandidateItem]) -> None:
         self._entries[self.key(user_id, topic)] = candidates
+        self._eviction_counter += 1
+        if self._eviction_counter >= self._EVICTION_INTERVAL:
+            self._evict_stale()
+            self._eviction_counter = 0
 
     def get_fresh(self, user_id: str, topic: str) -> list[CandidateItem]:
         now = datetime.now(timezone.utc)
@@ -422,6 +474,35 @@ class CandidateCache:
         unseen = [replace(c) for c in candidates if c.candidate_id not in already_seen_ids]
         unseen.sort(key=lambda c: c.composite_score(), reverse=True)
         return unseen[:limit]
+
+    def _evict_stale(self) -> None:
+        """Remove fully stale entries and enforce max slot cap.
+
+        Runs periodically (triggered by put()) to prevent unbounded growth.
+        Entries where ALL candidates are stale are removed entirely.
+        If the cache still exceeds _MAX_SLOTS after stale eviction, the
+        oldest slots (by newest candidate timestamp) are dropped.
+        """
+        now = datetime.now(timezone.utc)
+        to_remove: list[str] = []
+        for cache_key, candidates in self._entries.items():
+            if all(now - c.created_at > self.stale_after for c in candidates):
+                to_remove.append(cache_key)
+        for cache_key in to_remove:
+            del self._entries[cache_key]
+
+        # Enforce hard cap by dropping oldest slots
+        if len(self._entries) > self._MAX_SLOTS:
+            def _newest_ts(cands: list[CandidateItem]) -> datetime:
+                return max((c.created_at for c in cands), default=datetime.min.replace(tzinfo=timezone.utc))
+
+            sorted_keys = sorted(self._entries.keys(), key=lambda k: _newest_ts(self._entries[k]))
+            overshoot = len(self._entries) - self._MAX_SLOTS
+            for k in sorted_keys[:overshoot]:
+                del self._entries[k]
+
+        if to_remove:
+            log.debug("Cache eviction: removed %d stale slots, %d remaining", len(to_remove), len(self._entries))
 
 
 class StatePersistence:

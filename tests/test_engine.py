@@ -156,5 +156,67 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(engine._enabled_stages, expected)
 
 
+class CircuitBreakerTests(unittest.TestCase):
+    """Tests for the per-agent circuit breaker in the optimizer module."""
+
+    def test_closed_allows_requests(self) -> None:
+        from newsfeed.orchestration.optimizer import CircuitBreaker
+        cb = CircuitBreaker(failure_threshold=3, recovery_seconds=60)
+        self.assertTrue(cb.allow_request("agent_a"))
+        self.assertEqual(cb.get_state("agent_a"), "closed")
+
+    def test_trips_open_after_threshold_failures(self) -> None:
+        from newsfeed.orchestration.optimizer import CircuitBreaker
+        cb = CircuitBreaker(failure_threshold=3, recovery_seconds=60)
+        cb.record_failure("agent_a")
+        cb.record_failure("agent_a")
+        self.assertTrue(cb.allow_request("agent_a"))  # still closed (2 < 3)
+        cb.record_failure("agent_a")
+        self.assertFalse(cb.allow_request("agent_a"))  # tripped open
+        self.assertEqual(cb.get_state("agent_a"), "open")
+
+    def test_success_resets_to_closed(self) -> None:
+        from newsfeed.orchestration.optimizer import CircuitBreaker
+        cb = CircuitBreaker(failure_threshold=2, recovery_seconds=60)
+        cb.record_failure("agent_a")
+        cb.record_success("agent_a")
+        # After success, counter is reset — need 2 more failures to trip
+        cb.record_failure("agent_a")
+        self.assertTrue(cb.allow_request("agent_a"))  # still closed (1 < 2)
+
+    def test_half_open_recovery(self) -> None:
+        from newsfeed.orchestration.optimizer import CircuitBreaker
+        cb = CircuitBreaker(failure_threshold=2, recovery_seconds=0.01)
+        cb.record_failure("agent_a")
+        cb.record_failure("agent_a")
+        self.assertFalse(cb.allow_request("agent_a"))
+        # Wait for recovery window
+        import time
+        time.sleep(0.02)
+        self.assertTrue(cb.allow_request("agent_a"))  # half-open probe
+        self.assertEqual(cb.get_state("agent_a"), "half_open")
+        # Success on probe → back to closed
+        cb.record_success("agent_a")
+        self.assertEqual(cb.get_state("agent_a"), "closed")
+
+    def test_snapshot_reports_non_closed(self) -> None:
+        from newsfeed.orchestration.optimizer import CircuitBreaker
+        cb = CircuitBreaker(failure_threshold=2, recovery_seconds=60)
+        cb.record_failure("agent_a")
+        cb.record_failure("agent_a")
+        snap = cb.snapshot()
+        self.assertIn("agent_a", snap)
+        self.assertEqual(snap["agent_a"]["state"], "open")
+
+    def test_independent_agents(self) -> None:
+        from newsfeed.orchestration.optimizer import CircuitBreaker
+        cb = CircuitBreaker(failure_threshold=2, recovery_seconds=60)
+        cb.record_failure("agent_a")
+        cb.record_failure("agent_a")
+        # agent_b should be unaffected
+        self.assertTrue(cb.allow_request("agent_b"))
+        self.assertFalse(cb.allow_request("agent_a"))
+
+
 if __name__ == "__main__":
     unittest.main()

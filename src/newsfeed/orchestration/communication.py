@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from newsfeed.orchestration.engine import NewsFeedEngine
 
 from newsfeed.delivery.market import MarketTicker
-from newsfeed.memory.store import match_tracked
+from newsfeed.memory.store import BoundedUserDict, match_tracked
 
 log = logging.getLogger(__name__)
 
@@ -53,13 +53,15 @@ class CommunicationAgent:
         self._default_topics = default_topics or _FALLBACK_TOPICS
         self._market = MarketTicker()
         # Track items shown per user for "show more" dedup
-        self._shown_ids: dict[str, set[str]] = {}
+        # All per-user dicts use BoundedUserDict to cap at 500 users
+        # with LRU eviction — prevents unbounded memory growth.
+        self._shown_ids: BoundedUserDict[set[str]] = BoundedUserDict(maxlen=500)
         # Track last briefing topic per user
-        self._last_topic: dict[str, str] = {}
+        self._last_topic: BoundedUserDict[str] = BoundedUserDict(maxlen=500)
         # Track last briefing items per user for per-item feedback
-        self._last_items: dict[str, list[dict]] = {}  # user_id -> [{topic, source}, ...]
+        self._last_items: BoundedUserDict[list[dict]] = BoundedUserDict(maxlen=500)
         # Per-user rate limiting for resource-intensive commands
-        self._rate_limits: dict[str, float] = {}  # user_id -> last_expensive_command_ts
+        self._rate_limits: BoundedUserDict[float] = BoundedUserDict(maxlen=500)
         self._RATE_LIMIT_SECONDS = 15  # Min seconds between briefing/sitrep/quick
 
     def handle_update(self, update: dict) -> dict[str, Any] | None:

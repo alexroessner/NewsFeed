@@ -23,6 +23,8 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlencode
 
+from newsfeed.memory.store import BoundedUserDict
+
 log = logging.getLogger(__name__)
 
 _API_BASE = "https://api.telegram.org/bot{token}"
@@ -587,10 +589,12 @@ class BriefingScheduler:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._schedules: dict[str, dict[str, Any]] = {}
-        self._last_sent: dict[str, float] = {}
-        self._muted_until: dict[str, float] = {}  # user_id -> timestamp when mute expires
-        self._user_timezones: dict[str, str] = {}  # user_id -> timezone string
+        # All per-user dicts use BoundedUserDict to cap memory at 1000
+        # users with LRU eviction — prevents unbounded growth.
+        self._schedules: BoundedUserDict[dict[str, Any]] = BoundedUserDict(maxlen=1000)
+        self._last_sent: BoundedUserDict[float] = BoundedUserDict(maxlen=1000)
+        self._muted_until: BoundedUserDict[float] = BoundedUserDict(maxlen=1000)
+        self._user_timezones: BoundedUserDict[str] = BoundedUserDict(maxlen=1000)
 
     def set_user_timezone(self, user_id: str, tz: str) -> None:
         """Update the cached timezone for a user."""
