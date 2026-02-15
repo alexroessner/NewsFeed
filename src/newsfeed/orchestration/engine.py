@@ -865,11 +865,27 @@ class NewsFeedEngine:
         self._persistence.save("trends", self.trends.snapshot())
         self._persistence.save("optimizer", self.optimizer.snapshot())
         self._persistence.save("debate_chair", self.experts.chair.snapshot())
+        # Persist scheduler so scheduled briefings survive restarts
+        if hasattr(self, "_scheduler") and self._scheduler:
+            self._persistence.save("scheduler", self._scheduler.snapshot())
 
-    # Allowed values for validated string fields on restore
-    _VALID_TONES = frozenset({"concise", "detailed", "analytical", "casual"})
-    _VALID_FORMATS = frozenset({"bullet", "narrative", "brief", "detailed"})
-    _VALID_CADENCES = frozenset({"on_demand", "hourly", "daily", "weekly"})
+    # Allowed values for validated string fields on restore.
+    # IMPORTANT: These must be a superset of the values accepted by the
+    # user-facing parser in memory/commands.py.  A mismatch causes user
+    # settings to silently revert to defaults on every restart.
+    _VALID_TONES = frozenset({
+        "concise", "analyst", "brief", "deep", "executive",
+        # Legacy values (pre-parser-unification) kept for backwards compat
+        "detailed", "analytical", "casual",
+    })
+    _VALID_FORMATS = frozenset({
+        "bullet", "sections", "narrative",
+        "brief", "detailed",
+    })
+    _VALID_CADENCES = frozenset({
+        "on_demand", "morning", "evening", "realtime",
+        "hourly", "daily", "weekly",
+    })
     _VALID_URGENCIES = frozenset({"", "routine", "elevated", "breaking", "critical"})
 
     def _load_state(self) -> None:
@@ -1000,5 +1016,12 @@ class NewsFeedEngine:
                 if isinstance(topic, str) and isinstance(velocity, (int, float)):
                     self.trends._baseline[topic] = max(0.0, min(1.0, float(velocity)))
             log.info("Restored trend baselines for %d topics", len(trend_data))
+
+        # Restore scheduler state (schedules, timezones) so briefings survive restarts
+        if hasattr(self, "_scheduler") and self._scheduler:
+            sched_data = self._persistence.load("scheduler")
+            if sched_data and isinstance(sched_data, dict):
+                count = self._scheduler.restore(sched_data)
+                log.info("Restored %d briefing schedules from disk", count)
 
         log.info("State loaded from %s", self._persistence.state_dir)
