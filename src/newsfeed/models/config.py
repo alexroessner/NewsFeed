@@ -67,8 +67,11 @@ def load_runtime_config(config_dir: Path) -> RuntimeConfig:
             for key, value in secrets.items():
                 if value:  # Only override if secret has a non-empty value
                     api_keys[key] = value
-        except ConfigError:
-            pass  # Malformed secrets file — skip silently
+        except ConfigError as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                "secrets.json is malformed — API keys NOT loaded: %s", e
+            )
 
     cfg = RuntimeConfig(agents=agents, pipeline=pipeline, personas=personas)
     cfg.validate()

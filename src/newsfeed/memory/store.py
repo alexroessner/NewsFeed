@@ -31,27 +31,30 @@ class BoundedUserDict(dict[str, _VT]):
     when the population exceeds *maxlen* the oldest entry is evicted.
     """
 
-    __slots__ = ("_maxlen",)
+    __slots__ = ("_maxlen", "_lock")
 
     def __init__(self, maxlen: int = 500, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._maxlen = max(1, maxlen)
+        self._lock = threading.RLock()
 
     def __setitem__(self, key: str, value: _VT) -> None:
-        # Move existing key to end (refresh) or insert at end
-        if key in self:
-            super().__delitem__(key)
-        super().__setitem__(key, value)
-        # Evict oldest entries if over cap
-        while len(self) > self._maxlen:
-            oldest = next(iter(self))
-            log.info("BoundedUserDict evicting key=%s (cap=%d)", oldest, self._maxlen)
-            super().__delitem__(oldest)
+        with self._lock:
+            # Move existing key to end (refresh) or insert at end
+            if key in self:
+                super().__delitem__(key)
+            super().__setitem__(key, value)
+            # Evict oldest entries if over cap
+            while len(self) > self._maxlen:
+                oldest = next(iter(self))
+                log.info("BoundedUserDict evicting key=%s (cap=%d)", oldest, self._maxlen)
+                super().__delitem__(oldest)
 
     def setdefault(self, key: str, default: _VT = None) -> _VT:  # type: ignore[assignment]
-        if key not in self:
-            self[key] = default  # type: ignore[assignment]
-        return self[key]
+        with self._lock:
+            if key not in self:
+                self[key] = default  # type: ignore[assignment]
+            return self[key]
 
 # Common stop words to exclude from keyword extraction
 _STOP_WORDS = frozenset({

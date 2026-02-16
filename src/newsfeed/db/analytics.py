@@ -374,8 +374,23 @@ class AnalyticsDB:
     # ──────────────────────────────────────────────────────────────
 
     def _conn(self) -> sqlite3.Connection:
-        """Get thread-local SQLite connection (local mode only)."""
+        """Get thread-local SQLite connection (local mode only).
+
+        Validates the connection is alive before returning it.
+        Recreates stale/broken connections automatically.
+        """
         conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            try:
+                conn.execute("SELECT 1")
+            except (sqlite3.OperationalError, sqlite3.DatabaseError):
+                log.warning("Stale SQLite connection detected — reconnecting")
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = None
+                self._local.conn = None
         if conn is None:
             conn = sqlite3.connect(self._db_path, timeout=10)
             conn.execute("PRAGMA journal_mode=WAL")
@@ -429,7 +444,7 @@ class AnalyticsDB:
             log.exception("Analytics DB write failed (%s): %s", self._backend, sql[:100])
 
     def _safe_exec_many(self, sql: str, params_list: list[tuple]) -> None:
-        """Execute many SQL statements with error isolation."""
+        """Execute many SQL statements atomically with error isolation."""
         if not params_list:
             return
         try:
@@ -437,8 +452,13 @@ class AnalyticsDB:
                 self._d1.execute_many(sql, params_list)
             else:
                 conn = self._conn()
-                conn.executemany(sql, params_list)
-                conn.commit()
+                try:
+                    conn.execute("BEGIN")
+                    conn.executemany(sql, params_list)
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
         except Exception:
             log.exception("Analytics DB batch write failed (%s): %s", self._backend, sql[:100])
 
@@ -1155,4 +1175,55 @@ class AnalyticsDB:
                 "Analytics cleanup: deleted %d records older than %d days",
                 total, retention_days,
             )
+        return deleted
+
+    def auto_purge(self, retention_days: int = 90) -> dict[str, int]:
+        """Purge analytics data older than retention_days.
+
+        Returns dict of {table_name: rows_deleted}.
+        """
+        self._ensure_schema()
+        cutoff = time.time() - (retention_days * 86400)
+        deleted: dict[str, int] = {}
+        tables_with_ts = {
+            "interactions": "ts",
+            "requests": "started_at",
+            "briefings": "delivered_at",
+            "feedback": "ts",
+        }
+        for table, ts_col in tables_with_ts.items():
+            try:
+                if self._d1:
+                    result = self._d1.execute(
+                        f"DELETE FROM {table} WHERE {ts_col} < ?", (cutoff,)
+                    )
+                    deleted[table] = result.get("changes", 0) if isinstance(result, dict) else 0
+                else:
+                    conn = self._conn()
+                    cursor = conn.execute(f"DELETE FROM {table} WHERE {ts_col} < ?", (cutoff,))
+                    deleted[table] = cursor.rowcount
+                    conn.commit()
+            except Exception:
+                log.exception("Failed to purge %s", table)
+                deleted[table] = -1
+        # Clean orphaned candidates and votes
+        for child_table in ("candidates", "expert_votes"):
+            try:
+                if self._d1:
+                    self._d1.execute(
+                        f"DELETE FROM {child_table} WHERE request_id NOT IN (SELECT request_id FROM requests)"
+                    )
+                else:
+                    conn = self._conn()
+                    cursor = conn.execute(
+                        f"DELETE FROM {child_table} WHERE request_id NOT IN (SELECT request_id FROM requests)"
+                    )
+                    deleted[child_table] = cursor.rowcount
+                    conn.commit()
+            except Exception:
+                log.exception("Failed to purge orphans from %s", child_table)
+
+        total = sum(v for v in deleted.values() if v > 0)
+        if total > 0:
+            log.info("Auto-purge: removed %d rows (retention=%dd): %s", total, retention_days, deleted)
         return deleted

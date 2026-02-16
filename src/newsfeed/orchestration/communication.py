@@ -232,6 +232,36 @@ class CommunicationAgent:
         self._rate_limits[user_id] = now
         return False
 
+    # Per-command rate limits for non-briefing commands (requests per minute)
+    _COMMAND_RATE_LIMITS: dict[str, tuple[int, int]] = {
+        "feedback": (10, 60),
+        "track": (20, 60),
+        "untrack": (20, 60),
+        "save": (20, 60),
+        "unsave": (20, 60),
+        "recall": (5, 60),
+        "more": (10, 60),
+    }
+
+    def _check_command_rate_limit(self, user_id: str, command: str) -> bool:
+        """Check per-command rate limit. Returns True if BLOCKED."""
+        limits = self._COMMAND_RATE_LIMITS.get(command)
+        if not limits:
+            return False
+        max_requests, window_secs = limits
+        now = time.monotonic()
+        key = f"{user_id}:{command}"
+        if not hasattr(self, "_cmd_rate_windows"):
+            self._cmd_rate_windows: dict[str, list[float]] = {}
+        timestamps = self._cmd_rate_windows.get(key, [])
+        # Expire old timestamps
+        timestamps = [t for t in timestamps if now - t < window_secs]
+        if len(timestamps) >= max_requests:
+            return True
+        timestamps.append(now)
+        self._cmd_rate_windows[key] = timestamps
+        return False
+
     def _handle_command(self, chat_id: int | str, user_id: str,
                         command: str, args: str) -> dict[str, Any]:
         """Route a slash command to the appropriate handler."""
@@ -1025,6 +1055,19 @@ class CommunicationAgent:
         results = self._engine.apply_user_feedback(
             user_id, text, is_admin=self._is_admin(user_id)
         )
+
+        # Send a concise confirmation of each change applied
+        if results:
+            summary_lines = []
+            for k, v in results.items():
+                if not k.startswith("hint:"):
+                    summary_lines.append(f"{k} \u2192 {v}")
+            if summary_lines:
+                confirmation = "\n".join(summary_lines)
+                self._bot.send_message(
+                    chat_id,
+                    f"<b>Confirmed changes:</b>\n{html_mod.escape(confirmation)}",
+                )
 
         # If rich parser corrected topics, re-apply with corrected topics
         if parse_result.corrections and parse_result.commands:
