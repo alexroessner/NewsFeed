@@ -253,6 +253,17 @@ def send_webhook(url: str, payload: dict[str, Any],
     SECURITY: Uses a custom opener that refuses HTTP redirects to prevent
     SSRF via open-redirect chains (validated URL -> 302 -> internal IP).
     """
+    _, error = send_webhook_with_detail(url, payload, timeout)
+    return error == ""
+
+
+def send_webhook_with_detail(url: str, payload: dict[str, Any],
+                              timeout: float = 10.0) -> tuple[bool, str]:
+    """Send a JSON payload to a webhook URL.
+
+    Returns (success, error_detail). error_detail is empty on success,
+    or a human-readable diagnostic string on failure.
+    """
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -264,13 +275,22 @@ def send_webhook(url: str, payload: dict[str, Any],
     opener = urllib.request.build_opener(_NoRedirectHandler)
     try:
         with opener.open(req, timeout=timeout) as resp:
-            return 200 <= resp.status < 300
+            if 200 <= resp.status < 300:
+                return True, ""
+            return False, f"HTTP {resp.status}"
     except urllib.error.HTTPError as exc:
         if 300 <= exc.code < 400:
             log.warning("Webhook redirect blocked (SSRF prevention): %s", url)
-            return False
+            return False, f"Redirect blocked (HTTP {exc.code}) — SSRF prevention"
         log.warning("Webhook HTTP error: %s %s", exc.code, exc.reason)
-        return False
-    except Exception:
+        return False, f"HTTP {exc.code} {exc.reason}"
+    except socket.timeout:
+        log.debug("Webhook delivery timed out for %s", url)
+        return False, f"Connection timed out after {timeout}s"
+    except urllib.error.URLError as exc:
+        reason = str(exc.reason) if hasattr(exc, "reason") else str(exc)
+        log.debug("Webhook delivery failed: %s", reason)
+        return False, f"Connection failed: {reason}"
+    except Exception as exc:
         log.debug("Webhook delivery failed", exc_info=True)
-        return False
+        return False, f"Unexpected error: {type(exc).__name__}"

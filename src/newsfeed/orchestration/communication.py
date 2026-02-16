@@ -8,6 +8,8 @@ intelligence pipeline.
 from __future__ import annotations
 
 import logging
+import time
+from collections import defaultdict
 from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -52,6 +54,51 @@ _FALLBACK_TOPICS = {
 }
 
 
+class DeliveryMetrics:
+    """Track delivery success/failure rates across channels.
+
+    Provides a lightweight in-memory view of recent delivery health.
+    No persistence needed — resets on restart, which is fine for a
+    health dashboard that shows recent trends.
+    """
+
+    _CHANNELS = ("telegram", "webhook", "email")
+
+    def __init__(self) -> None:
+        self._success: dict[str, int] = defaultdict(int)
+        self._failure: dict[str, int] = defaultdict(int)
+        self._last_success: dict[str, float] = {}
+        self._last_failure: dict[str, float] = {}
+
+    def record_success(self, channel: str) -> None:
+        self._success[channel] += 1
+        self._last_success[channel] = time.monotonic()
+
+    def record_failure(self, channel: str) -> None:
+        self._failure[channel] += 1
+        self._last_failure[channel] = time.monotonic()
+
+    def success_rate(self, channel: str) -> float:
+        """Return success rate as 0.0–1.0. Returns 1.0 if no deliveries."""
+        total = self._success[channel] + self._failure[channel]
+        if total == 0:
+            return 1.0
+        return self._success[channel] / total
+
+    def summary(self) -> dict[str, Any]:
+        """Return health summary for all channels."""
+        result: dict[str, Any] = {}
+        for ch in self._CHANNELS:
+            total = self._success[ch] + self._failure[ch]
+            result[ch] = {
+                "success": self._success[ch],
+                "failure": self._failure[ch],
+                "total": total,
+                "rate": self.success_rate(ch),
+            }
+        return result
+
+
 class CommunicationAgent:
     """Telegram-facing communication interface.
 
@@ -76,6 +123,7 @@ class CommunicationAgent:
         self._scheduler = scheduler
         self._default_topics = default_topics or _FALLBACK_TOPICS
         self._market = MarketTicker()
+        self._delivery_metrics = DeliveryMetrics()
         # Track items shown per user for "show more" dedup
         # All per-user dicts use BoundedUserDict to cap at 500 users
         # with LRU eviction — prevents unbounded memory growth.
@@ -1410,10 +1458,12 @@ class CommunicationAgent:
                 # Use user_id as chat_id for direct messages
                 self._run_briefing(user_id, user_id)
                 sent += 1
+                self._delivery_metrics.record_success("telegram")
                 # Auto-send email digest if user has email configured
                 self._auto_email_digest(user_id)
             except Exception:
                 log.exception("Failed to deliver scheduled briefing to user=%s", user_id)
+                self._delivery_metrics.record_failure("telegram")
                 # Notify the user so they know their briefing didn't arrive
                 try:
                     self._bot.send_message(
@@ -1859,11 +1909,18 @@ class CommunicationAgent:
                 "message": "NewsFeed webhook connected successfully",
                 "user_id": user_id,
             }
-            success = send_webhook(profile.webhook_url, test_payload)
+            from newsfeed.delivery.webhook import send_webhook_with_detail
+            success, error_detail = send_webhook_with_detail(profile.webhook_url, test_payload)
             if success:
                 self._bot.send_message(chat_id, "\u2705 Test payload delivered successfully.")
             else:
-                self._bot.send_message(chat_id, "\u274c Delivery failed. Check your webhook URL.")
+                import html as html_mod
+                safe_detail = html_mod.escape(error_detail)
+                self._bot.send_message(
+                    chat_id,
+                    f"\u274c Delivery failed: {safe_detail}\n"
+                    f"Check your endpoint accepts POST with Content-Type: application/json."
+                )
             return {"action": "webhook_test", "user_id": user_id, "success": success}
 
         # Validate and set URL
@@ -2004,10 +2061,13 @@ class CommunicationAgent:
             success = digest.send(profile.email, subject, html_body)
             if success:
                 log.info("Auto-sent email digest to user=%s", user_id)
+                self._delivery_metrics.record_success("email")
             else:
                 log.warning("Email digest send returned failure for user=%s", user_id)
+                self._delivery_metrics.record_failure("email")
         except Exception:
             log.warning("Auto email digest failed for user=%s", user_id, exc_info=True)
+            self._delivery_metrics.record_failure("email")
 
     def _build_thread_map(self, payload) -> dict[int, dict]:
         """Map 1-based story indices to their narrative thread info.
@@ -2056,19 +2116,28 @@ class CommunicationAgent:
             return
         try:
             from newsfeed.delivery.webhook import (
-                _detect_platform, format_briefing_payload, send_webhook,
+                _detect_platform, format_briefing_payload, send_webhook, validate_webhook_url,
             )
+            # Re-validate URL at delivery time (DNS may have changed since setup)
+            valid, _err = validate_webhook_url(profile.webhook_url)
+            if not valid:
+                log.warning("Webhook URL failed re-validation for user=%s: %s", user_id, _err)
+                self._record_webhook_failure(user_id, profile)
+                return
             platform = _detect_platform(profile.webhook_url)
             payload = format_briefing_payload(user_id, items, platform)
             success = send_webhook(profile.webhook_url, payload)
             if success:
                 log.info("Webhook briefing pushed for user=%s", user_id)
                 self._webhook_fail_counts.pop(user_id, None)
+                self._delivery_metrics.record_success("webhook")
             else:
                 self._record_webhook_failure(user_id, profile)
+                self._delivery_metrics.record_failure("webhook")
         except Exception:
             log.warning("Webhook briefing failed for user=%s", user_id, exc_info=True)
             self._record_webhook_failure(user_id, profile)
+            self._delivery_metrics.record_failure("webhook")
 
     def _record_webhook_failure(self, user_id: str, profile) -> None:
         """Track webhook failures and disable after too many consecutive ones."""
@@ -3331,6 +3400,20 @@ class CommunicationAgent:
                 )
             self._bot.send_message(chat_id, "\n".join(lines))
             return {"action": "admin_briefings", "user_id": user_id}
+
+        if subcmd == "health":
+            health = self._delivery_metrics.summary()
+            lines = ["<b>Delivery Health</b>", ""]
+            for ch in ("telegram", "webhook", "email"):
+                h = health[ch]
+                rate_pct = h["rate"] * 100
+                icon = "\u2705" if rate_pct >= 95 else ("\u26a0\ufe0f" if rate_pct >= 80 else "\u274c")
+                lines.append(
+                    f"  {icon} {ch}: {h['success']}/{h['total']} "
+                    f"({rate_pct:.0f}% success)"
+                )
+            self._bot.send_message(chat_id, "\n".join(lines))
+            return {"action": "admin_health", "user_id": user_id}
 
         self._bot.send_message(chat_id, f"Unknown admin command: {html_mod.escape(subcmd)}. Try /admin help")
         return {"action": "admin_unknown", "user_id": user_id}

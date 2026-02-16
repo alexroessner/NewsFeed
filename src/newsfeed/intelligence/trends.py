@@ -37,7 +37,10 @@ class TrendDetector:
             velocity = recent / max(total, 1)
 
             baseline = self._baseline.get(topic, 0.3)
-            anomaly_score = velocity / max(baseline, 0.01)
+            # Floor at 0.1 (not 0.01) to prevent false positives:
+            # a baseline decayed to 0.01 with velocity 0.5 would give
+            # anomaly_score = 50x, which is almost never a real spike.
+            anomaly_score = velocity / max(baseline, 0.1)
             is_emerging = anomaly_score >= self.anomaly_threshold and total >= 2
 
             self._baseline[topic] = round(
