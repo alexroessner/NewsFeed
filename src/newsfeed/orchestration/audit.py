@@ -43,6 +43,10 @@ class AuditTrail:
     4. User transparency: "Show me the reasoning behind my briefing."
     """
 
+    # Hard cap on total events to prevent unbounded memory growth.
+    # 50 requests × ~100 events/request = ~5000 events max (~1 MB).
+    _MAX_EVENTS = 5000
+
     def __init__(self, max_requests: int = 50) -> None:
         self._events: list[AuditEvent] = []
         self._max_requests = max_requests
@@ -239,15 +243,21 @@ class AuditTrail:
         }
 
     def _trim(self) -> None:
-        """Keep only the most recent N requests.
+        """Keep only the most recent N requests, with a hard cap on total events.
 
         Optimized to batch eviction: only triggers when 20% over capacity
         to amortize the cost of the index rebuild.  Without batching, the
         full O(n) rebuild would run on every record() call at capacity.
+
+        Also enforces _MAX_EVENTS as a hard safety limit to prevent memory
+        leaks if many events are recorded per request.
         """
+        # Force trim if total events exceed hard cap
+        events_over = len(self._events) > self._MAX_EVENTS
         overshoot = len(self._request_index) - self._max_requests
-        if overshoot < max(1, self._max_requests // 5):
+        if not events_over and overshoot < max(1, self._max_requests // 5):
             return  # Wait until 20% over before trimming (amortize cost)
+        overshoot = max(overshoot, 1)  # drop at least 1 request when over event cap
 
         # Find oldest requests to drop
         requests_by_first = sorted(

@@ -669,6 +669,30 @@ class BriefingScheduler:
             # Invalid timezone or zoneinfo unavailable — fall back to UTC
             return datetime.now(timezone.utc).strftime("%H:%M")
 
+    @staticmethod
+    def _time_within_window(schedule_time: str, current_time: str,
+                            window_minutes: int = 2) -> bool:
+        """Check if current_time is within window_minutes of schedule_time.
+
+        Both are HH:MM strings. Uses a forward window so that if the
+        scheduler poll misses the exact minute, the briefing still fires.
+        The 120-second cooldown in get_due_users() prevents duplicates.
+        """
+        try:
+            sh, sm = int(schedule_time[:2]), int(schedule_time[3:5])
+            ch, cm = int(current_time[:2]), int(current_time[3:5])
+        except (ValueError, IndexError):
+            return False
+        sched_mins = sh * 60 + sm
+        curr_mins = ch * 60 + cm
+        diff = curr_mins - sched_mins
+        # Handle midnight wrap (e.g., schedule=23:59, current=00:01)
+        if diff > 720:
+            diff -= 1440
+        elif diff < -720:
+            diff += 1440
+        return 0 <= diff < window_minutes
+
     def set_schedule(self, user_id: str, schedule_type: str, time_str: str = "") -> str:
         """Set a briefing schedule for a user.
 
@@ -714,7 +738,7 @@ class BriefingScheduler:
                     continue
 
                 user_now = self._user_local_time(user_id)
-                if schedule["time"] == user_now:
+                if self._time_within_window(schedule["time"], user_now):
                     last = self._last_sent.get(user_id, 0)
                     if time.time() - last > 120:
                         due.append(user_id)

@@ -142,6 +142,8 @@ class CommunicationAgent:
         self._ALERT_COOLDOWN = _ALERT_COOLDOWN_SECONDS
         # Onboarding state for interactive setup flow
         self._onboarding: BoundedUserDict[OnboardingState] = BoundedUserDict(maxlen=500)
+        # Pending reset confirmations (user_id -> monotonic timestamp)
+        self._pending_resets: BoundedUserDict[float] = BoundedUserDict(maxlen=200)
         # Handler context for delegated command modules
         self._ctx = HandlerContext(
             engine=engine, bot=bot, scheduler=scheduler,
@@ -395,6 +397,36 @@ class CommunicationAgent:
             return self._handle_preset(chat_id, user_id, args)
 
         if command == "reset":
+            import time as _time
+            # Two-step confirmation to prevent accidental data loss.
+            # "reset confirm" or second /reset within 30s = execute.
+            if args.strip().lower() == "confirm":
+                pass  # confirmed via argument
+            elif user_id in self._pending_resets:
+                elapsed = _time.monotonic() - self._pending_resets.pop(user_id)
+                if elapsed > 30:
+                    # Confirmation expired — ask again
+                    self._pending_resets[user_id] = _time.monotonic()
+                    self._bot.send_message(
+                        chat_id,
+                        "\u26a0\ufe0f Confirmation expired. Send /reset again within 30 seconds "
+                        "or use /reset confirm to erase all preferences.",
+                    )
+                    return {"action": "reset_pending", "user_id": user_id}
+                # Confirmed by double /reset within 30s — fall through
+            else:
+                self._pending_resets[user_id] = _time.monotonic()
+                self._bot.send_message(
+                    chat_id,
+                    "\u26a0\ufe0f <b>This will erase ALL your preferences</b> "
+                    "(topics, sources, schedule, bookmarks, tracked stories).\n\n"
+                    "Send /reset again within 30 seconds to confirm, "
+                    "or /reset confirm to proceed immediately.",
+                    parse_mode="HTML",
+                )
+                return {"action": "reset_pending", "user_id": user_id}
+
+            self._pending_resets.pop(user_id, None)
             self._engine.preferences.reset(user_id)
             self._engine.apply_user_feedback(user_id, "reset preferences")
             self._shown_ids.pop(user_id, None)
@@ -2849,16 +2881,37 @@ class CommunicationAgent:
         )
         return {"action": "source_help", "user_id": user_id}
 
+    # Rate limit for /source add: max 3 source additions per 60 seconds per user.
+    _SOURCE_ADD_WINDOW = 60
+    _SOURCE_ADD_MAX = 3
+
     def _source_add(self, chat_id: int | str, user_id: str,
                     args: str) -> dict[str, Any]:
         """Handle /source add <url> [name] — discover, validate, and register a feed."""
         import html as html_mod
+        import time as _time
         from urllib.parse import urlparse
 
         from newsfeed.agents.dynamic_sources import (
             discover_feed,
             validate_source_name,
         )
+
+        # Per-user rate limit for source additions to prevent abuse/DoS.
+        if not hasattr(self, "_source_add_times"):
+            self._source_add_times: BoundedUserDict[list[float]] = BoundedUserDict(maxlen=500)
+        now = _time.monotonic()
+        times = self._source_add_times.get(user_id, [])
+        times = [t for t in times if now - t < self._SOURCE_ADD_WINDOW]
+        if len(times) >= self._SOURCE_ADD_MAX:
+            self._bot.send_message(
+                chat_id,
+                f"\u26a0\ufe0f Rate limited: max {self._SOURCE_ADD_MAX} source additions "
+                f"per {self._SOURCE_ADD_WINDOW} seconds. Please wait.",
+            )
+            return {"action": "source_add_rate_limited", "user_id": user_id}
+        times.append(now)
+        self._source_add_times[user_id] = times
 
         if not args:
             self._bot.send_message(
