@@ -142,9 +142,26 @@ class TelegramBot:
                                 method, delay, attempt + 1, self._MAX_RETRIES)
                     time.sleep(delay)
                     continue
-                log.error("Telegram API call %s failed: %s", method, e)
+                # Retry on server errors (5xx) — these are transient
+                if e.code >= 500 and attempt < self._MAX_RETRIES:
+                    delay = self._RETRY_BASE_DELAY * (2 ** attempt)
+                    log.warning("Telegram %d error on %s, retrying in %.1fs (attempt %d/%d)",
+                                e.code, method, delay, attempt + 1, self._MAX_RETRIES)
+                    time.sleep(delay)
+                    continue
+                log.error("Telegram API call %s failed: HTTP %d %s", method, e.code, e)
                 return {}
-            except (urllib.error.URLError, json.JSONDecodeError, OSError, ValueError) as e:
+            except (urllib.error.URLError, OSError) as e:
+                # Retry on network errors (timeout, connection refused, DNS failure)
+                if attempt < self._MAX_RETRIES:
+                    delay = self._RETRY_BASE_DELAY * (2 ** attempt)
+                    log.warning("Telegram network error on %s: %s, retrying in %.1fs (attempt %d/%d)",
+                                method, e, delay, attempt + 1, self._MAX_RETRIES)
+                    time.sleep(delay)
+                    continue
+                log.error("Telegram API call %s failed after %d retries: %s", method, self._MAX_RETRIES, e)
+                return {}
+            except (json.JSONDecodeError, ValueError) as e:
                 log.error("Telegram API call %s failed: %s", method, e)
                 return {}
         return {}

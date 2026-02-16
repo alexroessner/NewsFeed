@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import threading
 import time
@@ -340,16 +341,20 @@ class PreferenceStore:
         preset = profile.presets.get(name)
         if not preset:
             return None
-        profile.topic_weights = dict(preset.get("topic_weights") or {})
-        profile.source_weights = dict(preset.get("source_weights") or {})
-        profile.tone = str(preset.get("tone") or "concise")
-        profile.format = str(preset.get("format") or "bullet")
-        profile.max_items = int(preset.get("max_items") or 10)
-        profile.regions_of_interest = list(preset.get("regions") or [])
-        profile.confidence_min = float(preset.get("confidence_min") or 0.0)
-        profile.urgency_min = str(preset.get("urgency_min") or "")
-        profile.max_per_source = int(preset.get("max_per_source") or 0)
-        profile.muted_topics = list(preset.get("muted_topics") or [])
+        try:
+            profile.topic_weights = dict(preset.get("topic_weights") or {})
+            profile.source_weights = dict(preset.get("source_weights") or {})
+            profile.tone = str(preset.get("tone") or "concise")
+            profile.format = str(preset.get("format") or "bullet")
+            profile.max_items = self._safe_int(preset.get("max_items"), 10)
+            profile.regions_of_interest = list(preset.get("regions") or [])
+            profile.confidence_min = max(0.0, min(1.0, self._safe_float(preset.get("confidence_min"), 0.0)))
+            profile.urgency_min = str(preset.get("urgency_min") or "")
+            profile.max_per_source = max(0, min(10, self._safe_int(preset.get("max_per_source"), 0)))
+            profile.muted_topics = list(preset.get("muted_topics") or [])
+        except (TypeError, AttributeError) as e:
+            log.warning("Failed to load preset %r for user %s: %s", name, user_id, e)
+            return None
         return profile
 
     def delete_preset(self, user_id: str, name: str) -> bool:
@@ -522,6 +527,29 @@ class PreferenceStore:
         storage.save(key, data)
         return len(data) - 1  # exclude __weight_timestamps__
 
+    @staticmethod
+    def _safe_float(value, default: float) -> float:
+        """Convert to float, rejecting NaN/Inf; return default on failure."""
+        try:
+            f = float(value or default)
+            return f if math.isfinite(f) else default
+        except (ValueError, TypeError):
+            return default
+
+    @staticmethod
+    def _safe_int(value, default: int) -> int:
+        """Convert to int, return default on failure."""
+        try:
+            return int(value or default)
+        except (ValueError, TypeError):
+            return default
+
+    @staticmethod
+    def _capped_list(value, cap: int) -> list:
+        """Convert to list, capping at max length to prevent memory abuse."""
+        result = list(value or [])
+        return result[-cap:] if len(result) > cap else result
+
     def restore(self, storage: StatePersistence, key: str = "preferences") -> int:
         """Restore profiles from persistent storage. Returns count restored."""
         data = storage.load(key)
@@ -537,29 +565,40 @@ class PreferenceStore:
                 if not isinstance(uid, str) or not isinstance(profile_data, dict):
                     continue
                 profile = self.get_or_create(uid)
-                profile.topic_weights = dict(profile_data.get("topic_weights") or {})
-                profile.source_weights = dict(profile_data.get("source_weights") or {})
+                # Weight dicts — cap at MAX_WEIGHTS entries
+                tw = dict(profile_data.get("topic_weights") or {})
+                if len(tw) > self.MAX_WEIGHTS:
+                    tw = dict(list(tw.items())[:self.MAX_WEIGHTS])
+                profile.topic_weights = tw
+                sw = dict(profile_data.get("source_weights") or {})
+                if len(sw) > self.MAX_WEIGHTS:
+                    sw = dict(list(sw.items())[:self.MAX_WEIGHTS])
+                profile.source_weights = sw
                 profile.tone = str(profile_data.get("tone") or "concise")
                 profile.format = str(profile_data.get("format") or "bullet")
-                profile.max_items = int(profile_data.get("max_items") or 10)
+                profile.max_items = self._safe_int(profile_data.get("max_items"), 10)
                 profile.briefing_cadence = str(profile_data.get("cadence") or "on_demand")
-                profile.regions_of_interest = list(profile_data.get("regions") or [])
-                profile.watchlist_crypto = list(profile_data.get("watchlist_crypto") or [])
-                profile.watchlist_stocks = list(profile_data.get("watchlist_stocks") or [])
-                profile.timezone = str(profile_data.get("timezone") or "UTC")
-                profile.muted_topics = list(profile_data.get("muted_topics") or [])
-                profile.tracked_stories = list(profile_data.get("tracked_stories") or [])
-                profile.bookmarks = list(profile_data.get("bookmarks") or [])
+                profile.regions_of_interest = self._capped_list(profile_data.get("regions"), 20)
+                profile.watchlist_crypto = self._capped_list(profile_data.get("watchlist_crypto"), self.MAX_WATCHLIST_SIZE)
+                profile.watchlist_stocks = self._capped_list(profile_data.get("watchlist_stocks"), self.MAX_WATCHLIST_SIZE)
+                profile.timezone = str(profile_data.get("timezone") or "UTC")[:self._MAX_TIMEZONE_LEN]
+                profile.muted_topics = self._capped_list(profile_data.get("muted_topics"), self.MAX_MUTED_TOPICS)
+                profile.tracked_stories = self._capped_list(profile_data.get("tracked_stories"), 20)
+                profile.bookmarks = self._capped_list(profile_data.get("bookmarks"), 50)
                 profile.email = str(profile_data.get("email") or "")
-                profile.confidence_min = float(profile_data.get("confidence_min") or 0.0)
+                profile.confidence_min = max(0.0, min(1.0, self._safe_float(profile_data.get("confidence_min"), 0.0)))
                 profile.urgency_min = str(profile_data.get("urgency_min") or "")
-                profile.max_per_source = int(profile_data.get("max_per_source") or 0)
-                profile.alert_georisk_threshold = float(profile_data.get("alert_georisk_threshold") or 0.5)
-                profile.alert_trend_threshold = float(profile_data.get("alert_trend_threshold") or 3.0)
-                profile.presets = dict(profile_data.get("presets") or {})
+                profile.max_per_source = max(0, min(10, self._safe_int(profile_data.get("max_per_source"), 0)))
+                profile.alert_georisk_threshold = max(0.1, min(1.0, self._safe_float(profile_data.get("alert_georisk_threshold"), 0.5)))
+                profile.alert_trend_threshold = max(1.5, min(10.0, self._safe_float(profile_data.get("alert_trend_threshold"), 3.0)))
+                presets = profile_data.get("presets") or {}
+                # Cap presets to 10
+                if isinstance(presets, dict) and len(presets) > 10:
+                    presets = dict(list(presets.items())[:10])
+                profile.presets = dict(presets) if isinstance(presets, dict) else {}
                 profile.webhook_url = str(profile_data.get("webhook_url") or "")
-                profile.custom_sources = list(profile_data.get("custom_sources") or [])
-                profile.alert_keywords = list(profile_data.get("alert_keywords") or [])
+                profile.custom_sources = self._capped_list(profile_data.get("custom_sources"), 10)
+                profile.alert_keywords = self._capped_list(profile_data.get("alert_keywords"), 50)
                 restored += 1
         log.info("Restored %d user profiles from persistent storage", restored)
         return restored
@@ -597,9 +636,13 @@ class PreferenceStore:
                     continue  # too recent to decay
                 # Exponential decay: value * 0.5^(age / half_life)
                 decay_factor = 0.5 ** (age_secs / half_life_secs)
-                new_val = round(value * decay_factor, 3)
-                if abs(new_val) < 0.01:
-                    new_val = 0.0  # snap to zero
+                new_val = value * decay_factor
+                # Snap small values to zero (threshold at 0.05, not 0.01,
+                # to avoid rounding artifacts where round(x, 3) = x)
+                if abs(new_val) < 0.05:
+                    new_val = 0.0
+                else:
+                    new_val = round(new_val, 3)
                 if new_val != value:
                     to_update.append((key, new_val))
                     decayed += 1

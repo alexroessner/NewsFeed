@@ -764,10 +764,25 @@ class CommunicationAgent:
             self._bot.send_story_card(chat_id, card, story_index=idx, is_tracked=is_tracked)
 
         if not payload.items:
-            self._bot.send_message(
-                chat_id,
-                "No stories matched your current filters. Try /feedback to adjust."
-            )
+            # Explain which filters caused the empty result
+            filter_hints = []
+            if profile.confidence_min > 0:
+                filter_hints.append(f"confidence \u2265 {profile.confidence_min:.0%}")
+            if profile.urgency_min:
+                filter_hints.append(f"urgency \u2265 {profile.urgency_min}")
+            if profile.max_per_source > 0:
+                filter_hints.append(f"max {profile.max_per_source}/source")
+            if profile.muted_topics:
+                filter_hints.append(f"{len(profile.muted_topics)} muted topics")
+            if filter_hints:
+                hint_str = ", ".join(filter_hints)
+                msg = (
+                    f"No stories passed your active filters ({hint_str}).\n"
+                    f"Try /filter confidence 0 or /feedback reset filters to see more."
+                )
+            else:
+                msg = "No stories matched your current interests. Try /feedback to adjust."
+            self._bot.send_message(chat_id, msg)
 
         # Topic discovery — surface emerging trends the user doesn't track
         if payload.trends and payload.items:
@@ -1986,10 +2001,13 @@ class CommunicationAgent:
 
             html_body = digest.render(payload, tracked_flags, weekly)
             subject = f"Intelligence Digest \u2014 {datetime.now(timezone.utc).strftime('%b %d, %Y')}"
-            digest.send(profile.email, subject, html_body)
-            log.info("Auto-sent email digest to user=%s", user_id)
+            success = digest.send(profile.email, subject, html_body)
+            if success:
+                log.info("Auto-sent email digest to user=%s", user_id)
+            else:
+                log.warning("Email digest send returned failure for user=%s", user_id)
         except Exception:
-            log.debug("Auto email digest failed for user=%s", user_id, exc_info=True)
+            log.warning("Auto email digest failed for user=%s", user_id, exc_info=True)
 
     def _build_thread_map(self, payload) -> dict[int, dict]:
         """Map 1-based story indices to their narrative thread info.
@@ -2023,10 +2041,18 @@ class CommunicationAgent:
 
         return result
 
+    # Webhook circuit breaker: after N consecutive failures, disable webhook
+    # and notify user via Telegram. Prevents hammering dead endpoints.
+    _WEBHOOK_MAX_FAILURES = 5
+    _webhook_fail_counts: dict[str, int] = {}
+
     def _auto_webhook_briefing(self, user_id: str, items: list) -> None:
         """Push briefing to user's webhook if configured."""
         profile = self._engine.preferences.get_or_create(user_id)
         if not profile.webhook_url or not items:
+            return
+        # Circuit breaker: skip if already tripped
+        if self._webhook_fail_counts.get(user_id, 0) >= self._WEBHOOK_MAX_FAILURES:
             return
         try:
             from newsfeed.delivery.webhook import (
@@ -2034,10 +2060,35 @@ class CommunicationAgent:
             )
             platform = _detect_platform(profile.webhook_url)
             payload = format_briefing_payload(user_id, items, platform)
-            send_webhook(profile.webhook_url, payload)
-            log.info("Webhook briefing pushed for user=%s", user_id)
+            success = send_webhook(profile.webhook_url, payload)
+            if success:
+                log.info("Webhook briefing pushed for user=%s", user_id)
+                self._webhook_fail_counts.pop(user_id, None)
+            else:
+                self._record_webhook_failure(user_id, profile)
         except Exception:
-            log.debug("Webhook briefing failed for user=%s", user_id, exc_info=True)
+            log.warning("Webhook briefing failed for user=%s", user_id, exc_info=True)
+            self._record_webhook_failure(user_id, profile)
+
+    def _record_webhook_failure(self, user_id: str, profile) -> None:
+        """Track webhook failures and disable after too many consecutive ones."""
+        count = self._webhook_fail_counts.get(user_id, 0) + 1
+        self._webhook_fail_counts[user_id] = count
+        if count >= self._WEBHOOK_MAX_FAILURES:
+            log.warning("Webhook disabled for user=%s after %d consecutive failures", user_id, count)
+            chat_id = self._resolve_chat_id(user_id)
+            if chat_id:
+                try:
+                    self._bot.send_message(
+                        chat_id,
+                        f"\u26a0\ufe0f Your webhook has been disabled after {count} consecutive delivery "
+                        f"failures. Briefings will continue via Telegram.\n"
+                        f"Fix your endpoint and run /webhook test to re-enable."
+                    )
+                except Exception:
+                    pass
+            profile.webhook_url = ""
+            self._persist_prefs()
 
     def _auto_webhook_alert(self, user_id: str, alert_type: str,
                             alert_data: dict) -> None:
