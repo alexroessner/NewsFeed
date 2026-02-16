@@ -73,10 +73,11 @@ class TestFullPipeline(unittest.TestCase):
 
     def test_feedback_updates_preferences(self) -> None:
         """User feedback changes topic weights."""
-        profile_before = self.engine.preferences.get_or_create("integration-fb")
+        uid = f"integration-fb-{id(self)}"  # Unique per run
+        profile_before = self.engine.preferences.get_or_create(uid)
         old_weight = profile_before.topic_weights.get("geopolitics", 0.0)
-        self.engine.apply_user_feedback("integration-fb", "more geopolitics")
-        profile_after = self.engine.preferences.get_or_create("integration-fb")
+        self.engine.apply_user_feedback(uid, "more geopolitics")
+        profile_after = self.engine.preferences.get_or_create(uid)
         new_weight = profile_after.topic_weights.get("geopolitics", 0.0)
         self.assertGreater(new_weight, old_weight)
 
@@ -214,6 +215,155 @@ class TestThreadSafety(unittest.TestCase):
             t.join(timeout=10)
 
         self.assertEqual(len(errors), 0, f"Thread errors: {errors}")
+
+
+class TestBoundedUserDictSemantics(unittest.TestCase):
+    """Verify LRU semantics and RLock reentrancy in BoundedUserDict."""
+
+    def test_setdefault_does_not_deadlock(self) -> None:
+        """setdefault calls __setitem__ internally — RLock must allow reentrancy."""
+        from newsfeed.memory.store import BoundedUserDict
+        d: BoundedUserDict[str] = BoundedUserDict(maxlen=10)
+        # This would deadlock with threading.Lock instead of RLock
+        result = d.setdefault("a", "default")
+        self.assertEqual(result, "default")
+        # Second call returns existing value without insert
+        result = d.setdefault("a", "other")
+        self.assertEqual(result, "default")
+
+    def test_lru_eviction_order(self) -> None:
+        """Oldest (least recently used) key is evicted first."""
+        from newsfeed.memory.store import BoundedUserDict
+        d: BoundedUserDict[int] = BoundedUserDict(maxlen=3)
+        d["a"] = 1
+        d["b"] = 2
+        d["c"] = 3
+        # "a" is oldest; adding "d" should evict "a"
+        d["d"] = 4
+        self.assertNotIn("a", d)
+        self.assertIn("b", d)
+        self.assertIn("c", d)
+        self.assertIn("d", d)
+
+    def test_lru_refresh_on_update(self) -> None:
+        """Updating an existing key refreshes it (moves to end)."""
+        from newsfeed.memory.store import BoundedUserDict
+        d: BoundedUserDict[int] = BoundedUserDict(maxlen=3)
+        d["a"] = 1
+        d["b"] = 2
+        d["c"] = 3
+        # Refresh "a" — now "b" is oldest
+        d["a"] = 10
+        d["d"] = 4
+        self.assertNotIn("b", d)  # "b" was oldest after "a" was refreshed
+        self.assertIn("a", d)
+
+
+class TestCommandRateLimiter(unittest.TestCase):
+    """Verify per-command rate limiting logic."""
+
+    def setUp(self) -> None:
+        from unittest.mock import MagicMock
+        from newsfeed.orchestration.communication import CommunicationAgent
+        from newsfeed.models.domain import UserProfile
+
+        self.mock_engine = MagicMock()
+        self.mock_engine.preferences.get_or_create.return_value = UserProfile(
+            user_id="u1", topic_weights={"geopolitics": 0.8}, max_items=10,
+        )
+        mock_payload = MagicMock()
+        mock_payload.items = []
+        self.mock_engine.handle_request_payload.return_value = mock_payload
+        self.mock_engine.handle_request.return_value = "Briefing text"
+        self.mock_engine.apply_user_feedback.return_value = {"topic:geopolitics": "1.0"}
+        self.mock_engine.last_briefing_items.return_value = []
+
+        self.mock_bot = MagicMock()
+        self.mock_bot.parse_command.return_value = None
+
+        self.agent = CommunicationAgent(engine=self.mock_engine, bot=self.mock_bot)
+
+    def test_unknown_command_not_rate_limited(self) -> None:
+        """Commands not in _COMMAND_RATE_LIMITS pass through."""
+        self.assertFalse(self.agent._check_command_rate_limit("u1", "help"))
+        self.assertFalse(self.agent._check_command_rate_limit("u1", "settings"))
+
+    def test_first_request_allowed(self) -> None:
+        """First request for a rate-limited command succeeds."""
+        self.assertFalse(self.agent._check_command_rate_limit("u1", "feedback"))
+
+    def test_exceeding_limit_blocks(self) -> None:
+        """Exceeding the rate limit blocks the request."""
+        # "recall" limit is (5, 60) — 5 per 60 seconds
+        for _ in range(5):
+            self.assertFalse(self.agent._check_command_rate_limit("u1", "recall"))
+        # 6th request should be blocked
+        self.assertTrue(self.agent._check_command_rate_limit("u1", "recall"))
+
+    def test_different_users_separate_limits(self) -> None:
+        """Each user has their own rate limit window."""
+        for _ in range(5):
+            self.agent._check_command_rate_limit("user_a", "recall")
+        # user_a is blocked
+        self.assertTrue(self.agent._check_command_rate_limit("user_a", "recall"))
+        # user_b is NOT blocked
+        self.assertFalse(self.agent._check_command_rate_limit("user_b", "recall"))
+
+    def test_rate_limit_wiring_in_handle_command(self) -> None:
+        """Rate-limited command returns command_rate_limited action."""
+        # Exhaust the recall limit
+        for _ in range(5):
+            self.agent._check_command_rate_limit("u1", "recall")
+        # Now route a recall command through _handle_command
+        result = self.agent._handle_command(123, "u1", "recall", "test")
+        self.assertEqual(result["action"], "command_rate_limited")
+        self.mock_bot.send_message.assert_called()
+
+
+class TestPreferenceConfirmation(unittest.TestCase):
+    """Verify feedback confirmation message is sent."""
+
+    def setUp(self) -> None:
+        from unittest.mock import MagicMock
+        from newsfeed.orchestration.communication import CommunicationAgent
+        from newsfeed.models.domain import UserProfile
+
+        self.mock_engine = MagicMock()
+        self.mock_engine.preferences.get_or_create.return_value = UserProfile(
+            user_id="u1", topic_weights={"geopolitics": 0.8}, max_items=10,
+        )
+        self.mock_engine.apply_user_feedback.return_value = {
+            "topic:geopolitics": "1.0",
+            "hint:geopolitics": "Already at maximum",
+        }
+        self.mock_engine._preference_deltas = {"more": 0.2, "less": -0.2}
+        self.mock_engine.last_briefing_items.return_value = []
+
+        self.mock_bot = MagicMock()
+        self.mock_bot.parse_command.return_value = {
+            "type": "feedback", "chat_id": 123, "user_id": "u1",
+            "command": "", "args": "", "text": "more geopolitics",
+        }
+
+        self.agent = CommunicationAgent(engine=self.mock_engine, bot=self.mock_bot)
+
+    def test_confirmation_sent_after_feedback(self) -> None:
+        """Feedback triggers a confirmation message."""
+        self.agent.handle_update({})
+        # Check that send_message was called with confirmation
+        calls = self.mock_bot.send_message.call_args_list
+        confirmations = [c for c in calls if "Confirmed" in str(c)]
+        self.assertGreater(len(confirmations), 0, "No confirmation message sent")
+
+    def test_hints_excluded_from_confirmation(self) -> None:
+        """Hint messages (hint:*) are not shown in confirmation."""
+        self.agent.handle_update({})
+        calls = self.mock_bot.send_message.call_args_list
+        for call in calls:
+            msg = str(call)
+            if "Confirmed" in msg:
+                self.assertNotIn("hint:", msg)
+                self.assertNotIn("Already at maximum", msg)
 
 
 if __name__ == "__main__":

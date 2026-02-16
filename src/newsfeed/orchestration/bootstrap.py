@@ -20,13 +20,14 @@ _reload = False
 
 def _handle_signal(signum: int, frame: object) -> None:
     global _shutdown
-    log.info("Received signal %d — shutting down gracefully", signum)
+    # IMPORTANT: only set flag here — logging is not async-signal-safe
+    # and calling log.info() risks deadlock if the logging lock is held.
     _shutdown = True
 
 
 def _handle_reload(signum: int, frame: object) -> None:
     global _reload
-    log.info("Received SIGHUP — will reload configuration")
+    # IMPORTANT: only set flag — see _handle_signal comment.
     _reload = True
 
 
@@ -167,7 +168,7 @@ def _run_bot_loop(engine: NewsFeedEngine, config_dir: Path) -> None:
                     # Update scoring config
                     from newsfeed.models.domain import configure_scoring
                     configure_scoring(new_cfg.pipeline.get("scoring", {}))
-                    log.info("Configuration reloaded successfully (config v%s)", new_cfg.pipeline.get("version", "?"))
+                    log.info("Scoring config reloaded (config v%s). Other changes require restart.", new_cfg.pipeline.get("version", "?"))
                 except Exception:
                     log.exception("Config reload failed — continuing with previous config")
 
@@ -176,7 +177,7 @@ def _run_bot_loop(engine: NewsFeedEngine, config_dir: Path) -> None:
             time.sleep(5)
 
     # Graceful shutdown: flush pending state
-    log.info("Flushing state before shutdown...")
+    log.info("Shutdown signal received — flushing state...")
     try:
         engine.persist_preferences()
     except Exception:
