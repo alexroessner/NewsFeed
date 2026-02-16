@@ -916,13 +916,16 @@ class GenericRSSAgentTests(unittest.TestCase):
     @patch("newsfeed.agents.rss_generic.urlopen")
     def test_generic_rss_novelty_decreases(self, mock_urlopen) -> None:
         """Novelty score should decrease for items lower in the feed."""
+        from datetime import timedelta
         from email.utils import format_datetime
         from newsfeed.agents.npr import NPRAgent
-        # Generate RSS with fresh dates so novelty stays above the 0.3 floor
+        # Generate RSS with fresh dates so novelty stays above the 0.3 floor.
+        # Use timedelta instead of hour replacement to avoid clamping at hour=0
+        # which caused identical timestamps when now.hour < 12.
         now = datetime.now(timezone.utc)
-        d1 = format_datetime(now.replace(hour=max(0, now.hour - 1), minute=0))
-        d2 = format_datetime(now.replace(hour=max(0, now.hour - 6), minute=0))
-        d3 = format_datetime(now.replace(hour=max(0, now.hour - 12), minute=0))
+        d1 = format_datetime(now - timedelta(hours=1))
+        d2 = format_datetime(now - timedelta(hours=6))
+        d3 = format_datetime(now - timedelta(hours=12))
         rss = f"""<?xml version="1.0"?><rss version="2.0"><channel>
             <title>Test</title>
             <item><title>Story A</title><description>Desc A</description>
@@ -1222,47 +1225,41 @@ class StyleReviewAgentTests(unittest.TestCase):
         item = _make_report_item()
         profile = UserProfile(user_id="u1", tone="concise")
         result = agent.review(item, profile)
-        # Should have rewritten why_it_matters (not the original base text)
-        self.assertNotEqual(result.why_it_matters, "Base why text.")
-        # New rewrite uses summary content instead of topic labels
-        self.assertIn("summary", result.why_it_matters.lower())
+        # Should preserve narrative base text (not replace with summary)
+        self.assertIn("Base why text", result.why_it_matters)
 
     def test_analyst_tone_rewrite(self) -> None:
         agent = StyleReviewAgent()
         item = _make_report_item()
         profile = UserProfile(user_id="u1", tone="analyst")
         result = agent.review(item, profile)
-        # Rewrite uses the full summary as content
-        self.assertNotEqual(result.why_it_matters, "Base why text.")
-        self.assertIn("summary", result.why_it_matters.lower())
+        # Preserves narrative base text for all tones
+        self.assertIn("Base why text", result.why_it_matters)
 
     def test_executive_tone_rewrite(self) -> None:
         agent = StyleReviewAgent()
         item = _make_report_item()
         profile = UserProfile(user_id="u1", tone="executive")
         result = agent.review(item, profile)
-        # Tone prefixes are now empty (formatter handles labels);
-        # verify rewrite happened and uses summary content
-        self.assertNotEqual(result.why_it_matters, "Base why text.")
-        self.assertIn("summary", result.why_it_matters.lower())
+        # Preserves narrative base text for all tones
+        self.assertIn("Base why text", result.why_it_matters)
 
     def test_high_priority_topic_personalization(self) -> None:
         agent = StyleReviewAgent()
         item = _make_report_item(topic="ai_policy")
         profile = UserProfile(user_id="u1", topic_weights={"ai_policy": 0.9})
         result = agent.review(item, profile)
-        # _rewrite_why now uses summary content instead of "high-priority" template text
-        self.assertNotEqual(result.why_it_matters, "Base why text.")
-        self.assertIn("summary", result.why_it_matters.lower())
+        # Preserves narrative base text — summary duplication bug is fixed
+        self.assertIn("Base why text", result.why_it_matters)
 
     def test_urgency_framing(self) -> None:
         agent = StyleReviewAgent()
         item = _make_report_item(urgency=UrgencyLevel.BREAKING)
         profile = UserProfile(user_id="u1")
         result = agent.review(item, profile)
-        # Urgency is now shown via icon in the card, not as text prefix
-        # Verify the summary content is still used
-        self.assertIn("summary", result.why_it_matters.lower())
+        # Urgency framing is prepended to the narrative text
+        self.assertIn("Developing rapidly", result.why_it_matters)
+        self.assertIn("Base why text", result.why_it_matters)
 
     def test_what_changed_corroboration(self) -> None:
         agent = StyleReviewAgent()
@@ -1286,10 +1283,9 @@ class StyleReviewAgentTests(unittest.TestCase):
         item = _make_report_item()
         profile = UserProfile(user_id="u1")
         result = agent.review(item, profile)
-        # Persona context is no longer appended to visible output;
-        # verify the review still rewrites the text using summary content
-        self.assertNotEqual(result.why_it_matters, "Base why text.")
-        self.assertIn("summary", result.why_it_matters.lower())
+        # Persona context only affects LLM mode; in heuristic mode
+        # the narrative base text is preserved as-is for routine urgency
+        self.assertIn("Base why text", result.why_it_matters)
 
 
 class ClarityReviewAgentTests(unittest.TestCase):

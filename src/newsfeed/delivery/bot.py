@@ -95,37 +95,59 @@ class TelegramBot:
     # Core API methods
     # ──────────────────────────────────────────────────────────────
 
+    _MAX_RETRIES = 3
+    _RETRY_BASE_DELAY = 1.0  # seconds
+
     def _api_call(self, method: str, params: dict | None = None, data: dict | None = None) -> dict:
-        """Make a Telegram Bot API call."""
+        """Make a Telegram Bot API call with retry on 429 rate limits."""
         url = f"{self._base_url}/{method}"
 
-        try:
-            if data:
-                body = json.dumps(data).encode("utf-8")
-                req = urllib.request.Request(
-                    url,
-                    data=body,
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-            elif params:
-                url = f"{url}?{urlencode(params)}"
-                req = urllib.request.Request(url)
-            else:
-                req = urllib.request.Request(url)
+        for attempt in range(self._MAX_RETRIES + 1):
+            try:
+                if data:
+                    body = json.dumps(data).encode("utf-8")
+                    req = urllib.request.Request(
+                        url,
+                        data=body,
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                elif params:
+                    call_url = f"{url}?{urlencode(params)}"
+                    req = urllib.request.Request(call_url)
+                else:
+                    req = urllib.request.Request(url)
 
-            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-                result = json.loads(resp.read().decode("utf-8"))
+                with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                    result = json.loads(resp.read().decode("utf-8"))
 
-            if not result.get("ok"):
-                log.error("Telegram API error: %s", result.get("description", "unknown"))
+                if not result.get("ok"):
+                    log.error("Telegram API error: %s", result.get("description", "unknown"))
+                    return {}
+
+                return result.get("result", {})
+
+            except urllib.error.HTTPError as e:
+                if e.code == 429 and attempt < self._MAX_RETRIES:
+                    # Respect Retry-After header if present, otherwise exponential backoff
+                    retry_after = None
+                    try:
+                        err_body = json.loads(e.read().decode("utf-8"))
+                        retry_after = err_body.get("parameters", {}).get("retry_after")
+                    except (json.JSONDecodeError, OSError):
+                        pass
+                    delay = retry_after if retry_after else self._RETRY_BASE_DELAY * (2 ** attempt)
+                    delay = min(delay, 30)  # cap at 30s
+                    log.warning("Telegram 429 rate limit on %s, retrying in %.1fs (attempt %d/%d)",
+                                method, delay, attempt + 1, self._MAX_RETRIES)
+                    time.sleep(delay)
+                    continue
+                log.error("Telegram API call %s failed: %s", method, e)
                 return {}
-
-            return result.get("result", {})
-
-        except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, OSError, ValueError) as e:
-            log.error("Telegram API call %s failed: %s", method, e)
-            return {}
+            except (urllib.error.URLError, json.JSONDecodeError, OSError, ValueError) as e:
+                log.error("Telegram API call %s failed: %s", method, e)
+                return {}
+        return {}
 
     def get_me(self) -> dict:
         """Verify bot token and get bot info."""
