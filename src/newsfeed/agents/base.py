@@ -42,7 +42,7 @@ class ResearchAgent(ABC):
 
     async def run_async(self, task: ResearchTask, top_k: int = 5) -> list[CandidateItem]:
         """Run agent in a thread pool for true I/O parallelism."""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self.run, task, top_k)
 
     # Synonym expansion for topic matching — a story about "NATO" or "sanctions"

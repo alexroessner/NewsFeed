@@ -84,9 +84,11 @@ class TestFullPipeline(unittest.TestCase):
         """Preferences survive save/restore cycle."""
         from newsfeed.memory.store import StatePersistence
         import tempfile
+        uid = f"persist-test-{id(self)}"  # Unique per run to avoid stale state
         with tempfile.TemporaryDirectory() as tmpdir:
             storage = StatePersistence(Path(tmpdir))
-            self.engine.preferences.apply_weight_adjustment("persist-test", "crypto", 0.5)
+            self.engine.preferences.apply_weight_adjustment(uid, "crypto", 0.5)
+            expected = self.engine.preferences.get_or_create(uid).topic_weights.get("crypto", 0.0)
             count = self.engine.preferences.persist(storage)
             self.assertGreater(count, 0)
             # Create fresh store and restore
@@ -94,8 +96,8 @@ class TestFullPipeline(unittest.TestCase):
             fresh = PreferenceStore()
             restored = fresh.restore(storage)
             self.assertGreater(restored, 0)
-            profile = fresh.get_or_create("persist-test")
-            self.assertAlmostEqual(profile.topic_weights.get("crypto", 0.0), 0.5, places=2)
+            profile = fresh.get_or_create(uid)
+            self.assertAlmostEqual(profile.topic_weights.get("crypto", 0.0), expected, places=2)
 
     def test_empty_research_produces_diagnostic(self) -> None:
         """When research returns nothing, payload metadata reflects it."""
