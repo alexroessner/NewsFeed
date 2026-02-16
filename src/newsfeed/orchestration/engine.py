@@ -507,7 +507,7 @@ class NewsFeedEngine:
                     "agents_total": len(self.config.get("research_agents", [])),
                     "agents_contributing": len(by_agent),
                     "agents_silent": len(self.config.get("research_agents", [])) - len(by_agent),
-                    "stages_succeeded": list(self._enabled_stages),
+                    "stages_enabled": list(self._enabled_stages),
                     "total_candidates": len(all_candidates),
                 },
             },

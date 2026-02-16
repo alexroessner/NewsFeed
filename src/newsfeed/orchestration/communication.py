@@ -135,6 +135,7 @@ class CommunicationAgent:
         # Per-user rate limiting for resource-intensive commands
         self._rate_limits: BoundedUserDict[float] = BoundedUserDict(maxlen=500)
         self._RATE_LIMIT_SECONDS = 15  # Min seconds between briefing/sitrep/quick
+        self._cmd_rate_windows: dict[str, list[float]] = {}  # Per-command sliding window
         # Alert dedup: track which alerts have been sent to avoid repeat notifications.
         # Key: "user_id:alert_type:region_or_topic", Value: monotonic timestamp.
         self._sent_alerts: dict[str, float] = {}
@@ -251,12 +252,14 @@ class CommunicationAgent:
         max_requests, window_secs = limits
         now = time.monotonic()
         key = f"{user_id}:{command}"
-        if not hasattr(self, "_cmd_rate_windows"):
-            self._cmd_rate_windows: dict[str, list[float]] = {}
         timestamps = self._cmd_rate_windows.get(key, [])
         # Expire old timestamps
         timestamps = [t for t in timestamps if now - t < window_secs]
+        if not timestamps:
+            # Clean up empty key to prevent unbounded growth
+            self._cmd_rate_windows.pop(key, None)
         if len(timestamps) >= max_requests:
+            self._cmd_rate_windows[key] = timestamps
             return True
         timestamps.append(now)
         self._cmd_rate_windows[key] = timestamps
@@ -279,7 +282,12 @@ class CommunicationAgent:
 
         # Per-command rate limits for lighter commands
         if self._check_command_rate_limit(user_id, command):
-            self._bot.send_message(chat_id, "Too many requests — please wait a moment.")
+            limits = self._COMMAND_RATE_LIMITS.get(command)
+            window = limits[1] if limits else 60
+            self._bot.send_message(
+                chat_id,
+                f"Too many /{command} requests — please wait up to {window}s.",
+            )
             return {"action": "command_rate_limited", "user_id": user_id, "command": command}
 
         if command == "more":
