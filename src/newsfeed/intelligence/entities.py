@@ -162,9 +162,17 @@ def format_entity_dashboard(items: list) -> dict[str, Any]:
             countries[entity].append(idx)
 
     # Find entity connections (entities that co-occur in stories)
+    # Cap entities to prevent O(n²) connection building with large inputs.
+    # Keep only the most-referenced entities (appear in most stories).
+    _MAX_ENTITIES_FOR_CONNECTIONS = 50
     all_entities: dict[str, set[int]] = {}
     for name, indices in {**people, **organizations, **countries}.items():
         all_entities[name] = set(indices)
+
+    # If too many entities, keep only top N by story count
+    if len(all_entities) > _MAX_ENTITIES_FOR_CONNECTIONS:
+        sorted_ents = sorted(all_entities.items(), key=lambda kv: -len(kv[1]))
+        all_entities = dict(sorted_ents[:_MAX_ENTITIES_FOR_CONNECTIONS])
 
     connections: list[tuple[str, str, int]] = []
     entity_names = list(all_entities.keys())
