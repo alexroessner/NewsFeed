@@ -10,12 +10,18 @@ Covers:
 - LLM prompt sanitization
 - Zero-yield agent detection
 - Source-add rate limiting
+- Alert dedup sentinel fix
+- Secrets file cleanup
+- Analytics DB TTL cleanup
+- Store thread safety (RLock)
 """
 from __future__ import annotations
 
+import os
 import time
 import unittest
 from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 
@@ -376,6 +382,205 @@ class TestSourceAddRateLimit(unittest.TestCase):
         # Next call should be rate-limited
         result = agent._source_add(123, "user1", "https://feed99.example.com")
         self.assertEqual(result["action"], "source_add_rate_limited")
+
+
+# ── 10. Alert Dedup Sentinel Fix ──────────────────────────────────────
+
+
+class TestAlertDedupSentinel(unittest.TestCase):
+    """Verify alert dedup doesn't suppress the first alert on fresh processes.
+
+    Bug: default sentinel of 0 for missing keys meant that if
+    time.monotonic() < ALERT_COOLDOWN (process running < 1 hour), the
+    first alert was incorrectly suppressed.
+    """
+
+    def test_first_alert_not_suppressed(self):
+        """First alert should always fire regardless of process uptime."""
+        from newsfeed.orchestration.communication import CommunicationAgent
+
+        engine = MagicMock()
+        engine.preferences.get_or_create.return_value = MagicMock(
+            webhook_url="", email="", topic_weights={}, source_weights={},
+            regions_of_interest=[], muted_topics=[], tracked_stories=[],
+            alert_keywords=[], watchlist_crypto=[], watchlist_stocks=[],
+            confidence_min=0, urgency_min="", max_per_source=0,
+            max_items=10, tone="concise", format="sections",
+            briefing_cadence="morning", timezone="UTC",
+            alert_georisk_threshold=0.5, alert_trend_threshold=3.0,
+            presets={},
+        )
+        engine.preferences.snapshot.return_value = {
+            "user1": {
+                "alert_georisk_threshold": 0.5,
+                "regions": ["Test Region"],
+                "topic_weights": {},
+                "alert_trend_threshold": 3.0,
+            }
+        }
+        engine.georisk.snapshot.return_value = {"test_region": 0.9}
+        engine.trends.snapshot.return_value = {}
+        engine.formatter.format_intelligence_alert.return_value = "Alert!"
+        engine.analytics.get_user_summary.return_value = {"chat_id": "123"}
+
+        bot = MagicMock()
+        agent = CommunicationAgent(engine=engine, bot=bot)
+
+        # This should send 1 alert even if time.monotonic() is small
+        sent = agent.check_intelligence_alerts()
+        self.assertEqual(sent, 1)
+
+
+# ── 11. Secrets Cleanup in run_scheduled ──────────────────────────────
+
+
+class TestSecretsCleanup(unittest.TestCase):
+    """Verify _inject_env_secrets returns whether it created a file."""
+
+    @patch.dict("os.environ", {
+        "TELEGRAM_BOT_TOKEN": "", "GEMINI_API_KEY": "",
+        "GUARDIAN_API_KEY": "", "ANTHROPIC_API_KEY": "",
+        "X_BEARER_TOKEN": "",
+    }, clear=False)
+    def test_returns_false_when_no_env_vars(self):
+        from newsfeed.run_scheduled import _inject_env_secrets
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = _inject_env_secrets(Path(tmpdir))
+            self.assertFalse(result)
+
+    def test_returns_false_when_file_exists(self):
+        from newsfeed.run_scheduled import _inject_env_secrets
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            secrets_path = Path(tmpdir) / "secrets.json"
+            secrets_path.write_text("{}")
+            result = _inject_env_secrets(Path(tmpdir))
+            self.assertFalse(result)
+
+    @patch.dict("os.environ", {"TELEGRAM_BOT_TOKEN": "test_token_123"})
+    def test_returns_true_when_created(self):
+        from newsfeed.run_scheduled import _inject_env_secrets
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = _inject_env_secrets(Path(tmpdir))
+            self.assertTrue(result)
+            # Verify file was written
+            secrets_path = Path(tmpdir) / "secrets.json"
+            self.assertTrue(secrets_path.exists())
+
+
+# ── 12. Analytics DB Cleanup/TTL ──────────────────────────────────────
+
+
+class TestAnalyticsCleanup(unittest.TestCase):
+    """Verify the analytics DB cleanup method removes old records."""
+
+    def test_cleanup_returns_dict(self):
+        import tempfile
+        from newsfeed.db.analytics import AnalyticsDB
+
+        with tempfile.NamedTemporaryFile(suffix=".db") as f:
+            db = AnalyticsDB(f.name)
+            result = db.cleanup_old_records(retention_days=90)
+            self.assertIsInstance(result, dict)
+
+    def test_cleanup_deletes_old_interactions(self):
+        import tempfile
+        from newsfeed.db.analytics import AnalyticsDB
+
+        with tempfile.NamedTemporaryFile(suffix=".db") as f:
+            db = AnalyticsDB(f.name)
+            # Insert old and new records
+            old_ts = time.time() - 200 * 86400  # 200 days ago
+            new_ts = time.time() - 5 * 86400     # 5 days ago
+            conn = db._conn()
+            conn.execute(
+                "INSERT INTO interactions (ts, user_id, interaction_type) VALUES (?, ?, ?)",
+                (old_ts, "u1", "test_old"),
+            )
+            conn.execute(
+                "INSERT INTO interactions (ts, user_id, interaction_type) VALUES (?, ?, ?)",
+                (new_ts, "u1", "test_new"),
+            )
+            conn.commit()
+
+            result = db.cleanup_old_records(retention_days=90)
+            self.assertEqual(result.get("interactions", 0), 1)
+
+            # Verify new record still exists
+            row = conn.execute(
+                "SELECT COUNT(*) FROM interactions WHERE interaction_type = 'test_new'"
+            ).fetchone()
+            self.assertEqual(row[0], 1)
+
+
+# ── 13. Store Thread Safety ──────────────────────────────────────────
+
+
+class TestStoreThreadSafety(unittest.TestCase):
+    """Verify PreferenceStore uses reentrant lock and get_or_create is safe."""
+
+    def test_get_or_create_is_thread_safe(self):
+        import threading
+        from newsfeed.memory.store import PreferenceStore
+
+        store = PreferenceStore()
+        errors: list[Exception] = []
+
+        def create_user(uid):
+            try:
+                for _ in range(50):
+                    store.get_or_create(uid)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=create_user, args=(f"user_{i}",)) for i in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(len(errors), 0)
+        # All 10 users should exist
+        for i in range(10):
+            self.assertIn(f"user_{i}", store._profiles)
+
+    def test_rlock_allows_nested_calls(self):
+        """apply_weight_adjustment holds lock and calls get_or_create — should not deadlock."""
+        from newsfeed.memory.store import PreferenceStore
+
+        store = PreferenceStore()
+        profile, hint = store.apply_weight_adjustment("u1", "tech", 0.5)
+        self.assertEqual(profile.topic_weights["tech"], 0.5)
+
+    def test_reset_is_thread_safe(self):
+        """reset() should work concurrently without errors."""
+        import threading
+        from newsfeed.memory.store import PreferenceStore
+
+        store = PreferenceStore()
+        store.get_or_create("u1")
+        store.apply_weight_adjustment("u1", "tech", 0.8)
+
+        errors: list[Exception] = []
+
+        def reset_user():
+            try:
+                store.reset("u1")
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=reset_user) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(len(errors), 0)
 
 
 if __name__ == "__main__":

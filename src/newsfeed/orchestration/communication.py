@@ -1851,7 +1851,8 @@ class CommunicationAgent:
                     # Dedup: skip if same alert was sent recently
                     alert_key = f"{user_id}:georisk:{region}"
                     now = time.monotonic()
-                    if now - self._sent_alerts.get(alert_key, 0) < self._ALERT_COOLDOWN:
+                    last_sent = self._sent_alerts.get(alert_key)
+                    if last_sent is not None and now - last_sent < self._ALERT_COOLDOWN:
                         continue
                     msg = formatter.format_intelligence_alert("georisk", alert_data)
                     self._bot.send_message(user_id, msg)
@@ -1881,7 +1882,8 @@ class CommunicationAgent:
                     # Dedup: skip if same alert was sent recently
                     alert_key = f"{user_id}:trend:{topic}"
                     now = time.monotonic()
-                    if now - self._sent_alerts.get(alert_key, 0) < self._ALERT_COOLDOWN:
+                    last_sent = self._sent_alerts.get(alert_key)
+                    if last_sent is not None and now - last_sent < self._ALERT_COOLDOWN:
                         continue
                     msg = formatter.format_intelligence_alert("trend", alert_data)
                     self._bot.send_message(user_id, msg)
