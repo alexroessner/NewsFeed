@@ -1210,9 +1210,10 @@ class AnalyticsDB:
         for child_table in ("candidates", "expert_votes"):
             try:
                 if self._d1:
-                    self._d1.execute(
+                    result = self._d1.execute(
                         f"DELETE FROM {child_table} WHERE request_id NOT IN (SELECT request_id FROM requests)"
                     )
+                    deleted[child_table] = result.get("changes", 0) if isinstance(result, dict) else 0
                 else:
                     conn = self._conn()
                     cursor = conn.execute(

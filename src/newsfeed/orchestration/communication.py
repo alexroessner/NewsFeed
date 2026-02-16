@@ -277,6 +277,11 @@ class CommunicationAgent:
         if command == "briefing":
             return self._run_briefing(chat_id, user_id, args)
 
+        # Per-command rate limits for lighter commands
+        if self._check_command_rate_limit(user_id, command):
+            self._bot.send_message(chat_id, "Too many requests — please wait a moment.")
+            return {"action": "command_rate_limited", "user_id": user_id, "command": command}
+
         if command == "more":
             return self._show_more(chat_id, user_id, args)
 
