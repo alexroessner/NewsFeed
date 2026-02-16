@@ -159,16 +159,21 @@ class StyleReviewAgent:
 
     def _rewrite_why(self, base: str, c: CandidateItem, profile: UserProfile,
                      templates: dict[str, str]) -> str:
-        # Use the full summary as the basis — it's the actual story content
-        summary = c.summary.strip()
-        if not summary:
-            summary = c.title.strip()
+        # Use the narrative-generated base text — it explains *why* the story
+        # matters (source quality, corroboration, urgency, user alignment).
+        # The summary is already shown separately; duplicating it here wastes
+        # the reader's time and discards the pipeline's analytical value.
+        text = base.strip()
+        if not text:
+            # Fallback only if narrative generation returned nothing
+            text = c.title.strip()
 
-        # Corroboration adds genuine editorial value
-        if c.corroborated_by:
-            summary += f" Confirmed by {', '.join(c.corroborated_by[:2])}."
+        # Add urgency framing if not already present
+        urgency_prefix = self._urgency_framing.get(c.urgency, "")
+        if urgency_prefix and urgency_prefix.strip().rstrip(".").lower() not in text.lower():
+            text = f"{urgency_prefix}{text}"
 
-        return summary
+        return text
 
     def _rewrite_changed(self, base: str, c: CandidateItem,
                          templates: dict[str, str]) -> str:
