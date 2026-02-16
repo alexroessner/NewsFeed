@@ -286,6 +286,10 @@ class ExpertCouncil:
         if w_sum > 0:
             score /= w_sum
 
+        # Guard against NaN/Inf from upstream score calculations
+        if not math.isfinite(score):
+            score = 0.5
+
         keep = score >= self.keep_threshold
         confidence = min(self.confidence_max, max(self.confidence_min, score))
 

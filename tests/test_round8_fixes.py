@@ -393,22 +393,22 @@ class TestTelegram429Retry(unittest.TestCase):
         self.assertEqual(mock_sleep.call_count, bot._MAX_RETRIES)
 
     @patch("newsfeed.delivery.bot.urllib.request.urlopen")
-    def test_non_429_error_not_retried(self, mock_urlopen):
-        """Non-429 HTTP errors should not trigger retry."""
+    def test_client_error_not_retried(self, mock_urlopen):
+        """HTTP 4xx client errors (except 429) should not trigger retry."""
         import urllib.error
 
-        err_500 = urllib.error.HTTPError(
+        err_403 = urllib.error.HTTPError(
             "https://api.telegram.org/bot123/test",
-            500, "Internal Server Error", {},
+            403, "Forbidden", {},
             MagicMock(read=MagicMock(return_value=b'{}'))
         )
-        mock_urlopen.side_effect = err_500
+        mock_urlopen.side_effect = err_403
 
         bot = TelegramBot("test_token")
         result = bot._api_call("test")
 
         self.assertEqual(result, {})
-        self.assertEqual(mock_urlopen.call_count, 1)  # No retry
+        self.assertEqual(mock_urlopen.call_count, 1)  # No retry for client errors
 
 
 # ══════════════════════════════════════════════════════════════════════════
