@@ -135,6 +135,11 @@ class CommunicationAgent:
         # Per-user rate limiting for resource-intensive commands
         self._rate_limits: BoundedUserDict[float] = BoundedUserDict(maxlen=500)
         self._RATE_LIMIT_SECONDS = 15  # Min seconds between briefing/sitrep/quick
+        # Alert dedup: track which alerts have been sent to avoid repeat notifications.
+        # Key: "user_id:alert_type:region_or_topic", Value: monotonic timestamp.
+        self._sent_alerts: dict[str, float] = {}
+        _ALERT_COOLDOWN_SECONDS = 3600  # 1 hour between identical alerts
+        self._ALERT_COOLDOWN = _ALERT_COOLDOWN_SECONDS
         # Onboarding state for interactive setup flow
         self._onboarding: BoundedUserDict[OnboardingState] = BoundedUserDict(maxlen=500)
         # Handler context for delegated command modules
@@ -1783,6 +1788,13 @@ class CommunicationAgent:
         sent = 0
         formatter = self._engine.formatter
 
+        # Evict expired alert dedup entries to prevent unbounded growth
+        now = time.monotonic()
+        self._sent_alerts = {
+            k: v for k, v in self._sent_alerts.items()
+            if now - v < self._ALERT_COOLDOWN
+        }
+
         # Check geo-risks from last pipeline run
         last_georisks = self._engine.georisk.snapshot()
         for region, risk_level in last_georisks.items():
@@ -1804,9 +1816,16 @@ class CommunicationAgent:
                 regions = profile_data.get("regions", [])
                 region_norm = {r.lower().replace(" ", "_") for r in regions}
                 if region.lower().replace(" ", "_") in region_norm:
+                    # Dedup: skip if same alert was sent recently
+                    alert_key = f"{user_id}:georisk:{region}"
+                    now = time.monotonic()
+                    if now - self._sent_alerts.get(alert_key, 0) < self._ALERT_COOLDOWN:
+                        continue
                     msg = formatter.format_intelligence_alert("georisk", alert_data)
                     self._bot.send_message(user_id, msg)
                     self._auto_webhook_alert(user_id, "georisk", alert_data)
+                    self._sent_alerts[alert_key] = now
+                    self._delivery_metrics.record_success("telegram")
                     sent += 1
 
         # Check trend spikes
@@ -1827,9 +1846,16 @@ class CommunicationAgent:
                     continue
                 weights = profile_data.get("topic_weights", {})
                 if weights.get(topic, 0) > 0.3:
+                    # Dedup: skip if same alert was sent recently
+                    alert_key = f"{user_id}:trend:{topic}"
+                    now = time.monotonic()
+                    if now - self._sent_alerts.get(alert_key, 0) < self._ALERT_COOLDOWN:
+                        continue
                     msg = formatter.format_intelligence_alert("trend", alert_data)
                     self._bot.send_message(user_id, msg)
                     self._auto_webhook_alert(user_id, "trend", alert_data)
+                    self._sent_alerts[alert_key] = now
+                    self._delivery_metrics.record_success("telegram")
                     sent += 1
 
         return sent
@@ -2139,6 +2165,21 @@ class CommunicationAgent:
             self._record_webhook_failure(user_id, profile)
             self._delivery_metrics.record_failure("webhook")
 
+    def _resolve_chat_id(self, user_id: str) -> str | int | None:
+        """Resolve a user_id to their most recent chat_id for notifications.
+
+        In Telegram DMs, chat_id == user_id, so we fall back to that if
+        analytics doesn't have a record.
+        """
+        try:
+            summary = self._engine.analytics.get_user_summary(user_id)
+            if summary and summary.get("chat_id"):
+                return summary["chat_id"]
+        except Exception:
+            pass
+        # In Telegram DMs, user_id works as chat_id
+        return user_id
+
     def _record_webhook_failure(self, user_id: str, profile) -> None:
         """Track webhook failures and disable after too many consecutive ones."""
         count = self._webhook_fail_counts.get(user_id, 0) + 1
@@ -2168,12 +2209,23 @@ class CommunicationAgent:
         try:
             from newsfeed.delivery.webhook import (
                 _detect_platform, format_alert_payload, send_webhook,
+                validate_webhook_url,
             )
+            # Re-validate URL at delivery time (same as briefing webhook)
+            valid, _err = validate_webhook_url(profile.webhook_url)
+            if not valid:
+                log.warning("Webhook alert URL failed re-validation for user=%s: %s", user_id, _err)
+                return
             platform = _detect_platform(profile.webhook_url)
             payload = format_alert_payload(alert_type, alert_data, platform)
-            send_webhook(profile.webhook_url, payload)
+            success = send_webhook(profile.webhook_url, payload)
+            if success:
+                self._delivery_metrics.record_success("webhook")
+            else:
+                self._delivery_metrics.record_failure("webhook")
         except Exception:
             log.debug("Webhook alert failed for user=%s", user_id, exc_info=True)
+            self._delivery_metrics.record_failure("webhook")
 
     @staticmethod
     def _build_continuity_summary(delta_tags: list[str], tracked_count: int) -> str:
@@ -3171,7 +3223,8 @@ class CommunicationAgent:
                 "/admin request [id] \u2014 Full request detail\n"
                 "/admin topics \u2014 Top topics (30 days)\n"
                 "/admin sources \u2014 Top sources (30 days)\n"
-                "/admin briefings [user_id] \u2014 User briefing history"
+                "/admin briefings [user_id] \u2014 User briefing history\n"
+                "/admin health \u2014 Delivery success rates"
             ))
             return {"action": "admin_help", "user_id": user_id}
 
