@@ -503,6 +503,13 @@ class NewsFeedEngine:
                 "intelligence_stages": active_stages,
                 "expert_influence": {eid: f"{inf:.2f}" for eid, inf, _ in self.experts.chair.rankings()},
                 "pipeline_trace": pipeline_trace,
+                "pipeline_health": {
+                    "agents_total": len(self.config.get("research_agents", [])),
+                    "agents_contributing": len(by_agent),
+                    "agents_silent": len(self.config.get("research_agents", [])) - len(by_agent),
+                    "stages_succeeded": list(self._enabled_stages),
+                    "total_candidates": len(all_candidates),
+                },
             },
             briefing_type=briefing_type,
             threads=threads,

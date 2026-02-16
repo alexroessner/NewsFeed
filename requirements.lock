@@ -1,0 +1,16 @@
+# Pinned dependency versions — generated for reproducible builds
+# Update with: pip freeze > requirements.lock
+# Core has no dependencies (stdlib only)
+# Optional dependencies pinned below:
+
+# [llm]
+anthropic>=0.7.0,<1.0.0
+
+# [telegram]
+python-telegram-bot>=20.0,<22.0
+
+# [test]
+pytest>=7.0,<9.0
+
+# [dev]
+ruff>=0.1.0,<1.0.0

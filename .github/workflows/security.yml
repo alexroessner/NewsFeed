@@ -1,0 +1,30 @@
+name: Security Scan
+
+on:
+  push:
+    branches: [main, work]
+  pull_request:
+  schedule:
+    - cron: '0 8 * * 1'  # Weekly Monday 8am
+
+jobs:
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install bandit safety
+
+      - name: Run Bandit (SAST)
+        run: bandit -r src/ -f json -o bandit-report.json || true
+
+      - name: Display Bandit results
+        run: bandit -r src/ -ll
+
+      - name: Check dependencies for known vulnerabilities
+        run: pip install -e ".[all]" && safety check || true

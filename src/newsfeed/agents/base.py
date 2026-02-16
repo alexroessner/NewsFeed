@@ -41,9 +41,9 @@ class ResearchAgent(ABC):
         """Fetch and return candidate items for the given task."""
 
     async def run_async(self, task: ResearchTask, top_k: int = 5) -> list[CandidateItem]:
-        """Async wrapper — subclasses can override for true async I/O."""
-        await asyncio.sleep(0)
-        return self.run(task, top_k=top_k)
+        """Run agent in a thread pool for true I/O parallelism."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self.run, task, top_k)
 
     # Synonym expansion for topic matching — a story about "NATO" or "sanctions"
     # should score high for the "geopolitics" topic even if "geopolitics" doesn't

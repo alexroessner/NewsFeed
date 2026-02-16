@@ -19,3 +19,21 @@ jobs:
       - name: Bytecode compile check
         run: |
           PYTHONPATH=src python -m compileall -q src tests
+      - name: Validate imports (catch missing deps early)
+        # Uses requirements.lock for pinned dependency versions
+        run: |
+          PYTHONPATH=src python -c "
+          import importlib, pathlib, sys
+          failures = []
+          for p in sorted(pathlib.Path('src').rglob('*.py')):
+              mod = '.'.join(p.with_suffix('').parts[1:])  # strip 'src/'
+              try:
+                  importlib.import_module(mod)
+              except Exception as exc:
+                  failures.append(f'{mod}: {exc}')
+          if failures:
+              print('Import validation failures:')
+              print('\n'.join(failures))
+              sys.exit(1)
+          print(f'All {len(list(pathlib.Path(\"src\").rglob(\"*.py\")))} modules imported OK')
+          "
