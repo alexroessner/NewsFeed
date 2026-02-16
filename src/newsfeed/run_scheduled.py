@@ -38,14 +38,23 @@ def main() -> None:
     if not config_dir.is_dir():
         config_dir = Path("config")
 
-    # Inject secrets from env vars (GH Actions)
-    _inject_env_secrets(config_dir)
+    # Inject secrets from env vars (GH Actions) then clean up after loading
+    secrets_created = _inject_env_secrets(config_dir)
 
     try:
         cfg = load_runtime_config(config_dir)
     except ConfigError as e:
         log.error("Configuration error: %s", e)
         sys.exit(1)
+    finally:
+        # Remove ephemeral secrets file immediately after config is loaded
+        # to avoid leaving credentials on disk longer than necessary.
+        if secrets_created:
+            secrets_path = config_dir / "secrets.json"
+            try:
+                secrets_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     personas_dir = root / "config" / "personas"
     engine = NewsFeedEngine(
@@ -74,11 +83,14 @@ def main() -> None:
         log.info("Default briefing sent to %s", owner_id)
 
 
-def _inject_env_secrets(config_dir: Path) -> None:
-    """Write a temporary secrets.json from environment variables."""
+def _inject_env_secrets(config_dir: Path) -> bool:
+    """Write an ephemeral secrets.json from environment variables.
+
+    Returns True if a new secrets file was created (caller should clean up).
+    """
     secrets_path = config_dir / "secrets.json"
     if secrets_path.exists():
-        return
+        return False
 
     env_map = {
         "telegram_bot_token": "TELEGRAM_BOT_TOKEN",
@@ -96,6 +108,8 @@ def _inject_env_secrets(config_dir: Path) -> None:
 
     if secrets:
         secrets_path.write_text(json.dumps(secrets, indent=2))
+        return True
+    return False
 
 
 if __name__ == "__main__":

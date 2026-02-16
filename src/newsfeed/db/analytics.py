@@ -1102,3 +1102,57 @@ class AnalyticsDB:
             "trends": trends,
             "days": days,
         }
+
+    # ──────────────────────────────────────────────────────────────
+    # Retention / TTL cleanup — prevents unbounded DB growth
+    # ──────────────────────────────────────────────────────────────
+
+    def cleanup_old_records(self, retention_days: int = 90) -> dict[str, int]:
+        """Delete records older than *retention_days* from high-volume tables.
+
+        Returns a dict mapping table name → rows deleted.  Fire-and-forget:
+        errors are logged but never propagate.
+
+        Recommended to call periodically (e.g. weekly via cron) to prevent
+        the analytics database from growing without bound.
+        """
+        cutoff = time.time() - retention_days * 86400
+        tables_and_cols = [
+            ("interactions", "ts"),
+            ("candidates", "ts"),
+            ("expert_votes", "ts"),
+            ("feedback", "ts"),
+            ("ratings", "ts"),
+            ("preference_changes", "ts"),
+            ("georisk_snapshots", "ts"),
+            ("trend_snapshots", "ts"),
+            ("credibility_snapshots", "ts"),
+            ("expert_snapshots", "ts"),
+            ("agent_performance", "ts"),
+        ]
+        deleted: dict[str, int] = {}
+        for table, col in tables_and_cols:
+            try:
+                if self._d1:
+                    result = self._d1.execute(
+                        f"DELETE FROM {table} WHERE {col} < ?", (cutoff,)
+                    )
+                    deleted[table] = result.get("changes", 0) if isinstance(result, dict) else 0
+                else:
+                    conn = self._conn()
+                    cursor = conn.execute(
+                        f"DELETE FROM {table} WHERE {col} < ?", (cutoff,)
+                    )
+                    deleted[table] = cursor.rowcount
+                    conn.commit()
+            except Exception:
+                log.debug("cleanup_old_records: skipped %s (table may not exist)", table)
+                deleted[table] = 0
+
+        total = sum(deleted.values())
+        if total > 0:
+            log.info(
+                "Analytics cleanup: deleted %d records older than %d days",
+                total, retention_days,
+            )
+        return deleted

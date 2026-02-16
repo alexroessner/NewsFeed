@@ -105,13 +105,16 @@ class PreferenceStore:
 
     def __init__(self) -> None:
         self._profiles: BoundedUserDict[UserProfile] = BoundedUserDict(maxlen=self.MAX_USERS)
-        self._lock = threading.Lock()
+        # RLock allows reentrant locking: methods that already hold the lock
+        # (e.g. apply_weight_adjustment) can safely call get_or_create.
+        self._lock = threading.RLock()
         self._weight_timestamps: dict[str, dict[str, float]] = {}  # user_id -> {topic: last_updated_ts}
 
     def get_or_create(self, user_id: str) -> UserProfile:
-        if user_id not in self._profiles:
-            self._profiles[user_id] = UserProfile(user_id=user_id)
-        return self._profiles[user_id]
+        with self._lock:
+            if user_id not in self._profiles:
+                self._profiles[user_id] = UserProfile(user_id=user_id)
+            return self._profiles[user_id]
 
     MAX_WEIGHTS = 100  # Max distinct topic/source weight entries per user
 
@@ -461,21 +464,22 @@ class PreferenceStore:
 
     def reset(self, user_id: str) -> UserProfile:
         """Reset all user preferences to defaults."""
-        profile = self.get_or_create(user_id)
-        profile.topic_weights.clear()
-        profile.source_weights.clear()
-        profile.regions_of_interest.clear()
-        profile.muted_topics.clear()
-        profile.tone = "concise"
-        profile.format = "bullet"
-        profile.max_items = 10
-        profile.briefing_cadence = "on_demand"
-        profile.timezone = "UTC"
-        profile.confidence_min = 0.0
-        profile.urgency_min = ""
-        profile.max_per_source = 0
-        profile.alert_georisk_threshold = 0.5
-        profile.alert_trend_threshold = 3.0
+        with self._lock:
+            profile = self.get_or_create(user_id)
+            profile.topic_weights.clear()
+            profile.source_weights.clear()
+            profile.regions_of_interest.clear()
+            profile.muted_topics.clear()
+            profile.tone = "concise"
+            profile.format = "bullet"
+            profile.max_items = 10
+            profile.briefing_cadence = "on_demand"
+            profile.timezone = "UTC"
+            profile.confidence_min = 0.0
+            profile.urgency_min = ""
+            profile.max_per_source = 0
+            profile.alert_georisk_threshold = 0.5
+            profile.alert_trend_threshold = 3.0
         # Keep watchlists, tracked stories, bookmarks, and email on reset — those are data, not weights
         return profile
 
@@ -619,42 +623,43 @@ class PreferenceStore:
 
         Returns number of weights decayed.
         """
-        profile = self._profiles.get(user_id)
-        if not profile:
-            return 0
-        now = time.time()
-        half_life_secs = self.DECAY_HALF_LIFE_DAYS * 86400
-        user_ts = self._weight_timestamps.get(user_id, {})
-        decayed = 0
+        with self._lock:
+            profile = self._profiles.get(user_id)
+            if not profile:
+                return 0
+            now = time.time()
+            half_life_secs = self.DECAY_HALF_LIFE_DAYS * 86400
+            user_ts = self._weight_timestamps.get(user_id, {})
+            decayed = 0
 
-        for weights_dict in (profile.topic_weights, profile.source_weights):
-            to_update: list[tuple[str, float]] = []
-            for key, value in weights_dict.items():
-                last_touch = user_ts.get(key, now - half_life_secs)
-                age_secs = now - last_touch
-                if age_secs < half_life_secs * 0.5:
-                    continue  # too recent to decay
-                # Exponential decay: value * 0.5^(age / half_life)
-                decay_factor = 0.5 ** (age_secs / half_life_secs)
-                new_val = value * decay_factor
-                # Snap small values to zero (threshold at 0.05, not 0.01,
-                # to avoid rounding artifacts where round(x, 3) = x)
-                if abs(new_val) < 0.05:
-                    new_val = 0.0
-                else:
-                    new_val = round(new_val, 3)
-                if new_val != value:
-                    to_update.append((key, new_val))
-                    decayed += 1
-            for key, new_val in to_update:
-                weights_dict[key] = new_val
+            for weights_dict in (profile.topic_weights, profile.source_weights):
+                to_update: list[tuple[str, float]] = []
+                for key, value in weights_dict.items():
+                    last_touch = user_ts.get(key, now - half_life_secs)
+                    age_secs = now - last_touch
+                    if age_secs < half_life_secs * 0.5:
+                        continue  # too recent to decay
+                    # Exponential decay: value * 0.5^(age / half_life)
+                    decay_factor = 0.5 ** (age_secs / half_life_secs)
+                    new_val = value * decay_factor
+                    # Snap small values to zero (threshold at 0.05, not 0.01,
+                    # to avoid rounding artifacts where round(x, 3) = x)
+                    if abs(new_val) < 0.05:
+                        new_val = 0.0
+                    else:
+                        new_val = round(new_val, 3)
+                    if new_val != value:
+                        to_update.append((key, new_val))
+                        decayed += 1
+                for key, new_val in to_update:
+                    weights_dict[key] = new_val
 
-        # Prune zero weights after decay
-        if decayed:
-            self._prune_zero_weights(profile.topic_weights)
-            self._prune_zero_weights(profile.source_weights)
+            # Prune zero weights after decay
+            if decayed:
+                self._prune_zero_weights(profile.topic_weights)
+                self._prune_zero_weights(profile.source_weights)
 
-        return decayed
+            return decayed
 
     # ── GDPR data export/deletion ────────────────────────────────
 
