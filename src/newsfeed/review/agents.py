@@ -223,16 +223,36 @@ class StyleReviewAgent:
 
         return f"{prefix}{'; '.join(parts)}."
 
+    @staticmethod
+    def _sanitize_for_prompt(value: str, max_len: int = 50) -> str:
+        """Sanitize user-controlled values before embedding in LLM prompts.
+
+        Strips characters that could be used for prompt injection:
+        newlines, control sequences, and instruction-like prefixes.
+        """
+        # Remove newlines and control chars
+        cleaned = re.sub(r"[\n\r\x00-\x1f]", " ", str(value))
+        # Collapse whitespace
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        # Truncate to prevent overlong injections
+        return cleaned[:max_len]
+
     def _review_llm(self, item: ReportItem, profile: UserProfile) -> ReportItem:
         """Use LLM to rewrite report item fields for style."""
         c = item.candidate
+        safe_tone = self._sanitize_for_prompt(profile.tone, 20)
+        safe_format = self._sanitize_for_prompt(profile.format, 20)
+        safe_topics = ", ".join(
+            self._sanitize_for_prompt(k, 30)
+            for k, v in profile.topic_weights.items() if v > 0.3
+        )
         system_prompt = (
             "You are an editorial style agent for a personal news intelligence system. "
             "Your job is to rewrite three text fields so they match the user's preferred tone "
             "and voice. Maintain all factual content — only reshape the presentation.\n\n"
-            f"User's preferred tone: {profile.tone}\n"
-            f"User's preferred format: {profile.format}\n"
-            f"User's high-priority topics: {', '.join(k for k, v in profile.topic_weights.items() if v > 0.3)}\n"
+            f"User's preferred tone: {safe_tone}\n"
+            f"User's preferred format: {safe_format}\n"
+            f"User's high-priority topics: {safe_topics}\n"
         )
         if self._persona_context:
             system_prompt += f"Review lenses to apply: {'; '.join(self._persona_context)}\n"

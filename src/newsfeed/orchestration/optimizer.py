@@ -28,6 +28,8 @@ class AgentMetric:
     total_latency_ms: float = 0.0
     error_count: int = 0
     last_run_at: float = 0.0
+    zero_yield_streak: int = 0
+    total_zero_yields: int = 0
 
     @property
     def avg_latency_ms(self) -> float:
@@ -120,7 +122,12 @@ class CircuitBreaker:
         self._breakers[agent_id] = (self.CLOSED, 0, 0.0)
 
     def record_failure(self, agent_id: str) -> None:
-        """Record an agent failure — may trip to OPEN."""
+        """Record an agent failure — may trip to OPEN.
+
+        Only counts *consecutive* failures since the last success.
+        record_success() resets the counter to 0, so a recovered agent
+        needs failure_threshold fresh failures to trip again.
+        """
         state, failures, _ = self._breakers.get(agent_id, (self.CLOSED, 0, 0.0))
         failures += 1
         now = time.monotonic()
@@ -207,6 +214,12 @@ class SystemOptimizationAgent:
         m.last_run_at = time.time()
         if error:
             m.error_count += 1
+        # Track consecutive zero-yield runs (agent returns [] without error).
+        if candidate_count == 0 and not error:
+            m.zero_yield_streak += 1
+            m.total_zero_yields += 1
+        else:
+            m.zero_yield_streak = 0
 
     def record_agent_selection(self, agent_id: str, selected_count: int) -> None:
         """Record how many of an agent's candidates survived expert selection."""
@@ -274,6 +287,19 @@ class SystemOptimizationAgent:
                     reason=f"Average latency {m.avg_latency_ms:.0f}ms exceeds threshold "
                            f"({self._latency_threshold_ms:.0f}ms)",
                     severity="low",
+                ))
+
+            # Silent zero-yield: agent runs without error but produces nothing.
+            # This catches scenarios like an API changing its response format
+            # or a source going permanently empty without raising exceptions.
+            streak = m.zero_yield_streak
+            if streak >= 5:
+                recommendations.append(TuningRecommendation(
+                    agent_id=agent_id,
+                    action="investigate",
+                    reason=f"Agent has returned 0 candidates for {streak} consecutive "
+                           f"runs without error — source may be silently broken",
+                    severity="high",
                 ))
 
         # Check pipeline stages

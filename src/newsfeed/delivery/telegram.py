@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import re
+from typing import Sequence
 
 from newsfeed.models.domain import (
     BriefingType,
@@ -12,6 +13,32 @@ from newsfeed.models.domain import (
     TrendSnapshot,
     UrgencyLevel,
 )
+
+
+def _close_unclosed_html_tags(text: str) -> str:
+    """Close any unclosed HTML tags to prevent garbled rendering in Telegram.
+
+    Only handles the subset of tags Telegram supports: b, i, a, code, pre, u, s.
+    """
+    _TELEGRAM_TAGS = {"b", "i", "a", "code", "pre", "u", "s"}
+    open_stack: list[str] = []
+    for m in re.finditer(r"<(/?)(\w+)(?:\s[^>]*)?>", text):
+        is_close = m.group(1) == "/"
+        tag = m.group(2).lower()
+        if tag not in _TELEGRAM_TAGS:
+            continue
+        if is_close:
+            # Pop matching tag from stack (if present)
+            for j in range(len(open_stack) - 1, -1, -1):
+                if open_stack[j] == tag:
+                    open_stack.pop(j)
+                    break
+        else:
+            open_stack.append(tag)
+    # Close remaining open tags in reverse order
+    for tag in reversed(open_stack):
+        text += f"</{tag}>"
+    return text
 
 _URGENCY_ICON = {
     UrgencyLevel.ROUTINE: "",
@@ -409,6 +436,7 @@ class TelegramFormatter:
             last_nl = result.rfind("\n")
             if last_nl > _MAX_CARD_LENGTH // 2:
                 result = result[:last_nl]
+            result = _close_unclosed_html_tags(result)
             result += "\n\n<i>[Card truncated \u2014 tap \U0001f50d Dive deeper for full analysis]</i>"
 
         return result
@@ -834,6 +862,7 @@ class TelegramFormatter:
             last_nl = result.rfind("\n")
             if last_nl > _MAX_CARD_LENGTH // 2:
                 result = result[:last_nl]
+            result = _close_unclosed_html_tags(result)
             result += "\n\n<i>[Truncated for length]</i>"
 
         return result

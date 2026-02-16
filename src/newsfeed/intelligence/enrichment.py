@@ -144,6 +144,60 @@ def _throttle_domain(url: str) -> None:
         time.sleep(wait)
 
 
+def _check_fetch_url_ip(url: str) -> bool:
+    """Validate that a URL does not resolve to a private/reserved IP.
+
+    Prevents SSRF attacks where attacker-controlled article URLs point to
+    internal services (localhost, cloud metadata, private networks).
+    DNS rebinding is mitigated by checking resolved IPs at fetch time.
+    """
+    import ipaddress
+    import socket
+
+    hostname = urlparse(url).hostname
+    if not hostname:
+        return False
+    # Check literal IP addresses
+    try:
+        addr = ipaddress.ip_address(hostname.strip("[]"))
+        if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
+            addr = addr.ipv4_mapped
+        if (addr.is_loopback or addr.is_private or addr.is_reserved
+                or addr.is_link_local or addr.is_multicast or addr.is_unspecified):
+            log.debug("Blocked fetch to non-public IP: %s", hostname)
+            return False
+        # Block cloud metadata endpoints
+        _meta = {ipaddress.ip_address("169.254.169.254"), ipaddress.ip_address("fd00:ec2::254")}
+        if addr in _meta:
+            log.debug("Blocked fetch to cloud metadata IP: %s", hostname)
+            return False
+        return True
+    except ValueError:
+        pass  # Not an IP literal — resolve via DNS
+
+    try:
+        results = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+    except socket.gaierror:
+        return False
+    if not results:
+        return False
+    for _fam, _, _, _, sockaddr in results:
+        try:
+            addr = ipaddress.ip_address(sockaddr[0])
+            if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
+                addr = addr.ipv4_mapped
+            if (addr.is_loopback or addr.is_private or addr.is_reserved
+                    or addr.is_link_local or addr.is_multicast or addr.is_unspecified):
+                log.debug("Blocked fetch to non-public resolved IP: %s -> %s", hostname, addr)
+                return False
+            _meta = {ipaddress.ip_address("169.254.169.254"), ipaddress.ip_address("fd00:ec2::254")}
+            if addr in _meta:
+                return False
+        except ValueError:
+            continue
+    return True
+
+
 def fetch_article(url: str, timeout: int = 8) -> str:
     """Fetch article HTML from a URL. Returns empty string on failure."""
     if not url or url.startswith("https://example.com"):
@@ -152,6 +206,10 @@ def fetch_article(url: str, timeout: int = 8) -> str:
     scheme = url.split(":", 1)[0].lower().strip() if ":" in url else ""
     if scheme not in _SAFE_FETCH_SCHEMES:
         log.debug("Blocked fetch for non-http scheme: %s", scheme)
+        return ""
+    # SSRF protection: validate resolved IP is not private/reserved/metadata
+    if not _check_fetch_url_ip(url):
+        log.warning("Blocked article fetch to non-public IP: %s", url[:120])
         return ""
     _throttle_domain(url)
     try:
