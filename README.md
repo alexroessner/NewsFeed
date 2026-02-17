@@ -11,28 +11,47 @@ NewsFeed monitors 18 sources (BBC, Reuters, AP, Guardian, FT, Al Jazeera, Hacker
 ```bash
 pip install -e .                    # Core (stdlib only)
 pip install -e ".[all]"             # + LLM + Telegram support
-pip install -e ".[test]"            # + pytest
+pip install -e ".[dev]"             # + pytest + ruff
 ```
 
 ## Quick start
 
 ```bash
-# Demo mode (no API keys needed — uses simulated data)
+# 1. Set up API keys (all optional — agents without keys use simulated data)
+cp config/secrets.json.example config/secrets.json
+# Edit config/secrets.json with your API keys
+
+# 2. Demo mode (no API keys needed)
 python -m newsfeed.orchestration.bootstrap
 
-# Telegram bot mode (set your bot token first)
-# Edit config/pipelines.json → api_keys.telegram_bot_token
+# 3. Telegram bot mode (requires telegram_bot_token in config/secrets.json)
 python -m newsfeed.orchestration.bootstrap
 ```
 
 ## API keys
 
-API keys go in `config/secrets.json` (gitignored) or directly in `config/pipelines.json` under `api_keys`. See `.env.example` for the full list of supported keys. All keys are optional — agents without keys fall back to simulated data. Free agents (BBC, HackerNews, Al Jazeera, arXiv, GDELT, Google News) work without any keys.
+API keys go in `config/secrets.json` (gitignored). Copy `config/secrets.json.example` to get started. Keys can also be set in `config/pipelines.json` under `api_keys`, or via environment variables in CI/CD.
+
+All keys are optional — agents without keys fall back to simulated data. Free agents (BBC, HackerNews, Al Jazeera, arXiv, GDELT, Google News) work without any keys.
+
+## Access control
+
+Set `TELEGRAM_OWNER_ID` env var to your Telegram user ID for admin access. Configure `access_control` in `config/pipelines.json`:
+
+```json
+{
+  "access_control": {
+    "owner_user_id": "YOUR_TELEGRAM_ID",
+    "allowed_users": [],
+    "open_registration": false
+  }
+}
+```
 
 ## Tests
 
 ```bash
-python -m pytest tests/ -v          # 303+ tests
+python -m pytest tests/ -v          # 779+ tests
 ```
 
 ## Architecture

@@ -136,6 +136,12 @@ class CommunicationAgent:
         self._rate_limits: BoundedUserDict[float] = BoundedUserDict(maxlen=500)
         self._RATE_LIMIT_SECONDS = 15  # Min seconds between briefing/sitrep/quick
         self._cmd_rate_windows: dict[str, list[float]] = {}  # Per-command sliding window
+        # Global concurrent pipeline cap — prevents resource exhaustion
+        self._active_pipelines = 0
+        self._MAX_CONCURRENT_PIPELINES = 5
+        # Per-user daily cost budget (briefing count)
+        self._daily_briefing_counts: BoundedUserDict[list] = BoundedUserDict(maxlen=500)
+        self._MAX_DAILY_BRIEFINGS = 50  # Per-user cap
         # Alert dedup: track which alerts have been sent to avoid repeat notifications.
         # Key: "user_id:alert_type:region_or_topic", Value: monotonic timestamp.
         self._sent_alerts: dict[str, float] = {}
@@ -229,11 +235,15 @@ class CommunicationAgent:
     def _check_rate_limit(self, chat_id: int | str, user_id: str) -> bool:
         """Check if user is rate-limited for expensive commands.
 
-        Returns True if the request should be BLOCKED (rate limited).
-        Uses monotonic clock so system time adjustments can't bypass limits.
+        Returns True if the request should be BLOCKED. Enforces:
+        1. Per-user cooldown (15s between briefings)
+        2. Global concurrent pipeline cap (5 max)
+        3. Per-user daily budget (50 briefings/day)
         """
         import time
         now = time.monotonic()
+
+        # Check 1: Per-user cooldown
         last = self._rate_limits.get(user_id, 0)
         if now - last < self._RATE_LIMIT_SECONDS:
             remaining = int(self._RATE_LIMIT_SECONDS - (now - last))
@@ -242,6 +252,29 @@ class CommunicationAgent:
                 f"Please wait {remaining}s before requesting another briefing."
             )
             return True
+
+        # Check 2: Global concurrent pipeline cap
+        if self._active_pipelines >= self._MAX_CONCURRENT_PIPELINES:
+            self._bot.send_message(
+                chat_id,
+                "System is processing multiple briefings. Please try again in a moment."
+            )
+            return True
+
+        # Check 3: Per-user daily budget
+        daily = self._daily_briefing_counts.get(user_id, [])
+        day_start = time.time() - 86400  # 24 hours ago
+        daily = [t for t in daily if t > day_start]
+        if len(daily) >= self._MAX_DAILY_BRIEFINGS:
+            self._bot.send_message(
+                chat_id,
+                f"Daily briefing limit reached ({self._MAX_DAILY_BRIEFINGS}/day). "
+                "Resets in 24 hours."
+            )
+            return True
+
+        daily.append(time.time())
+        self._daily_briefing_counts[user_id] = daily
         self._rate_limits[user_id] = now
         return False
 
@@ -884,12 +917,16 @@ class CommunicationAgent:
             max_items = min(max_items + 5, 20)
 
         # Run the intelligence pipeline — get structured payload
-        payload = self._engine.handle_request_payload(
-            user_id=user_id,
-            prompt=prompt,
-            weighted_topics=topics,
-            max_items=max_items,
-        )
+        self._active_pipelines += 1
+        try:
+            payload = self._engine.handle_request_payload(
+                user_id=user_id,
+                prompt=prompt,
+                weighted_topics=topics,
+                max_items=max_items,
+            )
+        finally:
+            self._active_pipelines = max(0, self._active_pipelines - 1)
 
         # Apply user-configured advanced filters
         has_filters = profile.confidence_min > 0 or profile.urgency_min or profile.max_per_source > 0
@@ -942,8 +979,13 @@ class CommunicationAgent:
         # Build continuity summary from delta tags
         continuity = self._build_continuity_summary(delta_tags, tracked_count)
 
+        # Build quality indicator from pipeline health metadata
+        quality_badge = self._build_quality_badge(payload)
+
         # Message 1: Header (ticker + exec summary + geo risks + trends + threads)
         header = formatter.format_header(payload, ticker_bar, tracked_count=tracked_count)
+        if quality_badge:
+            header += f"\n{quality_badge}"
         if continuity:
             header += f"\n{continuity}"
         self._bot.send_message(chat_id, header)
@@ -2390,6 +2432,53 @@ class CommunicationAgent:
         except Exception:
             log.debug("Webhook alert failed for user=%s", user_id, exc_info=True)
             self._delivery_metrics.record_failure("webhook")
+
+    @staticmethod
+    @staticmethod
+    def _build_quality_badge(payload) -> str:
+        """Build a quality/confidence indicator for the briefing.
+
+        Shows the user how much of the pipeline was healthy, e.g.:
+        "Based on 16/23 sources, 7 intelligence stages, LLM-enriched"
+        Defensive against MagicMock or missing metadata.
+        """
+        try:
+            meta = getattr(payload, "metadata", None)
+            if not isinstance(meta, dict):
+                return ""
+            health = meta.get("pipeline_health")
+            trace = meta.get("pipeline_trace")
+            if not isinstance(health, dict) or not isinstance(trace, dict):
+                return ""
+
+            agents_total = int(health.get("agents_total", 0) or 0)
+            agents_contributing = int(health.get("agents_contributing", 0) or 0)
+            stages = health.get("stages_enabled", [])
+            enrichment_ms = float(trace.get("enrichment_time_ms", 0) or 0)
+
+            if not agents_total:
+                return ""
+
+            parts: list[str] = []
+            parts.append(f"{agents_contributing}/{agents_total} sources")
+            if isinstance(stages, list) and stages:
+                parts.append(f"{len(stages)} intel stages")
+            if enrichment_ms > 100:
+                parts.append("LLM-enriched")
+            elif enrichment_ms == 0:
+                parts.append("basic mode")
+
+            ratio = agents_contributing / max(agents_total, 1)
+            if ratio >= 0.75:
+                icon = "\u2705"
+            elif ratio >= 0.5:
+                icon = "\u26a0\ufe0f"
+            else:
+                icon = "\U0001f534"
+
+            return f"<i>{icon} Based on {', '.join(parts)}</i>"
+        except (TypeError, ValueError, AttributeError):
+            return ""
 
     @staticmethod
     def _build_continuity_summary(delta_tags: list[str], tracked_count: int) -> str:

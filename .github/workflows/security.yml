@@ -21,10 +21,29 @@ jobs:
         run: pip install bandit safety
 
       - name: Run Bandit (SAST)
-        run: bandit -r src/ -f json -o bandit-report.json || true
+        run: bandit -r src/ -f json -o bandit-report.json -ll
 
       - name: Display Bandit results
+        if: always()
         run: bandit -r src/ -ll
 
       - name: Check dependencies for known vulnerabilities
-        run: pip install -e ".[all]" && safety check || true
+        run: pip install -e ".[all]" && safety check
+
+      - name: Check for secrets in source code
+        run: |
+          # Fail if any common secret patterns found in tracked source files
+          if grep -rn --include='*.py' --include='*.json' --include='*.yml' --include='*.js' \
+            -E '(sk-[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{36}|AKIA[A-Z0-9]{16}|-----BEGIN (RSA |EC )?PRIVATE KEY-----)' \
+            src/ config/ cloudflare-worker/ .github/ 2>/dev/null; then
+            echo "ERROR: Potential secrets detected in source code!"
+            exit 1
+          fi
+          echo "No secrets detected in source code."
+
+      - name: Upload Bandit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-report
+          path: bandit-report.json

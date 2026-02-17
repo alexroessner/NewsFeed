@@ -11,6 +11,7 @@ from newsfeed.agents.dynamic_sources import create_custom_agent
 from newsfeed.agents.experts import ExpertCouncil
 from newsfeed.agents.registry import create_agent
 from newsfeed.db.analytics import AnalyticsDB, create_analytics_db
+from newsfeed.db.state_store import D1StateStore
 from newsfeed.delivery.telegram import TelegramFormatter
 from newsfeed.intelligence.clustering import StoryClustering
 from newsfeed.intelligence.enrichment import ArticleEnricher
@@ -236,6 +237,12 @@ class NewsFeedEngine:
         analytics_dir = Path(persist_cfg.get("state_dir", "state"))
         analytics_dir.mkdir(parents=True, exist_ok=True)
         self.analytics = create_analytics_db(local_path=analytics_dir / "analytics.db")
+
+        # D1-backed state store — persists preferences, trends, etc. across runs
+        self._d1_state = D1StateStore(self.analytics)
+        # Load state from D1 if file-based persistence didn't find anything
+        if not self._persistence or not (Path(persist_cfg.get("state_dir", "state")) / "preferences.json").exists():
+            self._load_d1_state()
 
         log.info(
             "Engine ready: %d agents, %d experts, stages=%s",
@@ -870,22 +877,68 @@ class NewsFeedEngine:
         return sum(len(v) for v in self.cache._entries.values())
 
     def persist_preferences(self) -> None:
-        """Persist current preferences to disk (if persistence is enabled)."""
+        """Persist current preferences to disk and D1."""
         if self._persistence:
             self._persistence.save("preferences", self.preferences.snapshot())
+        self._save_d1_state()
 
     def _save_state(self) -> None:
-        if not self._persistence:
-            return
-        self._persistence.save("preferences", self.preferences.snapshot())
-        self._persistence.save("credibility", self.credibility.snapshot())
-        self._persistence.save("georisk", self.georisk.snapshot())
-        self._persistence.save("trends", self.trends.snapshot())
-        self._persistence.save("optimizer", self.optimizer.snapshot())
-        self._persistence.save("debate_chair", self.experts.chair.snapshot())
-        # Persist scheduler so scheduled briefings survive restarts
-        if hasattr(self, "_scheduler") and self._scheduler:
-            self._persistence.save("scheduler", self._scheduler.snapshot())
+        if self._persistence:
+            self._persistence.save("preferences", self.preferences.snapshot())
+            self._persistence.save("credibility", self.credibility.snapshot())
+            self._persistence.save("georisk", self.georisk.snapshot())
+            self._persistence.save("trends", self.trends.snapshot())
+            self._persistence.save("optimizer", self.optimizer.snapshot())
+            self._persistence.save("debate_chair", self.experts.chair.snapshot())
+            if hasattr(self, "_scheduler") and self._scheduler:
+                self._persistence.save("scheduler", self._scheduler.snapshot())
+            if hasattr(self, "access_control"):
+                self._persistence.save("access_control", self.access_control.snapshot())
+        # Also persist to D1 for cross-run durability
+        self._save_d1_state()
+
+    def _save_d1_state(self) -> None:
+        """Persist state to D1 so it survives across ephemeral GH Actions runs."""
+        try:
+            self._d1_state.save("preferences", self.preferences.snapshot())
+            self._d1_state.save("credibility", self.credibility.snapshot())
+            self._d1_state.save("georisk", self.georisk.snapshot())
+            self._d1_state.save("trends", self.trends.snapshot())
+            self._d1_state.save("optimizer", self.optimizer.snapshot())
+            self._d1_state.save("debate_chair", self.experts.chair.snapshot())
+            if hasattr(self, "_scheduler") and self._scheduler:
+                self._d1_state.save("scheduler", self._scheduler.snapshot())
+            if hasattr(self, "access_control"):
+                self._d1_state.save("access_control", self.access_control.snapshot())
+        except Exception:
+            log.debug("D1 state save failed (non-critical)", exc_info=True)
+
+    def _load_d1_state(self) -> None:
+        """Load state from D1 on startup (fallback when file-based state is absent)."""
+        try:
+            prefs = self._d1_state.load("preferences")
+            if prefs and isinstance(prefs, dict):
+                # Delegate to existing _load_state validation logic by temporarily
+                # injecting into persistence, or directly restore minimal state
+                for uid, pdata in prefs.items():
+                    if isinstance(pdata, dict):
+                        profile = self.preferences.get_or_create(uid)
+                        tw = pdata.get("topic_weights", {})
+                        if isinstance(tw, dict):
+                            for k, v in list(tw.items())[:50]:
+                                profile.topic_weights[str(k)] = round(max(-1.0, min(1.0, float(v))), 3)
+                log.info("Restored %d user preferences from D1", len(prefs))
+
+            ac_data = self._d1_state.load("access_control")
+            if ac_data and isinstance(ac_data, dict) and hasattr(self, "access_control"):
+                self.access_control.restore(ac_data)
+                log.info("Restored access control state from D1")
+
+            cred = self._d1_state.load("credibility")
+            if cred and isinstance(cred, dict):
+                log.info("Restored credibility data from D1 (%d sources)", len(cred))
+        except Exception:
+            log.debug("D1 state load failed (non-critical)", exc_info=True)
 
     # Allowed values for validated string fields on restore.
     # IMPORTANT: These must be a superset of the values accepted by the
