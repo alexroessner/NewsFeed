@@ -173,6 +173,18 @@ class CommunicationAgent:
         if not chat_id or not user_id:
             return None
 
+        # Access control gate — check authorization before processing
+        ac = self._engine.access_control
+        if cmd_type == "command" and command == "start":
+            pass  # /start always allowed — triggers registration flow
+        elif not ac.is_allowed(user_id):
+            self._bot.send_message(
+                chat_id,
+                "You don't have access to this bot.\n"
+                "Use /start to request access from the administrator.",
+            )
+            return {"action": "access_denied", "user_id": user_id}
+
         log.info("Processing %s from user=%s: cmd=%s args=%r", cmd_type, user_id, command, args)
 
         result: dict[str, Any] | None = None
@@ -484,6 +496,49 @@ class CommunicationAgent:
         if command == "admin":
             return self._handle_admin(chat_id, user_id, args)
 
+        if command == "approve":
+            ac = self._engine.access_control
+            msg = ac.approve_user(user_id, args.strip())
+            self._bot.send_message(chat_id, msg)
+            return {"action": "approve_user", "user_id": user_id, "target": args.strip()}
+
+        if command == "reject":
+            ac = self._engine.access_control
+            msg = ac.reject_user(user_id, args.strip())
+            self._bot.send_message(chat_id, msg)
+            return {"action": "reject_user", "user_id": user_id, "target": args.strip()}
+
+        if command == "promote":
+            ac = self._engine.access_control
+            msg = ac.promote_to_admin(user_id, args.strip())
+            self._bot.send_message(chat_id, msg)
+            return {"action": "promote_user", "user_id": user_id, "target": args.strip()}
+
+        if command == "demote":
+            ac = self._engine.access_control
+            msg = ac.demote_from_admin(user_id, args.strip())
+            self._bot.send_message(chat_id, msg)
+            return {"action": "demote_user", "user_id": user_id, "target": args.strip()}
+
+        if command == "users":
+            ac = self._engine.access_control
+            counts = ac.get_user_count()
+            pending = ac.get_pending_users()
+            import html as html_mod
+            lines = [
+                "<b>User Access Summary</b>",
+                f"  Allowed: {counts['allowed']}",
+                f"  Admins: {counts['admin']}",
+                f"  Pending: {counts['pending']}",
+            ]
+            if pending:
+                lines.append("")
+                lines.append("<b>Pending Approval:</b>")
+                for uid in pending:
+                    lines.append(f"  {html_mod.escape(uid)} — /approve {html_mod.escape(uid)}")
+            self._bot.send_message(chat_id, "\n".join(lines))
+            return {"action": "users_list", "user_id": user_id}
+
         if command == "_stale_callback":
             self._bot.send_message(
                 chat_id,
@@ -502,7 +557,26 @@ class CommunicationAgent:
 
         Starts a 3-step personalization: topics -> role -> detail level.
         Seeds the profile in ~30 seconds instead of requiring iterative /feedback.
+        If access control is active, handles registration before onboarding.
         """
+        ac = self._engine.access_control
+        if not ac.is_allowed(user_id):
+            msg = ac.request_access(user_id)
+            self._bot.send_message(chat_id, msg)
+            # Notify admins of pending request
+            pending = ac.get_pending_users()
+            if pending and user_id in pending:
+                for admin_id in ac._admin_users:
+                    if admin_id != user_id:
+                        self._bot.send_message(
+                            admin_id,
+                            f"New access request from user {user_id}.\n"
+                            f"Approve: /approve {user_id}\n"
+                            f"Reject: /reject {user_id}",
+                        )
+            if not ac.is_allowed(user_id):
+                return {"action": "access_requested", "user_id": user_id}
+
         self._engine.preferences.get_or_create(user_id)
         self._engine.analytics.record_user_seen(user_id, chat_id)
 
@@ -3293,17 +3367,12 @@ class CommunicationAgent:
         )
 
     def _is_admin(self, user_id: str) -> bool:
-        """Check if user is the admin/owner.
+        """Check if user is an admin via AccessControl.
 
-        SECURITY: Requires explicit TELEGRAM_OWNER_ID configuration.
-        If not set, admin access is denied entirely — no fallback to
-        'first user' which would allow arbitrary privilege escalation.
+        Delegates to the engine's AccessControl which supports owner,
+        configured admins, and runtime-promoted admins.
         """
-        import os
-        owner_id = os.environ.get("TELEGRAM_OWNER_ID", "")
-        if not owner_id:
-            return False
-        return str(user_id) == str(owner_id)
+        return self._engine.access_control.is_admin(user_id)
 
     def _handle_admin(self, chat_id: int | str, user_id: str,
                       args: str) -> dict[str, Any]:

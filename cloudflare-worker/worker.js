@@ -22,8 +22,9 @@ export default {
     }
 
     // Validate Telegram's secret token header (set via setWebhook secret_token param)
+    // SECURITY: reject if WEBHOOK_SECRET is not configured OR if it doesn't match
     const secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
-    if (env.WEBHOOK_SECRET && secret !== env.WEBHOOK_SECRET) {
+    if (!env.WEBHOOK_SECRET || secret !== env.WEBHOOK_SECRET) {
       return new Response("Unauthorized", { status: 403 });
     }
 

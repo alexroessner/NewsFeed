@@ -42,6 +42,7 @@ from newsfeed.models.domain import (
     configure_scoring,
     validate_candidate,
 )
+from newsfeed.orchestration.access_control import AccessControl
 from newsfeed.orchestration.audit import AuditTrail
 from newsfeed.orchestration.communication import CommunicationAgent
 from newsfeed.orchestration.configurator import SystemConfigurator
@@ -147,6 +148,10 @@ class NewsFeedEngine:
 
         # Audit trail (full decision tracking)
         self.audit = AuditTrail()
+
+        # Access control (user allowlist + admin roles)
+        ac_cfg = pipeline.get("access_control", {})
+        self.access_control = AccessControl(ac_cfg)
 
         # Universal configurator (plain-text config changes)
         self.configurator = SystemConfigurator(pipeline, config, personas)

@@ -1453,6 +1453,10 @@ class CommunicationAgentTests(unittest.TestCase):
             {"topic": "technology", "source": "bbc"},
         ]
 
+        # Access control mock — allow all users, no admin by default
+        self.mock_engine.access_control.is_allowed.return_value = True
+        self.mock_engine.access_control.is_admin.return_value = False
+
         self.mock_bot = MagicMock()
         self.mock_bot.parse_command.return_value = None
         self.mock_bot.format_help.return_value = "Help text"
