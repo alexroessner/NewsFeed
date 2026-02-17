@@ -244,6 +244,20 @@ class NewsFeedEngine:
         if not self._persistence or not (Path(persist_cfg.get("state_dir", "state")) / "preferences.json").exists():
             self._load_d1_state()
 
+        # Run pending database migrations
+        from newsfeed.db.migrations import MigrationRunner
+        try:
+            migration_runner = MigrationRunner(self.analytics)
+            applied = migration_runner.apply_all()
+            if applied:
+                log.info("Applied %d database migrations (now at v%d)", applied, migration_runner.current_version())
+        except Exception:
+            log.debug("Migration runner skipped (non-critical)", exc_info=True)
+
+        # Operator dashboard
+        from newsfeed.monitoring.dashboard import OperatorDashboard
+        self.dashboard = OperatorDashboard(self)
+
         log.info(
             "Engine ready: %d agents, %d experts, stages=%s",
             len(config.get("research_agents", [])),

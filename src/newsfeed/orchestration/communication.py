@@ -3493,7 +3493,9 @@ class CommunicationAgent:
                 "/admin topics \u2014 Top topics (30 days)\n"
                 "/admin sources \u2014 Top sources (30 days)\n"
                 "/admin briefings [user_id] \u2014 User briefing history\n"
-                "/admin health \u2014 Delivery success rates"
+                "/admin health \u2014 Delivery success rates\n"
+                "/admin dashboard \u2014 Full operator dashboard\n"
+                "/admin alerts \u2014 Recent alerts"
             ))
             return {"action": "admin_help", "user_id": user_id}
 
@@ -3736,6 +3738,29 @@ class CommunicationAgent:
                 )
             self._bot.send_message(chat_id, "\n".join(lines))
             return {"action": "admin_health", "user_id": user_id}
+
+        if subcmd == "dashboard":
+            try:
+                dashboard_text = self._engine.dashboard.format_telegram_dashboard()
+                self._bot.send_message(chat_id, dashboard_text)
+            except Exception:
+                self._bot.send_message(chat_id, "Dashboard generation failed.")
+            return {"action": "admin_dashboard", "user_id": user_id}
+
+        if subcmd == "alerts":
+            from newsfeed.monitoring.alerts import create_default_alerts
+            mgr = create_default_alerts(self._engine)
+            fired = mgr.check_all()
+            recent = mgr.recent_alerts()
+            if not fired and not recent:
+                self._bot.send_message(chat_id, "\u2705 No alerts — all systems healthy.")
+            else:
+                lines = ["<b>Alert Status</b>", ""]
+                for alert in (fired or recent):
+                    icon = "\U0001f534" if alert.get("severity") == "critical" else "\u26a0\ufe0f"
+                    lines.append(f"  {icon} {html_mod.escape(alert.get('message', 'Unknown alert'))}")
+                self._bot.send_message(chat_id, "\n".join(lines))
+            return {"action": "admin_alerts", "user_id": user_id}
 
         self._bot.send_message(chat_id, f"Unknown admin command: {html_mod.escape(subcmd)}. Try /admin help")
         return {"action": "admin_unknown", "user_id": user_id}

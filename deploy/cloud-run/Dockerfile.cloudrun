@@ -1,0 +1,35 @@
+# Cloud Run optimized Dockerfile for NewsFeed
+# Uses the same multi-stage build but with Cloud Run specific settings
+FROM python:3.11-slim AS builder
+
+WORKDIR /app
+COPY pyproject.toml .
+COPY src/ src/
+RUN pip install --no-cache-dir -e ".[all]"
+
+FROM python:3.11-slim AS runtime
+
+WORKDIR /app
+
+RUN groupadd -r newsfeed && useradd -r -g newsfeed -d /app newsfeed
+
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+COPY src/ src/
+COPY config/ config/
+COPY personas/ personas/
+COPY pyproject.toml .
+
+RUN mkdir -p /app/state && chown -R newsfeed:newsfeed /app
+
+USER newsfeed
+
+ENV PYTHONPATH=/app/src
+ENV PYTHONUNBUFFERED=1
+ENV NEWSFEED_LOG_JSON=1
+ENV PORT=8080
+
+# Cloud Run expects the container to listen on $PORT
+# The bootstrap module handles both polling and webhook modes
+ENTRYPOINT ["python", "-m", "newsfeed.orchestration.bootstrap"]

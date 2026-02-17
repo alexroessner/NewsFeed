@@ -90,6 +90,13 @@ def main() -> None:
     log.info("  Intelligence stages: %d/%d enabled", len(enabled_stages), 7)
     log.info("=" * 60)
 
+    # Start health check + metrics server
+    try:
+        from newsfeed.monitoring.health import start_health_server
+        start_health_server(engine=engine)
+    except Exception:
+        log.debug("Health server not started (non-critical)", exc_info=True)
+
     # If Telegram bot is configured, start the polling loop
     if engine.is_telegram_connected():
         log.info("Telegram bot configured — starting polling loop")
