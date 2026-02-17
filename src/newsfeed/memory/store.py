@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
+import threading
 import time
 from collections import OrderedDict
 from dataclasses import replace
@@ -29,26 +31,30 @@ class BoundedUserDict(dict[str, _VT]):
     when the population exceeds *maxlen* the oldest entry is evicted.
     """
 
-    __slots__ = ("_maxlen",)
+    __slots__ = ("_maxlen", "_lock")
 
     def __init__(self, maxlen: int = 500, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._maxlen = max(1, maxlen)
+        self._lock = threading.RLock()
 
     def __setitem__(self, key: str, value: _VT) -> None:
-        # Move existing key to end (refresh) or insert at end
-        if key in self:
-            super().__delitem__(key)
-        super().__setitem__(key, value)
-        # Evict oldest entries if over cap
-        while len(self) > self._maxlen:
-            oldest = next(iter(self))
-            super().__delitem__(oldest)
+        with self._lock:
+            # Move existing key to end (refresh) or insert at end
+            if key in self:
+                super().__delitem__(key)
+            super().__setitem__(key, value)
+            # Evict oldest entries if over cap
+            while len(self) > self._maxlen:
+                oldest = next(iter(self))
+                log.info("BoundedUserDict evicting key=%s (cap=%d)", oldest, self._maxlen)
+                super().__delitem__(oldest)
 
     def setdefault(self, key: str, default: _VT = None) -> _VT:  # type: ignore[assignment]
-        if key not in self:
-            self[key] = default  # type: ignore[assignment]
-        return self[key]
+        with self._lock:
+            if key not in self:
+                self[key] = default  # type: ignore[assignment]
+            return self[key]
 
 # Common stop words to exclude from keyword extraction
 _STOP_WORDS = frozenset({
@@ -72,13 +78,26 @@ def match_tracked(story_topic: str, story_title: str,
                   tracked: dict) -> bool:
     """Check if a story matches a tracked item.
 
-    Matches if same topic AND at least 2 keyword overlaps.
+    Uses tiered matching to handle headline evolution over time:
+    1. Same topic + 2+ keyword overlaps = strong match
+    2. Same topic + 1 keyword overlap (if keyword is 5+ chars) = weak match
+
+    This prevents tracking from breaking when headlines evolve naturally
+    (e.g., "China Taiwan tensions escalate" -> "Beijing Taipei stakes raised").
     """
     if story_topic != tracked["topic"]:
         return False
     story_words = set(extract_keywords(story_title))
     tracked_words = set(tracked["keywords"])
-    return len(story_words & tracked_words) >= 2
+    overlap = story_words & tracked_words
+    if len(overlap) >= 2:
+        return True
+    # Weak match: 1 overlap allowed if the shared keyword is substantial
+    if len(overlap) == 1:
+        shared = next(iter(overlap))
+        if len(shared) >= 5:
+            return True
+    return False
 
 
 class PreferenceStore:
@@ -89,22 +108,54 @@ class PreferenceStore:
 
     def __init__(self) -> None:
         self._profiles: BoundedUserDict[UserProfile] = BoundedUserDict(maxlen=self.MAX_USERS)
+        # RLock allows reentrant locking: methods that already hold the lock
+        # (e.g. apply_weight_adjustment) can safely call get_or_create.
+        self._lock = threading.RLock()
+        self._weight_timestamps: dict[str, dict[str, float]] = {}  # user_id -> {topic: last_updated_ts}
 
     def get_or_create(self, user_id: str) -> UserProfile:
-        if user_id not in self._profiles:
-            self._profiles[user_id] = UserProfile(user_id=user_id)
-        return self._profiles[user_id]
+        with self._lock:
+            if user_id not in self._profiles:
+                self._profiles[user_id] = UserProfile(user_id=user_id)
+            return self._profiles[user_id]
 
     MAX_WEIGHTS = 100  # Max distinct topic/source weight entries per user
 
-    def apply_weight_adjustment(self, user_id: str, topic: str, delta: float) -> UserProfile:
-        profile = self.get_or_create(user_id)
-        current = profile.topic_weights.get(topic, 0.0)
-        # Reject new entries if at cap (updates to existing keys are always allowed)
-        if topic not in profile.topic_weights and len(profile.topic_weights) >= self.MAX_WEIGHTS:
-            return profile
-        profile.topic_weights[topic] = round(max(min(current + delta, 1.0), -1.0), 3)
-        return profile
+    @staticmethod
+    def _prune_zero_weights(weights: dict[str, float]) -> int:
+        """Remove zero-weight entries that waste slots. Returns count pruned."""
+        dead = [k for k, v in weights.items() if v == 0.0]
+        for k in dead:
+            del weights[k]
+        return len(dead)
+
+    def apply_weight_adjustment(self, user_id: str, topic: str,
+                               delta: float) -> tuple[UserProfile, str]:
+        """Apply a weight delta to a topic.
+
+        Returns (profile, hint) where hint is a user-facing message if
+        the cap was hit or the weight saturated, or empty string otherwise.
+        """
+        with self._lock:
+            profile = self.get_or_create(user_id)
+            current = profile.topic_weights.get(topic, 0.0)
+            # Reject new entries if at cap (updates to existing keys are always allowed)
+            if topic not in profile.topic_weights and len(profile.topic_weights) >= self.MAX_WEIGHTS:
+                # Try pruning zero-weight entries first before rejecting
+                pruned = self._prune_zero_weights(profile.topic_weights)
+                if pruned == 0 or len(profile.topic_weights) >= self.MAX_WEIGHTS:
+                    return profile, (
+                        f"You've reached the {self.MAX_WEIGHTS}-topic limit. "
+                        f"Use /feedback reset preferences or reduce an existing topic to add new ones."
+                    )
+            new_val = round(max(min(current + delta, 1.0), -1.0), 3)
+            profile.topic_weights[topic] = new_val
+            self._record_weight_touch(user_id, topic)
+            hint = ""
+            if new_val == current:
+                direction = "maximum" if delta > 0 else "minimum"
+                hint = f'Topic "{topic.replace("_", " ")}" is already at {direction} weight ({new_val}).'
+            return profile, hint
 
     def apply_style_update(self, user_id: str, tone: str | None = None, fmt: str | None = None) -> UserProfile:
         profile = self.get_or_create(user_id)
@@ -130,13 +181,31 @@ class PreferenceStore:
         profile.max_items = max(1, min(max_items, 50))
         return profile
 
-    def apply_source_weight(self, user_id: str, source: str, delta: float) -> UserProfile:
-        profile = self.get_or_create(user_id)
-        current = profile.source_weights.get(source, 0.0)
-        if source not in profile.source_weights and len(profile.source_weights) >= self.MAX_WEIGHTS:
-            return profile
-        profile.source_weights[source] = round(max(min(current + delta, 2.0), -2.0), 3)
-        return profile
+    def apply_source_weight(self, user_id: str, source: str,
+                            delta: float) -> tuple[UserProfile, str]:
+        """Apply a weight delta to a source.
+
+        Returns (profile, hint) where hint is a user-facing message if
+        the cap was hit or the weight saturated, or empty string otherwise.
+        """
+        with self._lock:
+            profile = self.get_or_create(user_id)
+            current = profile.source_weights.get(source, 0.0)
+            if source not in profile.source_weights and len(profile.source_weights) >= self.MAX_WEIGHTS:
+                self._prune_zero_weights(profile.source_weights)
+                if len(profile.source_weights) >= self.MAX_WEIGHTS:
+                    return profile, (
+                        f"You've reached the {self.MAX_WEIGHTS}-source limit. "
+                        f"Use /feedback reset preferences to free up slots."
+                    )
+            new_val = round(max(min(current + delta, 2.0), -2.0), 3)
+            profile.source_weights[source] = new_val
+            self._record_weight_touch(user_id, source)
+            hint = ""
+            if new_val == current:
+                direction = "maximum" if delta > 0 else "minimum"
+                hint = f'Source "{source}" is already at {direction} weight ({new_val}).'
+            return profile, hint
 
     def remove_region(self, user_id: str, region: str) -> UserProfile:
         profile = self.get_or_create(user_id)
@@ -236,10 +305,21 @@ class PreferenceStore:
         return profile
 
     _MAX_PRESET_NAME_LEN = 50  # Reasonable limit for a human-typed preset name
+    _PRESET_NAME_RE = re.compile(r"^[a-zA-Z0-9_\- ]+$")
 
-    def save_preset(self, user_id: str, name: str) -> UserProfile:
-        """Save current preferences as a named preset."""
-        name = name[:self._MAX_PRESET_NAME_LEN]
+    def save_preset(self, user_id: str, name: str) -> tuple[UserProfile, str]:
+        """Save current preferences as a named preset.
+
+        Returns (profile, error_message). Error is empty on success.
+        """
+        name = name.strip()[:self._MAX_PRESET_NAME_LEN].strip()
+        if not name:
+            return self.get_or_create(user_id), "Preset name cannot be empty."
+        if not self._PRESET_NAME_RE.match(name):
+            return self.get_or_create(user_id), (
+                "Preset names may only contain letters, numbers, "
+                "spaces, hyphens, and underscores."
+            )
         profile = self.get_or_create(user_id)
         profile.presets[name] = {
             "topic_weights": dict(profile.topic_weights),
@@ -259,7 +339,7 @@ class PreferenceStore:
             if first_key is None:
                 break
             del profile.presets[first_key]
-        return profile
+        return profile, ""
 
     def load_preset(self, user_id: str, name: str) -> UserProfile | None:
         """Load a named preset, replacing current preferences."""
@@ -267,16 +347,20 @@ class PreferenceStore:
         preset = profile.presets.get(name)
         if not preset:
             return None
-        profile.topic_weights = dict(preset.get("topic_weights") or {})
-        profile.source_weights = dict(preset.get("source_weights") or {})
-        profile.tone = str(preset.get("tone") or "concise")
-        profile.format = str(preset.get("format") or "bullet")
-        profile.max_items = int(preset.get("max_items") or 10)
-        profile.regions_of_interest = list(preset.get("regions") or [])
-        profile.confidence_min = float(preset.get("confidence_min") or 0.0)
-        profile.urgency_min = str(preset.get("urgency_min") or "")
-        profile.max_per_source = int(preset.get("max_per_source") or 0)
-        profile.muted_topics = list(preset.get("muted_topics") or [])
+        try:
+            profile.topic_weights = dict(preset.get("topic_weights") or {})
+            profile.source_weights = dict(preset.get("source_weights") or {})
+            profile.tone = str(preset.get("tone") or "concise")
+            profile.format = str(preset.get("format") or "bullet")
+            profile.max_items = self._safe_int(preset.get("max_items"), 10)
+            profile.regions_of_interest = list(preset.get("regions") or [])
+            profile.confidence_min = max(0.0, min(1.0, self._safe_float(preset.get("confidence_min"), 0.0)))
+            profile.urgency_min = str(preset.get("urgency_min") or "")
+            profile.max_per_source = max(0, min(10, self._safe_int(preset.get("max_per_source"), 0)))
+            profile.muted_topics = list(preset.get("muted_topics") or [])
+        except (TypeError, AttributeError) as e:
+            log.warning("Failed to load preset %r for user %s: %s", name, user_id, e)
+            return None
         return profile
 
     def delete_preset(self, user_id: str, name: str) -> bool:
@@ -383,25 +467,30 @@ class PreferenceStore:
 
     def reset(self, user_id: str) -> UserProfile:
         """Reset all user preferences to defaults."""
-        profile = self.get_or_create(user_id)
-        profile.topic_weights.clear()
-        profile.source_weights.clear()
-        profile.regions_of_interest.clear()
-        profile.muted_topics.clear()
-        profile.tone = "concise"
-        profile.format = "bullet"
-        profile.max_items = 10
-        profile.briefing_cadence = "on_demand"
-        profile.timezone = "UTC"
-        profile.confidence_min = 0.0
-        profile.urgency_min = ""
-        profile.max_per_source = 0
-        profile.alert_georisk_threshold = 0.5
-        profile.alert_trend_threshold = 3.0
+        with self._lock:
+            profile = self.get_or_create(user_id)
+            profile.topic_weights.clear()
+            profile.source_weights.clear()
+            profile.regions_of_interest.clear()
+            profile.muted_topics.clear()
+            profile.tone = "concise"
+            profile.format = "bullet"
+            profile.max_items = 10
+            profile.briefing_cadence = "on_demand"
+            profile.timezone = "UTC"
+            profile.confidence_min = 0.0
+            profile.urgency_min = ""
+            profile.max_per_source = 0
+            profile.alert_georisk_threshold = 0.5
+            profile.alert_trend_threshold = 3.0
         # Keep watchlists, tracked stories, bookmarks, and email on reset — those are data, not weights
         return profile
 
     def snapshot(self) -> dict[str, dict]:
+        with self._lock:
+            return self._snapshot_unlocked()
+
+    def _snapshot_unlocked(self) -> dict[str, dict]:
         result = {}
         for uid, p in self._profiles.items():
             result[uid] = {
@@ -430,6 +519,177 @@ class PreferenceStore:
                 "alert_keywords": list(p.alert_keywords),
             }
         return result
+
+    # ── Cross-session persistence ────────────────────────────────
+    # PreferenceStore is backed by BoundedUserDict which is ephemeral.
+    # These methods allow saving/restoring all profiles to/from a
+    # StatePersistence backend so user preferences survive restarts.
+
+    def persist(self, storage: StatePersistence, key: str = "preferences") -> int:
+        """Save all profiles to persistent storage. Returns count saved."""
+        with self._lock:
+            data = self._snapshot_unlocked()
+            # Include weight timestamps for decay
+            data["__weight_timestamps__"] = dict(self._weight_timestamps)
+        storage.save(key, data)
+        return len(data) - 1  # exclude __weight_timestamps__
+
+    @staticmethod
+    def _safe_float(value, default: float) -> float:
+        """Convert to float, rejecting NaN/Inf; return default on failure."""
+        try:
+            f = float(value or default)
+            return f if math.isfinite(f) else default
+        except (ValueError, TypeError):
+            return default
+
+    @staticmethod
+    def _safe_int(value, default: int) -> int:
+        """Convert to int, return default on failure."""
+        try:
+            return int(value or default)
+        except (ValueError, TypeError):
+            return default
+
+    @staticmethod
+    def _capped_list(value, cap: int) -> list:
+        """Convert to list, capping at max length to prevent memory abuse."""
+        result = list(value or [])
+        return result[-cap:] if len(result) > cap else result
+
+    def restore(self, storage: StatePersistence, key: str = "preferences") -> int:
+        """Restore profiles from persistent storage. Returns count restored."""
+        data = storage.load(key)
+        if not data or not isinstance(data, dict):
+            return 0
+        restored = 0
+        # Restore weight timestamps
+        ts_data = data.pop("__weight_timestamps__", {})
+        if isinstance(ts_data, dict):
+            self._weight_timestamps = ts_data
+        with self._lock:
+            for uid, profile_data in data.items():
+                if not isinstance(uid, str) or not isinstance(profile_data, dict):
+                    continue
+                profile = self.get_or_create(uid)
+                # Weight dicts — cap at MAX_WEIGHTS entries
+                tw = dict(profile_data.get("topic_weights") or {})
+                if len(tw) > self.MAX_WEIGHTS:
+                    tw = dict(list(tw.items())[:self.MAX_WEIGHTS])
+                profile.topic_weights = tw
+                sw = dict(profile_data.get("source_weights") or {})
+                if len(sw) > self.MAX_WEIGHTS:
+                    sw = dict(list(sw.items())[:self.MAX_WEIGHTS])
+                profile.source_weights = sw
+                profile.tone = str(profile_data.get("tone") or "concise")
+                profile.format = str(profile_data.get("format") or "bullet")
+                profile.max_items = self._safe_int(profile_data.get("max_items"), 10)
+                profile.briefing_cadence = str(profile_data.get("cadence") or "on_demand")
+                profile.regions_of_interest = self._capped_list(profile_data.get("regions"), 20)
+                profile.watchlist_crypto = self._capped_list(profile_data.get("watchlist_crypto"), self.MAX_WATCHLIST_SIZE)
+                profile.watchlist_stocks = self._capped_list(profile_data.get("watchlist_stocks"), self.MAX_WATCHLIST_SIZE)
+                profile.timezone = str(profile_data.get("timezone") or "UTC")[:self._MAX_TIMEZONE_LEN]
+                profile.muted_topics = self._capped_list(profile_data.get("muted_topics"), self.MAX_MUTED_TOPICS)
+                profile.tracked_stories = self._capped_list(profile_data.get("tracked_stories"), 20)
+                profile.bookmarks = self._capped_list(profile_data.get("bookmarks"), 50)
+                profile.email = str(profile_data.get("email") or "")
+                profile.confidence_min = max(0.0, min(1.0, self._safe_float(profile_data.get("confidence_min"), 0.0)))
+                profile.urgency_min = str(profile_data.get("urgency_min") or "")
+                profile.max_per_source = max(0, min(10, self._safe_int(profile_data.get("max_per_source"), 0)))
+                profile.alert_georisk_threshold = max(0.1, min(1.0, self._safe_float(profile_data.get("alert_georisk_threshold"), 0.5)))
+                profile.alert_trend_threshold = max(1.5, min(10.0, self._safe_float(profile_data.get("alert_trend_threshold"), 3.0)))
+                presets = profile_data.get("presets") or {}
+                # Cap presets to 10
+                if isinstance(presets, dict) and len(presets) > 10:
+                    presets = dict(list(presets.items())[:10])
+                profile.presets = dict(presets) if isinstance(presets, dict) else {}
+                profile.webhook_url = str(profile_data.get("webhook_url") or "")
+                profile.custom_sources = self._capped_list(profile_data.get("custom_sources"), 10)
+                profile.alert_keywords = self._capped_list(profile_data.get("alert_keywords"), 50)
+                restored += 1
+        log.info("Restored %d user profiles from persistent storage", restored)
+        return restored
+
+    # ── Weight decay ─────────────────────────────────────────────
+    # Over time, user preferences that haven't been reinforced should
+    # fade toward neutral. This prevents stale topic weights from
+    # dominating briefing selection indefinitely.
+
+    DECAY_HALF_LIFE_DAYS = 30  # Weights halve every 30 days without reinforcement
+
+    def _record_weight_touch(self, user_id: str, key: str) -> None:
+        """Record that a weight was explicitly set/adjusted."""
+        self._weight_timestamps.setdefault(user_id, {})[key] = time.time()
+
+    def apply_weight_decay(self, user_id: str) -> int:
+        """Decay topic and source weights that haven't been reinforced.
+
+        Returns number of weights decayed.
+        """
+        with self._lock:
+            profile = self._profiles.get(user_id)
+            if not profile:
+                return 0
+            now = time.time()
+            half_life_secs = self.DECAY_HALF_LIFE_DAYS * 86400
+            user_ts = self._weight_timestamps.get(user_id, {})
+            decayed = 0
+
+            for weights_dict in (profile.topic_weights, profile.source_weights):
+                to_update: list[tuple[str, float]] = []
+                for key, value in weights_dict.items():
+                    last_touch = user_ts.get(key, now - half_life_secs)
+                    age_secs = now - last_touch
+                    if age_secs < half_life_secs * 0.5:
+                        continue  # too recent to decay
+                    # Exponential decay: value * 0.5^(age / half_life)
+                    decay_factor = 0.5 ** (age_secs / half_life_secs)
+                    new_val = value * decay_factor
+                    # Snap small values to zero (threshold at 0.05, not 0.01,
+                    # to avoid rounding artifacts where round(x, 3) = x)
+                    if abs(new_val) < 0.05:
+                        new_val = 0.0
+                    else:
+                        new_val = round(new_val, 3)
+                    if new_val != value:
+                        to_update.append((key, new_val))
+                        decayed += 1
+                for key, new_val in to_update:
+                    weights_dict[key] = new_val
+
+            # Prune zero weights after decay
+            if decayed:
+                self._prune_zero_weights(profile.topic_weights)
+                self._prune_zero_weights(profile.source_weights)
+
+            return decayed
+
+    # ── GDPR data export/deletion ────────────────────────────────
+
+    def export_user_data(self, user_id: str) -> dict | None:
+        """Export all data for a user (GDPR Article 20 — data portability).
+
+        Returns a JSON-serializable dict or None if user not found.
+        """
+        with self._lock:
+            profile = self._profiles.get(user_id)
+            if not profile:
+                return None
+            snapshot = self._snapshot_unlocked()
+            return snapshot.get(user_id)
+
+    def delete_user_data(self, user_id: str) -> bool:
+        """Delete all data for a user (GDPR Article 17 — right to erasure).
+
+        Returns True if user was found and deleted.
+        """
+        with self._lock:
+            if user_id not in self._profiles:
+                return False
+            del self._profiles[user_id]
+            self._weight_timestamps.pop(user_id, None)
+            log.info("Deleted all data for user %s (GDPR erasure)", user_id)
+            return True
 
 
 class CandidateCache:

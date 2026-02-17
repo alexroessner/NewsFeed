@@ -472,7 +472,7 @@ class NewsFeedEngine:
         # Pipeline trace metadata — powers /transparency command
         pipeline_trace = {
             "total_candidates_researched": len(all_candidates),
-            "valid_candidates": len(valid_candidates) if 'valid_candidates' in dir() else len(all_candidates),
+            "valid_candidates": len(valid_candidates),
             "research_time_ms": round(research_ms),
             "intelligence_time_ms": round(intel_ms),
             "expert_time_ms": round(expert_ms),
@@ -503,6 +503,13 @@ class NewsFeedEngine:
                 "intelligence_stages": active_stages,
                 "expert_influence": {eid: f"{inf:.2f}" for eid, inf, _ in self.experts.chair.rankings()},
                 "pipeline_trace": pipeline_trace,
+                "pipeline_health": {
+                    "agents_total": len(self.config.get("research_agents", [])),
+                    "agents_contributing": len(by_agent),
+                    "agents_silent": len(self.config.get("research_agents", [])) - len(by_agent),
+                    "stages_enabled": list(self._enabled_stages),
+                    "total_candidates": len(all_candidates),
+                },
             },
             briefing_type=briefing_type,
             threads=threads,
@@ -730,8 +737,10 @@ class NewsFeedEngine:
         for cmd in commands:
             if cmd.action == "topic_delta" and cmd.topic and cmd.value:
                 delta = float(cmd.value)
-                updated = self.preferences.apply_weight_adjustment(user_id, cmd.topic, delta)
+                updated, hint = self.preferences.apply_weight_adjustment(user_id, cmd.topic, delta)
                 results[f"topic:{cmd.topic}"] = str(updated.topic_weights.get(cmd.topic, 0.0))
+                if hint:
+                    results[f"hint:{cmd.topic}"] = hint
             elif cmd.action == "tone" and cmd.value:
                 self.preferences.apply_style_update(user_id, tone=cmd.value)
                 results["tone"] = cmd.value
@@ -748,11 +757,15 @@ class NewsFeedEngine:
                 self.preferences.apply_max_items(user_id, int(cmd.value))
                 results["max_items"] = cmd.value
             elif cmd.action == "source_boost" and cmd.topic:
-                self.preferences.apply_source_weight(user_id, cmd.topic, 1.0)
+                _, src_hint = self.preferences.apply_source_weight(user_id, cmd.topic, 1.0)
                 results[f"source:{cmd.topic}"] = "boosted"
+                if src_hint:
+                    results[f"hint:{cmd.topic}"] = src_hint
             elif cmd.action == "source_demote" and cmd.topic:
-                self.preferences.apply_source_weight(user_id, cmd.topic, -1.0)
+                _, src_hint = self.preferences.apply_source_weight(user_id, cmd.topic, -1.0)
                 results[f"source:{cmd.topic}"] = "demoted"
+                if src_hint:
+                    results[f"hint:{cmd.topic}"] = src_hint
             elif cmd.action == "remove_region" and cmd.value:
                 self.preferences.remove_region(user_id, cmd.value)
                 results["remove_region"] = cmd.value
@@ -865,11 +878,27 @@ class NewsFeedEngine:
         self._persistence.save("trends", self.trends.snapshot())
         self._persistence.save("optimizer", self.optimizer.snapshot())
         self._persistence.save("debate_chair", self.experts.chair.snapshot())
+        # Persist scheduler so scheduled briefings survive restarts
+        if hasattr(self, "_scheduler") and self._scheduler:
+            self._persistence.save("scheduler", self._scheduler.snapshot())
 
-    # Allowed values for validated string fields on restore
-    _VALID_TONES = frozenset({"concise", "detailed", "analytical", "casual"})
-    _VALID_FORMATS = frozenset({"bullet", "narrative", "brief", "detailed"})
-    _VALID_CADENCES = frozenset({"on_demand", "hourly", "daily", "weekly"})
+    # Allowed values for validated string fields on restore.
+    # IMPORTANT: These must be a superset of the values accepted by the
+    # user-facing parser in memory/commands.py.  A mismatch causes user
+    # settings to silently revert to defaults on every restart.
+    _VALID_TONES = frozenset({
+        "concise", "analyst", "brief", "deep", "executive",
+        # Legacy values (pre-parser-unification) kept for backwards compat
+        "detailed", "analytical", "casual",
+    })
+    _VALID_FORMATS = frozenset({
+        "bullet", "sections", "narrative",
+        "brief", "detailed",
+    })
+    _VALID_CADENCES = frozenset({
+        "on_demand", "morning", "evening", "realtime",
+        "hourly", "daily", "weekly",
+    })
     _VALID_URGENCIES = frozenset({"", "routine", "elevated", "breaking", "critical"})
 
     def _load_state(self) -> None:
@@ -1000,5 +1029,12 @@ class NewsFeedEngine:
                 if isinstance(topic, str) and isinstance(velocity, (int, float)):
                     self.trends._baseline[topic] = max(0.0, min(1.0, float(velocity)))
             log.info("Restored trend baselines for %d topics", len(trend_data))
+
+        # Restore scheduler state (schedules, timezones) so briefings survive restarts
+        if hasattr(self, "_scheduler") and self._scheduler:
+            sched_data = self._persistence.load("scheduler")
+            if sched_data and isinstance(sched_data, dict):
+                count = self._scheduler.restore(sched_data)
+                log.info("Restored %d briefing schedules from disk", count)
 
         log.info("State loaded from %s", self._persistence.state_dir)

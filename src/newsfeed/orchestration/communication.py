@@ -8,6 +8,8 @@ intelligence pipeline.
 from __future__ import annotations
 
 import logging
+import time
+from collections import defaultdict
 from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -30,6 +32,7 @@ from newsfeed.orchestration.handlers.management import (
     handle_unsave as _h_unsave,
     handle_untrack as _h_untrack,
 )
+from newsfeed.memory.commands import parse_preference_commands_rich
 from newsfeed.delivery.onboarding import (
     OnboardingState,
     apply_onboarding_profile,
@@ -49,6 +52,51 @@ _FALLBACK_TOPICS = {
     "technology": 0.6,
     "markets": 0.5,
 }
+
+
+class DeliveryMetrics:
+    """Track delivery success/failure rates across channels.
+
+    Provides a lightweight in-memory view of recent delivery health.
+    No persistence needed — resets on restart, which is fine for a
+    health dashboard that shows recent trends.
+    """
+
+    _CHANNELS = ("telegram", "webhook", "email")
+
+    def __init__(self) -> None:
+        self._success: dict[str, int] = defaultdict(int)
+        self._failure: dict[str, int] = defaultdict(int)
+        self._last_success: dict[str, float] = {}
+        self._last_failure: dict[str, float] = {}
+
+    def record_success(self, channel: str) -> None:
+        self._success[channel] += 1
+        self._last_success[channel] = time.monotonic()
+
+    def record_failure(self, channel: str) -> None:
+        self._failure[channel] += 1
+        self._last_failure[channel] = time.monotonic()
+
+    def success_rate(self, channel: str) -> float:
+        """Return success rate as 0.0–1.0. Returns 1.0 if no deliveries."""
+        total = self._success[channel] + self._failure[channel]
+        if total == 0:
+            return 1.0
+        return self._success[channel] / total
+
+    def summary(self) -> dict[str, Any]:
+        """Return health summary for all channels."""
+        result: dict[str, Any] = {}
+        for ch in self._CHANNELS:
+            total = self._success[ch] + self._failure[ch]
+            result[ch] = {
+                "success": self._success[ch],
+                "failure": self._failure[ch],
+                "total": total,
+                "rate": self.success_rate(ch),
+            }
+        return result
 
 
 class CommunicationAgent:
@@ -75,6 +123,7 @@ class CommunicationAgent:
         self._scheduler = scheduler
         self._default_topics = default_topics or _FALLBACK_TOPICS
         self._market = MarketTicker()
+        self._delivery_metrics = DeliveryMetrics()
         # Track items shown per user for "show more" dedup
         # All per-user dicts use BoundedUserDict to cap at 500 users
         # with LRU eviction — prevents unbounded memory growth.
@@ -86,8 +135,16 @@ class CommunicationAgent:
         # Per-user rate limiting for resource-intensive commands
         self._rate_limits: BoundedUserDict[float] = BoundedUserDict(maxlen=500)
         self._RATE_LIMIT_SECONDS = 15  # Min seconds between briefing/sitrep/quick
+        self._cmd_rate_windows: dict[str, list[float]] = {}  # Per-command sliding window
+        # Alert dedup: track which alerts have been sent to avoid repeat notifications.
+        # Key: "user_id:alert_type:region_or_topic", Value: monotonic timestamp.
+        self._sent_alerts: dict[str, float] = {}
+        _ALERT_COOLDOWN_SECONDS = 3600  # 1 hour between identical alerts
+        self._ALERT_COOLDOWN = _ALERT_COOLDOWN_SECONDS
         # Onboarding state for interactive setup flow
         self._onboarding: BoundedUserDict[OnboardingState] = BoundedUserDict(maxlen=500)
+        # Pending reset confirmations (user_id -> monotonic timestamp)
+        self._pending_resets: BoundedUserDict[float] = BoundedUserDict(maxlen=200)
         # Handler context for delegated command modules
         self._ctx = HandlerContext(
             engine=engine, bot=bot, scheduler=scheduler,
@@ -138,10 +195,13 @@ class CommunicationAgent:
             elif cmd_type == "onboard":
                 result = self._handle_onboard_callback(chat_id, user_id, command)
 
-        except Exception:
+        except Exception as exc:
             log.exception("Error handling update for user=%s", user_id)
-            self._bot.send_message(chat_id, "Something went wrong. Please try again.")
-            result = {"action": "error", "user_id": user_id}
+            # Categorize the error so the user gets actionable feedback
+            error_msg = self._categorize_error(exc)
+            self._bot.send_message(chat_id, error_msg)
+            result = {"action": "error", "user_id": user_id,
+                      "error_type": type(exc).__name__}
 
         # Analytics: record EVERY interaction
         self._engine.analytics.record_interaction(
@@ -173,6 +233,38 @@ class CommunicationAgent:
         self._rate_limits[user_id] = now
         return False
 
+    # Per-command rate limits for non-briefing commands (requests per minute)
+    _COMMAND_RATE_LIMITS: dict[str, tuple[int, int]] = {
+        "feedback": (10, 60),
+        "track": (20, 60),
+        "untrack": (20, 60),
+        "save": (20, 60),
+        "unsave": (20, 60),
+        "recall": (5, 60),
+        "more": (10, 60),
+    }
+
+    def _check_command_rate_limit(self, user_id: str, command: str) -> bool:
+        """Check per-command rate limit. Returns True if BLOCKED."""
+        limits = self._COMMAND_RATE_LIMITS.get(command)
+        if not limits:
+            return False
+        max_requests, window_secs = limits
+        now = time.monotonic()
+        key = f"{user_id}:{command}"
+        timestamps = self._cmd_rate_windows.get(key, [])
+        # Expire old timestamps
+        timestamps = [t for t in timestamps if now - t < window_secs]
+        if not timestamps:
+            # Clean up empty key to prevent unbounded growth
+            self._cmd_rate_windows.pop(key, None)
+        if len(timestamps) >= max_requests:
+            self._cmd_rate_windows[key] = timestamps
+            return True
+        timestamps.append(now)
+        self._cmd_rate_windows[key] = timestamps
+        return False
+
     def _handle_command(self, chat_id: int | str, user_id: str,
                         command: str, args: str) -> dict[str, Any]:
         """Route a slash command to the appropriate handler."""
@@ -187,6 +279,16 @@ class CommunicationAgent:
 
         if command == "briefing":
             return self._run_briefing(chat_id, user_id, args)
+
+        # Per-command rate limits for lighter commands
+        if self._check_command_rate_limit(user_id, command):
+            limits = self._COMMAND_RATE_LIMITS.get(command)
+            window = limits[1] if limits else 60
+            self._bot.send_message(
+                chat_id,
+                f"Too many /{command} requests — please wait up to {window}s.",
+            )
+            return {"action": "command_rate_limited", "user_id": user_id, "command": command}
 
         if command == "more":
             return self._show_more(chat_id, user_id, args)
@@ -225,8 +327,27 @@ class CommunicationAgent:
                 return _h_deep_dive_story(self._ctx, chat_id, user_id, story_num)
             except (ValueError, TypeError):
                 pass
-            # Otherwise run a fuller briefing
-            return self._run_briefing(chat_id, user_id, args, deep=True)
+            # No story number — prompt user to pick one
+            items = self._last_items.get(user_id, [])
+            if items:
+                import html as html_mod
+                lines = [
+                    "<b>\U0001f50d Which story to dive into?</b>",
+                    "",
+                ]
+                for i, item in enumerate(items[:10], 1):
+                    title = html_mod.escape(item.get("title", "")[:60])
+                    lines.append(f"  {i}. {title}")
+                lines.append("")
+                lines.append("<i>Tap \U0001f50d Dive deeper on a card, or type /deep_dive [number]</i>")
+                self._bot.send_message(chat_id, "\n".join(lines))
+            else:
+                self._bot.send_message(
+                    chat_id,
+                    "No stories to dive into. Run /briefing first, "
+                    "then tap \U0001f50d Dive deeper on any story card."
+                )
+            return {"action": "deep_dive_prompt", "user_id": user_id}
 
         if command == "quick":
             return self._run_quick_briefing(chat_id, user_id, args)
@@ -319,6 +440,36 @@ class CommunicationAgent:
             return self._handle_preset(chat_id, user_id, args)
 
         if command == "reset":
+            import time as _time
+            # Two-step confirmation to prevent accidental data loss.
+            # "reset confirm" or second /reset within 30s = execute.
+            if args.strip().lower() == "confirm":
+                pass  # confirmed via argument
+            elif user_id in self._pending_resets:
+                elapsed = _time.monotonic() - self._pending_resets.pop(user_id)
+                if elapsed > 30:
+                    # Confirmation expired — ask again
+                    self._pending_resets[user_id] = _time.monotonic()
+                    self._bot.send_message(
+                        chat_id,
+                        "\u26a0\ufe0f Confirmation expired. Send /reset again within 30 seconds "
+                        "or use /reset confirm to erase all preferences.",
+                    )
+                    return {"action": "reset_pending", "user_id": user_id}
+                # Confirmed by double /reset within 30s — fall through
+            else:
+                self._pending_resets[user_id] = _time.monotonic()
+                self._bot.send_message(
+                    chat_id,
+                    "\u26a0\ufe0f <b>This will erase ALL your preferences</b> "
+                    "(topics, sources, schedule, bookmarks, tracked stories).\n\n"
+                    "Send /reset again within 30 seconds to confirm, "
+                    "or /reset confirm to proceed immediately.",
+                    parse_mode="HTML",
+                )
+                return {"action": "reset_pending", "user_id": user_id}
+
+            self._pending_resets.pop(user_id, None)
             self._engine.preferences.reset(user_id)
             self._engine.apply_user_feedback(user_id, "reset preferences")
             self._shown_ids.pop(user_id, None)
@@ -332,6 +483,14 @@ class CommunicationAgent:
 
         if command == "admin":
             return self._handle_admin(chat_id, user_id, args)
+
+        if command == "_stale_callback":
+            self._bot.send_message(
+                chat_id,
+                "This button is no longer active. "
+                "Run /briefing for a fresh briefing with working controls."
+            )
+            return {"action": "stale_callback", "user_id": user_id}
 
         # Unknown command
         import html as html_mod
@@ -441,9 +600,19 @@ class CommunicationAgent:
             # Clean up onboarding state
             self._onboarding.pop(user_id, None)
 
+            # Auto-trigger first briefing — don't make user type /briefing
+            self._bot.send_message(
+                chat_id,
+                "<i>Generating your first personalized briefing...</i>"
+            )
+            self._run_briefing(chat_id, user_id)
+
             return {"action": "onboard_complete", "user_id": user_id,
                     "topics": state.selected_topics, "role": state.role,
                     "detail": state.detail_level}
+
+        # Unrecognized onboarding callback
+        return {"action": "onboard_unknown", "user_id": user_id}
 
     def _run_sitrep(self, chat_id: int | str, user_id: str,
                     args: str = "") -> dict[str, Any]:
@@ -696,8 +865,13 @@ class CommunicationAgent:
         # Build thread-to-story mapping for grouping
         thread_map = self._build_thread_map(payload)
 
+        # Build continuity summary from delta tags
+        continuity = self._build_continuity_summary(delta_tags, tracked_count)
+
         # Message 1: Header (ticker + exec summary + geo risks + trends + threads)
         header = formatter.format_header(payload, ticker_bar, tracked_count=tracked_count)
+        if continuity:
+            header += f"\n{continuity}"
         self._bot.send_message(chat_id, header)
 
         # Send story cards grouped by narrative thread
@@ -718,10 +892,25 @@ class CommunicationAgent:
             self._bot.send_story_card(chat_id, card, story_index=idx, is_tracked=is_tracked)
 
         if not payload.items:
-            self._bot.send_message(
-                chat_id,
-                "No stories matched your current filters. Try /feedback to adjust."
-            )
+            # Explain which filters caused the empty result
+            filter_hints = []
+            if profile.confidence_min > 0:
+                filter_hints.append(f"confidence \u2265 {profile.confidence_min:.0%}")
+            if profile.urgency_min:
+                filter_hints.append(f"urgency \u2265 {profile.urgency_min}")
+            if profile.max_per_source > 0:
+                filter_hints.append(f"max {profile.max_per_source}/source")
+            if profile.muted_topics:
+                filter_hints.append(f"{len(profile.muted_topics)} muted topics")
+            if filter_hints:
+                hint_str = ", ".join(filter_hints)
+                msg = (
+                    f"No stories passed your active filters ({hint_str}).\n"
+                    f"Try /filter confidence 0 or /feedback reset filters to see more."
+                )
+            else:
+                msg = "No stories matched your current interests. Try /feedback to adjust."
+            self._bot.send_message(chat_id, msg)
 
         # Topic discovery — surface emerging trends the user doesn't track
         if payload.trends and payload.items:
@@ -751,32 +940,53 @@ class CommunicationAgent:
 
     def _show_more(self, chat_id: int | str, user_id: str,
                    topic_hint: str = "") -> dict[str, Any]:
-        """Show more items from cache with HTML formatting, or run a fresh cycle."""
+        """Show more items from reserve cache with context, or signal caught-up state."""
         import html as html_mod
         topic = topic_hint.strip().lower().replace(" ", "_") if topic_hint else self._last_topic.get(user_id, "general")
+        topic_name = html_mod.escape(topic.replace("_", " ").title())
         seen = self._shown_ids.get(user_id, set())
 
         more = self._engine.show_more(user_id, topic, seen, limit=5)
 
         if more:
-            lines = [f"<b>More on {html_mod.escape(topic)}:</b>", ""]
+            # Context label — these are reserve items below the briefing threshold
+            lines = [
+                f"<b>More on {topic_name}</b> "
+                f"<i>(reserve stories \u2014 slightly below briefing threshold)</i>",
+                "",
+            ]
             for c in more:
                 title_esc = html_mod.escape(c.title)
+                score = c.composite_score()
+                conf_label = f" <i>({score:.0%} confidence)</i>"
                 if c.url and not c.url.startswith("https://example.com"):
-                    lines.append(f'\u2022 <a href="{html_mod.escape(c.url)}">{title_esc}</a> [{html_mod.escape(c.source)}]')
+                    lines.append(
+                        f'\u2022 <a href="{html_mod.escape(c.url)}">{title_esc}</a> '
+                        f'[{html_mod.escape(c.source)}]{conf_label}'
+                    )
                 else:
-                    lines.append(f"\u2022 {title_esc} [{html_mod.escape(c.source)}]")
+                    lines.append(
+                        f"\u2022 {title_esc} [{html_mod.escape(c.source)}]{conf_label}"
+                    )
                 if c.summary:
                     lines.append(f"  <i>{html_mod.escape(c.summary[:120])}</i>")
-                # Track as seen
                 self._shown_ids.setdefault(user_id, set()).add(c.candidate_id)
             self._bot.send_message(chat_id, "\n".join(lines))
             return {"action": "show_more", "user_id": user_id, "count": len(more)}
 
-        # Cache empty — run a fresh mini-cycle
-        import html as html_mod
-        self._bot.send_message(chat_id, f"Searching for more on {html_mod.escape(topic)}...")
-        return self._run_briefing(chat_id, user_id, topic_hint=topic)
+        # Cache exhausted — "all caught up" moment
+        total_seen = len(seen)
+        self._bot.send_message(
+            chat_id,
+            f"\u2705 <b>You're all caught up on {topic_name}!</b>\n\n"
+            f"You've seen {total_seen} stories on this topic today.\n"
+            f"No new high-confidence items since your last briefing.\n\n"
+            "<i>Check back in a few hours for new developments, or:\n"
+            "\u2022 /briefing \u2014 Full briefing on all topics\n"
+            "\u2022 /quick \u2014 Quick headline scan\n"
+            "\u2022 /filter confidence 0.5 \u2014 Lower threshold to see more</i>"
+        )
+        return {"action": "show_more_caught_up", "user_id": user_id, "seen": total_seen}
 
     def _detect_intent(self, text: str) -> tuple[str, str]:
         """Detect conversational intent from natural language text.
@@ -831,19 +1041,76 @@ class CommunicationAgent:
 
     def _handle_feedback(self, chat_id: int | str, user_id: str,
                          text: str) -> dict[str, Any]:
-        """Apply user feedback to preferences with rich weight preview."""
+        """Apply user feedback to preferences with fuzzy matching and rich preview."""
+        import html as html_mod
+
+        # Collect known topics for fuzzy matching
+        profile = self._engine.preferences.get_or_create(user_id)
+        known_topics = set(profile.topic_weights.keys())
+        known_topics.update(self._default_topics.keys())
+
+        # Parse with fuzzy matching to catch typos
+        parse_result = parse_preference_commands_rich(
+            text, known_topics=known_topics,
+            deltas=getattr(self._engine, '_preference_deltas', None),
+        )
+
+        # Surface unrecognized values immediately
+        if parse_result.unrecognized and not parse_result.commands:
+            hints = "\n".join(
+                f"\u2022 {html_mod.escape(u)}" for u in parse_result.unrecognized
+            )
+            self._bot.send_message(chat_id, f"\u26a0\ufe0f {hints}")
+            return {"action": "feedback_invalid", "user_id": user_id,
+                    "errors": parse_result.unrecognized}
+
+        # Apply via engine (use standard path for actual application)
         results = self._engine.apply_user_feedback(
             user_id, text, is_admin=self._is_admin(user_id)
         )
 
+        # Send a concise confirmation of each change applied
         if results:
-            import html as html_mod
-            # Build rich confirmation with weight preview
+            summary_lines = []
+            for k, v in results.items():
+                if not k.startswith("hint:"):
+                    summary_lines.append(f"{k} \u2192 {v}")
+            if summary_lines:
+                confirmation = "\n".join(summary_lines)
+                self._bot.send_message(
+                    chat_id,
+                    f"<b>Confirmed changes:</b>\n{html_mod.escape(confirmation)}",
+                )
+
+        # If rich parser corrected topics, re-apply with corrected topics
+        if parse_result.corrections and parse_result.commands:
+            for cmd in parse_result.commands:
+                if cmd.action == "topic_delta" and cmd.topic and cmd.value:
+                    delta = float(cmd.value)
+                    _, hint = self._engine.preferences.apply_weight_adjustment(
+                        user_id, cmd.topic, delta)
+                    results[f"topic:{cmd.topic}"] = str(
+                        self._engine.preferences.get_or_create(user_id)
+                        .topic_weights.get(cmd.topic, 0.0))
+                    if hint:
+                        results[f"hint:{cmd.topic}"] = hint
+
+        if results:
+            # Refresh profile after changes
             profile = self._engine.preferences.get_or_create(user_id)
             lines: list[str] = ["<b>Preferences updated:</b>", ""]
 
+            # Show corrections first so user knows what happened
+            for correction in parse_result.corrections:
+                lines.append(f"\U0001f504 <i>{html_mod.escape(correction)}</i>")
+            if parse_result.corrections:
+                lines.append("")
+
             for key, val in results.items():
-                lines.append(f"\u2022 {html_mod.escape(str(key))} = {html_mod.escape(str(val))}")
+                if key.startswith("hint:"):
+                    lines.append(f"\u26a0\ufe0f <i>{html_mod.escape(str(val))}</i>")
+                else:
+                    lines.append(f"\u2022 {html_mod.escape(str(key))} = {html_mod.escape(str(val))}")
 
             # Show updated topic balance if any topic changes
             topic_changes = [k for k in results if k.startswith("topic:")]
@@ -856,7 +1123,6 @@ class CommunicationAgent:
                     bar = "\u2588" * max(1, int(abs(weight) * 10))
                     lines.append(f"  {name}: {weight:.0%} {bar}")
                 lines.append("")
-                # Estimate effect on next briefing
                 total_items = profile.max_items
                 top_topic = sorted_topics[0][0].replace("_", " ").title() if sorted_topics else "general"
                 lines.append(
@@ -873,8 +1139,15 @@ class CommunicationAgent:
                     label = "\u2191 boosted" if sw > 0 else "\u2193 demoted"
                     lines.append(f"  {html_mod.escape(src)}: {label}")
 
+            # Surface any unrecognized parts alongside successful changes
+            if parse_result.unrecognized:
+                lines.append("")
+                for u in parse_result.unrecognized:
+                    lines.append(f"\u26a0\ufe0f <i>{html_mod.escape(u)}</i>")
+
             self._bot.send_message(chat_id, "\n".join(lines))
-            return {"action": "feedback", "user_id": user_id, "changes": results}
+            return {"action": "feedback", "user_id": user_id, "changes": results,
+                    "corrections": parse_result.corrections}
 
         # No preference match — try conversational intent detection
         intent, arg = self._detect_intent(text)
@@ -888,7 +1161,7 @@ class CommunicationAgent:
             return self._show_weekly(chat_id, user_id)
 
         if intent == "search_query":
-            return self._recall(chat_id, user_id, arg)
+            return _h_recall(self._ctx, chat_id, user_id, arg)
 
         if intent == "help_query":
             self._bot.send_message(chat_id, self._bot.format_help())
@@ -996,18 +1269,34 @@ class CommunicationAgent:
         item = items[item_num - 1]
         topic = item["topic"]
 
+        import html as html_mod
+        source = item.get("source", "")
+        topic_name = html_mod.escape(topic.replace("_", " ").title())
+        source_name = html_mod.escape(source) if source else ""
+
         if direction == "up":
             self._engine.apply_user_feedback(user_id, f"more {topic}")
-            if item.get("source"):
-                self._engine.preferences.apply_source_weight(user_id, item["source"], 0.3)
-            import html as html_mod
-            self._bot.send_message(chat_id, f"\U0001f44d Boosted {html_mod.escape(topic)} (story #{item_num})")
+            if source:
+                self._engine.preferences.apply_source_weight(user_id, source, 0.3)
+            # Show specific impact — make the learning feel immediate
+            profile = self._engine.preferences.get_or_create(user_id)
+            weight = profile.topic_weights.get(topic, 0.5)
+            msg = f"\U0001f44d Got it \u2014 more <b>{topic_name}</b>"
+            if source_name:
+                msg += f" from {source_name}"
+            msg += f"\n<i>Topic weight now {weight:.0%}. Next briefing will reflect this.</i>"
+            self._bot.send_message(chat_id, msg)
         elif direction == "down":
             self._engine.apply_user_feedback(user_id, f"less {topic}")
-            if item.get("source"):
-                self._engine.preferences.apply_source_weight(user_id, item["source"], -0.3)
-            import html as html_mod
-            self._bot.send_message(chat_id, f"\U0001f44e Reduced {html_mod.escape(topic)} (story #{item_num})")
+            if source:
+                self._engine.preferences.apply_source_weight(user_id, source, -0.3)
+            profile = self._engine.preferences.get_or_create(user_id)
+            weight = profile.topic_weights.get(topic, 0.5)
+            msg = f"\U0001f44e Got it \u2014 less <b>{topic_name}</b>"
+            if source_name:
+                msg += f" from {source_name}"
+            msg += f"\n<i>Topic weight now {weight:.0%}. Next briefing will reflect this.</i>"
+            self._bot.send_message(chat_id, msg)
         else:
             return {"action": "rate_error", "user_id": user_id}
 
@@ -1240,6 +1529,10 @@ class CommunicationAgent:
         self._scheduler.set_user_timezone(user_id, profile.timezone)
 
         msg = self._scheduler.set_schedule(user_id, schedule_type, time_str)
+        # Sync cadence to user profile so it survives persistence
+        cadence = schedule_type if schedule_type != "off" else "on_demand"
+        self._engine.preferences.apply_cadence(user_id, cadence)
+        self._persist_prefs(chat_id)
         self._bot.send_message(chat_id, msg)
         return {"action": "schedule", "user_id": user_id, "type": schedule_type}
 
@@ -1258,10 +1551,22 @@ class CommunicationAgent:
                 # Use user_id as chat_id for direct messages
                 self._run_briefing(user_id, user_id)
                 sent += 1
+                self._delivery_metrics.record_success("telegram")
                 # Auto-send email digest if user has email configured
                 self._auto_email_digest(user_id)
             except Exception:
                 log.exception("Failed to deliver scheduled briefing to user=%s", user_id)
+                self._delivery_metrics.record_failure("telegram")
+                # Notify the user so they know their briefing didn't arrive
+                try:
+                    self._bot.send_message(
+                        user_id,
+                        "\u26a0\ufe0f Your scheduled briefing could not be generated "
+                        "due to a temporary issue. You can run /briefing manually, "
+                        "or wait for your next scheduled delivery."
+                    )
+                except Exception:
+                    pass  # If we can't even notify, log already captured it
 
         # Also check for proactive tracked story updates
         try:
@@ -1277,12 +1582,27 @@ class CommunicationAgent:
 
         return sent
 
-    def _persist_prefs(self) -> None:
-        """Persist preferences immediately."""
+    def _persist_prefs(self, chat_id: int | str | None = None) -> bool:
+        """Persist preferences immediately. Returns True on success.
+
+        If chat_id is provided and persistence fails, notifies the user
+        so they know their change may not survive a restart.
+        """
         try:
             self._engine.persist_preferences()
+            return True
         except Exception:
             log.exception("Failed to persist preferences")
+            if chat_id is not None:
+                try:
+                    self._bot.send_message(
+                        chat_id,
+                        "\u26a0\ufe0f Your change was applied but could not be saved to disk. "
+                        "It may be lost if the system restarts. Please try again."
+                    )
+                except Exception:
+                    pass
+            return False
 
     def _set_watchlist(self, chat_id: int | str, user_id: str,
                        args: str) -> dict[str, Any]:
@@ -1338,9 +1658,22 @@ class CommunicationAgent:
             self._bot.send_message(
                 chat_id,
                 f"Current timezone: <code>{profile.timezone}</code>\n"
-                f"Set with: /timezone US/Eastern"
+                f"Set with: /timezone America/New_York"
             )
             return {"action": "timezone_show", "user_id": user_id}
+
+        # Validate timezone against zoneinfo database before accepting
+        try:
+            from zoneinfo import ZoneInfo
+            ZoneInfo(tz)  # Raises KeyError if invalid
+        except (KeyError, Exception):
+            import html as html_mod
+            self._bot.send_message(
+                chat_id,
+                f"Unknown timezone <code>{html_mod.escape(tz)}</code>.\n"
+                f"Examples: America/New_York, Europe/London, Asia/Tokyo, UTC"
+            )
+            return {"action": "timezone_invalid", "user_id": user_id}
 
         self._engine.preferences.set_timezone(user_id, tz)
         self._persist_prefs()
@@ -1415,128 +1748,6 @@ class CommunicationAgent:
         self._bot.send_message(chat_id, "\n".join(lines), reply_markup=keyboard)
         return {"action": "rate_prompt", "user_id": user_id}
 
-    def _track_story(self, chat_id: int | str, user_id: str,
-                     args: str) -> dict[str, Any]:
-        """Track a story from the last briefing for cross-session continuity."""
-        try:
-            story_num = int(args.strip())
-        except (ValueError, TypeError):
-            self._bot.send_message(chat_id, "Usage: tap the \U0001f4cc Track button on a story card.")
-            return {"action": "track_help", "user_id": user_id}
-
-        items = self._last_items.get(user_id, [])
-        if story_num < 1 or story_num > len(items):
-            self._bot.send_message(chat_id, "That story is no longer available. Run /briefing first.")
-            return {"action": "track_expired", "user_id": user_id}
-
-        item = items[story_num - 1]
-        topic = item["topic"]
-        headline = item["title"]
-
-        self._engine.preferences.track_story(user_id, topic, headline)
-        self._persist_prefs()
-        track_count = len(self._engine.preferences.get_or_create(user_id).tracked_stories)
-        import html as html_mod
-        self._bot.send_message(
-            chat_id,
-            f"\U0001f4cc Now tracking: <b>{html_mod.escape(headline)}</b>\n"
-            f"You'll see \U0001f4cc badges when new developments appear in future briefings.\n"
-            f"View tracked stories: /tracked\n"
-            f"<i>Tip: Use /timeline {track_count} to see this story's evolution over time</i>"
-        )
-        return {"action": "track", "user_id": user_id, "story": story_num}
-
-    def _show_tracked(self, chat_id: int | str, user_id: str) -> dict[str, Any]:
-        """Show all stories the user is currently tracking."""
-        import html as html_mod
-        profile = self._engine.preferences.get_or_create(user_id)
-        tracked = profile.tracked_stories
-
-        if not tracked:
-            self._bot.send_message(
-                chat_id,
-                "You're not tracking any stories yet.\n"
-                "Tap \U0001f4cc Track on a story card to follow it across briefings."
-            )
-            return {"action": "tracked_empty", "user_id": user_id}
-
-        lines = [f"<b>\U0001f4cc Tracked Stories ({len(tracked)})</b>", ""]
-        for i, t in enumerate(tracked, 1):
-            topic = html_mod.escape(t["topic"].replace("_", " ").title())
-            headline = html_mod.escape(t["headline"][:80])
-            lines.append(f"  {i}. <b>{headline}</b>")
-            lines.append(f"     <i>{topic}</i>")
-        lines.append("")
-        lines.append("<i>Untrack: /untrack [number]</i>")
-        self._bot.send_message(chat_id, "\n".join(lines))
-        return {"action": "tracked", "user_id": user_id, "count": len(tracked)}
-
-    def _untrack_story(self, chat_id: int | str, user_id: str,
-                       args: str) -> dict[str, Any]:
-        """Stop tracking a story by its position in /tracked list."""
-        try:
-            index = int(args.strip())
-        except (ValueError, TypeError):
-            self._bot.send_message(chat_id, "Usage: /untrack [number] — see /tracked for the list.")
-            return {"action": "untrack_help", "user_id": user_id}
-
-        profile = self._engine.preferences.get_or_create(user_id)
-        if index < 1 or index > len(profile.tracked_stories):
-            self._bot.send_message(chat_id, f"No tracked story #{index}. See /tracked for the list.")
-            return {"action": "untrack_invalid", "user_id": user_id}
-
-        removed = profile.tracked_stories[index - 1]
-        self._engine.preferences.untrack_story(user_id, index)
-        self._persist_prefs()
-        import html as html_mod
-        self._bot.send_message(
-            chat_id,
-            f"Stopped tracking: <b>{html_mod.escape(removed['headline'][:80])}</b>"
-        )
-        return {"action": "untrack", "user_id": user_id, "index": index}
-
-    def _compare_story(self, chat_id: int | str, user_id: str,
-                       args: str) -> dict[str, Any]:
-        """Show how different sources cover the same story."""
-        try:
-            story_num = int(args.strip())
-        except (ValueError, TypeError):
-            self._bot.send_message(chat_id, "Usage: /compare [story number]")
-            return {"action": "compare_help", "user_id": user_id}
-
-        item, others = self._engine.get_story_thread(user_id, story_num)
-        if not item:
-            self._bot.send_message(
-                chat_id,
-                f"Story #{story_num} not found. Run /briefing first."
-            )
-            return {"action": "compare_not_found", "user_id": user_id}
-
-        formatter = self._engine.formatter
-        card = formatter.format_comparison(item, others, story_num)
-        self._bot.send_message(chat_id, card)
-        return {"action": "compare", "user_id": user_id, "story": story_num,
-                "source_count": 1 + len(others)}
-
-    def _recall(self, chat_id: int | str, user_id: str,
-                args: str) -> dict[str, Any]:
-        """Search past briefing history for a keyword."""
-        keyword = args.strip()
-        if not keyword:
-            self._bot.send_message(
-                chat_id,
-                "Usage: /recall [keyword]\n"
-                "Example: /recall AI regulation"
-            )
-            return {"action": "recall_help", "user_id": user_id}
-
-        items = self._engine.analytics.search_briefing_items(user_id, keyword)
-        formatter = self._engine.formatter
-        card = formatter.format_recall(keyword, items)
-        self._bot.send_message(chat_id, card)
-        return {"action": "recall", "user_id": user_id, "keyword": keyword,
-                "results": len(items)}
-
     def check_tracked_updates(self) -> int:
         """Check for proactive tracked story updates across all users.
 
@@ -1599,7 +1810,7 @@ class CommunicationAgent:
                     self._engine.preferences.apply_weight_adjustment(user_id, topic, 0.1)
                     applied.append(f"Boosted {name} (+0.1) based on consistent positive ratings")
                 else:
-                    suggestions.append(f"{name} is already at max weight — you clearly love this topic")
+                    suggestions.append(f"{name} is already at max weight \u2014 you clearly love this topic")
             elif pct <= 20 and total >= 5:
                 # Strong negative signal — reduce
                 profile = self._engine.preferences.get_or_create(user_id)
@@ -1665,6 +1876,13 @@ class CommunicationAgent:
         sent = 0
         formatter = self._engine.formatter
 
+        # Evict expired alert dedup entries to prevent unbounded growth
+        now = time.monotonic()
+        self._sent_alerts = {
+            k: v for k, v in self._sent_alerts.items()
+            if now - v < self._ALERT_COOLDOWN
+        }
+
         # Check geo-risks from last pipeline run
         last_georisks = self._engine.georisk.snapshot()
         for region, risk_level in last_georisks.items():
@@ -1686,9 +1904,17 @@ class CommunicationAgent:
                 regions = profile_data.get("regions", [])
                 region_norm = {r.lower().replace(" ", "_") for r in regions}
                 if region.lower().replace(" ", "_") in region_norm:
+                    # Dedup: skip if same alert was sent recently
+                    alert_key = f"{user_id}:georisk:{region}"
+                    now = time.monotonic()
+                    last_sent = self._sent_alerts.get(alert_key)
+                    if last_sent is not None and now - last_sent < self._ALERT_COOLDOWN:
+                        continue
                     msg = formatter.format_intelligence_alert("georisk", alert_data)
                     self._bot.send_message(user_id, msg)
                     self._auto_webhook_alert(user_id, "georisk", alert_data)
+                    self._sent_alerts[alert_key] = now
+                    self._delivery_metrics.record_success("telegram")
                     sent += 1
 
         # Check trend spikes
@@ -1709,110 +1935,20 @@ class CommunicationAgent:
                     continue
                 weights = profile_data.get("topic_weights", {})
                 if weights.get(topic, 0) > 0.3:
+                    # Dedup: skip if same alert was sent recently
+                    alert_key = f"{user_id}:trend:{topic}"
+                    now = time.monotonic()
+                    last_sent = self._sent_alerts.get(alert_key)
+                    if last_sent is not None and now - last_sent < self._ALERT_COOLDOWN:
+                        continue
                     msg = formatter.format_intelligence_alert("trend", alert_data)
                     self._bot.send_message(user_id, msg)
                     self._auto_webhook_alert(user_id, "trend", alert_data)
+                    self._sent_alerts[alert_key] = now
+                    self._delivery_metrics.record_success("telegram")
                     sent += 1
 
         return sent
-
-    def _save_story(self, chat_id: int | str, user_id: str,
-                    args: str) -> dict[str, Any]:
-        """Bookmark a story from the last briefing."""
-        try:
-            story_num = int(args.strip())
-        except (ValueError, TypeError):
-            self._bot.send_message(chat_id, "Usage: tap the \U0001f516 Save button on a story card.")
-            return {"action": "save_help", "user_id": user_id}
-
-        items = self._last_items.get(user_id, [])
-        if story_num < 1 or story_num > len(items):
-            self._bot.send_message(chat_id, "That story is no longer available. Run /briefing first.")
-            return {"action": "save_expired", "user_id": user_id}
-
-        item = items[story_num - 1]
-        # Get URL from ReportItem if available
-        report_item = self._engine.get_report_item(user_id, story_num)
-        url = report_item.candidate.url if report_item else ""
-
-        self._engine.preferences.save_bookmark(
-            user_id,
-            title=item["title"],
-            source=item.get("source", ""),
-            url=url,
-            topic=item["topic"],
-        )
-        self._persist_prefs()
-
-        import html as html_mod
-        bookmark_count = len(self._engine.preferences.get_or_create(user_id).bookmarks)
-        self._bot.send_message(
-            chat_id,
-            f"\U0001f516 Saved: <b>{html_mod.escape(item['title'][:80])}</b>\n"
-            f"View bookmarks: /saved ({bookmark_count} total)\n"
-            f"<i>Tip: /export to get all stories as Markdown for your notes app</i>"
-        )
-        return {"action": "save", "user_id": user_id, "story": story_num}
-
-    def _show_saved(self, chat_id: int | str, user_id: str) -> dict[str, Any]:
-        """Show all bookmarked stories."""
-        profile = self._engine.preferences.get_or_create(user_id)
-        formatter = self._engine.formatter
-        card = formatter.format_bookmarks(profile.bookmarks)
-        self._bot.send_message(chat_id, card)
-        return {"action": "saved", "user_id": user_id, "count": len(profile.bookmarks)}
-
-    def _unsave_story(self, chat_id: int | str, user_id: str,
-                      args: str) -> dict[str, Any]:
-        """Remove a bookmark by index."""
-        try:
-            index = int(args.strip())
-        except (ValueError, TypeError):
-            self._bot.send_message(chat_id, "Usage: /unsave [number] \u2014 see /saved for the list.")
-            return {"action": "unsave_help", "user_id": user_id}
-
-        profile = self._engine.preferences.get_or_create(user_id)
-        if index < 1 or index > len(profile.bookmarks):
-            self._bot.send_message(chat_id, f"No bookmark #{index}. See /saved for the list.")
-            return {"action": "unsave_invalid", "user_id": user_id}
-
-        removed = profile.bookmarks[index - 1]
-        self._engine.preferences.remove_bookmark(user_id, index)
-        self._persist_prefs()
-        import html as html_mod
-        self._bot.send_message(
-            chat_id,
-            f"Removed bookmark: <b>{html_mod.escape(removed['title'][:80])}</b>"
-        )
-        return {"action": "unsave", "user_id": user_id, "index": index}
-
-    def _show_timeline(self, chat_id: int | str, user_id: str,
-                       args: str) -> dict[str, Any]:
-        """Show timeline of a tracked story's evolution from analytics."""
-        try:
-            index = int(args.strip())
-        except (ValueError, TypeError):
-            self._bot.send_message(
-                chat_id,
-                "Usage: /timeline [number] \u2014 where number is from /tracked list."
-            )
-            return {"action": "timeline_help", "user_id": user_id}
-
-        profile = self._engine.preferences.get_or_create(user_id)
-        if index < 1 or index > len(profile.tracked_stories):
-            self._bot.send_message(chat_id, f"No tracked story #{index}. See /tracked for the list.")
-            return {"action": "timeline_invalid", "user_id": user_id}
-
-        tracked = profile.tracked_stories[index - 1]
-        items = self._engine.analytics.get_story_timeline(
-            user_id, tracked["topic"], tracked["keywords"],
-        )
-
-        formatter = self._engine.formatter
-        card = formatter.format_timeline(tracked["headline"], items)
-        self._bot.send_message(chat_id, card)
-        return {"action": "timeline", "user_id": user_id, "index": index,
-                "results": len(items)}
 
     def _set_email(self, chat_id: int | str, user_id: str,
                    args: str) -> dict[str, Any]:
@@ -1831,6 +1967,10 @@ class CommunicationAgent:
             )
             return {"action": "email_show", "user_id": user_id}
 
+        # Security: reject CRLF injection and enforce length cap
+        if any(c in email for c in ("\r", "\n", "\x00")) or len(email) > 254:
+            self._bot.send_message(chat_id, "That doesn't look like a valid email address.")
+            return {"action": "email_invalid", "user_id": user_id}
         # Basic email validation
         if not re_mod.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
             self._bot.send_message(chat_id, "That doesn't look like a valid email address.")
@@ -1885,11 +2025,18 @@ class CommunicationAgent:
                 "message": "NewsFeed webhook connected successfully",
                 "user_id": user_id,
             }
-            success = send_webhook(profile.webhook_url, test_payload)
+            from newsfeed.delivery.webhook import send_webhook_with_detail
+            success, error_detail = send_webhook_with_detail(profile.webhook_url, test_payload)
             if success:
                 self._bot.send_message(chat_id, "\u2705 Test payload delivered successfully.")
             else:
-                self._bot.send_message(chat_id, "\u274c Delivery failed. Check your webhook URL.")
+                import html as html_mod
+                safe_detail = html_mod.escape(error_detail)
+                self._bot.send_message(
+                    chat_id,
+                    f"\u274c Delivery failed: {safe_detail}\n"
+                    f"Check your endpoint accepts POST with Content-Type: application/json."
+                )
             return {"action": "webhook_test", "user_id": user_id, "success": success}
 
         # Validate and set URL
@@ -2027,10 +2174,16 @@ class CommunicationAgent:
 
             html_body = digest.render(payload, tracked_flags, weekly)
             subject = f"Intelligence Digest \u2014 {datetime.now(timezone.utc).strftime('%b %d, %Y')}"
-            digest.send(profile.email, subject, html_body)
-            log.info("Auto-sent email digest to user=%s", user_id)
+            success = digest.send(profile.email, subject, html_body)
+            if success:
+                log.info("Auto-sent email digest to user=%s", user_id)
+                self._delivery_metrics.record_success("email")
+            else:
+                log.warning("Email digest send returned failure for user=%s", user_id)
+                self._delivery_metrics.record_failure("email")
         except Exception:
-            log.debug("Auto email digest failed for user=%s", user_id, exc_info=True)
+            log.warning("Auto email digest failed for user=%s", user_id, exc_info=True)
+            self._delivery_metrics.record_failure("email")
 
     def _build_thread_map(self, payload) -> dict[int, dict]:
         """Map 1-based story indices to their narrative thread info.
@@ -2064,21 +2217,78 @@ class CommunicationAgent:
 
         return result
 
+    # Webhook circuit breaker: after N consecutive failures, disable webhook
+    # and notify user via Telegram. Prevents hammering dead endpoints.
+    _WEBHOOK_MAX_FAILURES = 5
+    _webhook_fail_counts: dict[str, int] = {}
+
     def _auto_webhook_briefing(self, user_id: str, items: list) -> None:
         """Push briefing to user's webhook if configured."""
         profile = self._engine.preferences.get_or_create(user_id)
         if not profile.webhook_url or not items:
             return
+        # Circuit breaker: skip if already tripped
+        if self._webhook_fail_counts.get(user_id, 0) >= self._WEBHOOK_MAX_FAILURES:
+            return
         try:
             from newsfeed.delivery.webhook import (
-                _detect_platform, format_briefing_payload, send_webhook,
+                _detect_platform, format_briefing_payload, send_webhook, validate_webhook_url,
             )
+            # Re-validate URL at delivery time (DNS may have changed since setup)
+            valid, _err = validate_webhook_url(profile.webhook_url)
+            if not valid:
+                log.warning("Webhook URL failed re-validation for user=%s: %s", user_id, _err)
+                self._record_webhook_failure(user_id, profile)
+                return
             platform = _detect_platform(profile.webhook_url)
             payload = format_briefing_payload(user_id, items, platform)
-            send_webhook(profile.webhook_url, payload)
-            log.info("Webhook briefing pushed for user=%s", user_id)
+            success = send_webhook(profile.webhook_url, payload)
+            if success:
+                log.info("Webhook briefing pushed for user=%s", user_id)
+                self._webhook_fail_counts.pop(user_id, None)
+                self._delivery_metrics.record_success("webhook")
+            else:
+                self._record_webhook_failure(user_id, profile)
+                self._delivery_metrics.record_failure("webhook")
         except Exception:
-            log.debug("Webhook briefing failed for user=%s", user_id, exc_info=True)
+            log.warning("Webhook briefing failed for user=%s", user_id, exc_info=True)
+            self._record_webhook_failure(user_id, profile)
+            self._delivery_metrics.record_failure("webhook")
+
+    def _resolve_chat_id(self, user_id: str) -> str | int | None:
+        """Resolve a user_id to their most recent chat_id for notifications.
+
+        In Telegram DMs, chat_id == user_id, so we fall back to that if
+        analytics doesn't have a record.
+        """
+        try:
+            summary = self._engine.analytics.get_user_summary(user_id)
+            if summary and summary.get("chat_id"):
+                return summary["chat_id"]
+        except Exception:
+            pass
+        # In Telegram DMs, user_id works as chat_id
+        return user_id
+
+    def _record_webhook_failure(self, user_id: str, profile) -> None:
+        """Track webhook failures and disable after too many consecutive ones."""
+        count = self._webhook_fail_counts.get(user_id, 0) + 1
+        self._webhook_fail_counts[user_id] = count
+        if count >= self._WEBHOOK_MAX_FAILURES:
+            log.warning("Webhook disabled for user=%s after %d consecutive failures", user_id, count)
+            chat_id = self._resolve_chat_id(user_id)
+            if chat_id:
+                try:
+                    self._bot.send_message(
+                        chat_id,
+                        f"\u26a0\ufe0f Your webhook has been disabled after {count} consecutive delivery "
+                        f"failures. Briefings will continue via Telegram.\n"
+                        f"Fix your endpoint and run /webhook test to re-enable."
+                    )
+                except Exception:
+                    pass
+            profile.webhook_url = ""
+            self._persist_prefs()
 
     def _auto_webhook_alert(self, user_id: str, alert_type: str,
                             alert_data: dict) -> None:
@@ -2089,12 +2299,51 @@ class CommunicationAgent:
         try:
             from newsfeed.delivery.webhook import (
                 _detect_platform, format_alert_payload, send_webhook,
+                validate_webhook_url,
             )
+            # Re-validate URL at delivery time (same as briefing webhook)
+            valid, _err = validate_webhook_url(profile.webhook_url)
+            if not valid:
+                log.warning("Webhook alert URL failed re-validation for user=%s: %s", user_id, _err)
+                return
             platform = _detect_platform(profile.webhook_url)
             payload = format_alert_payload(alert_type, alert_data, platform)
-            send_webhook(profile.webhook_url, payload)
+            success = send_webhook(profile.webhook_url, payload)
+            if success:
+                self._delivery_metrics.record_success("webhook")
+            else:
+                self._delivery_metrics.record_failure("webhook")
         except Exception:
             log.debug("Webhook alert failed for user=%s", user_id, exc_info=True)
+            self._delivery_metrics.record_failure("webhook")
+
+    @staticmethod
+    def _build_continuity_summary(delta_tags: list[str], tracked_count: int) -> str:
+        """Build a one-line continuity header from delta tags.
+
+        Returns something like: "Since last briefing: 6 new, 3 developing, 1 tracked"
+        This is the #1 thing a returning user scans for — what changed?
+        """
+        from collections import Counter
+        counts = Counter(delta_tags)
+        new = counts.get("new", 0)
+        developing = counts.get("developing", 0)
+        updated = counts.get("updated", 0)
+
+        if not any([new, developing, updated]):
+            return ""
+
+        parts: list[str] = []
+        if new:
+            parts.append(f"{new} new")
+        if developing:
+            parts.append(f"{developing} developing")
+        if updated:
+            parts.append(f"{updated} updated")
+        if tracked_count:
+            parts.append(f"{tracked_count} tracked")
+
+        return f"<i>Since last briefing: {', '.join(parts)}</i>"
 
     def _compute_delta_tags(self, user_id: str,
                             payload) -> list[str]:
@@ -2274,35 +2523,6 @@ class CommunicationAgent:
         return {"action": "export", "user_id": user_id,
                 "length": len(markdown)}
 
-    def _deep_dive_story(self, chat_id: int | str, user_id: str,
-                         story_num: int) -> dict[str, Any]:
-        """Deep dive into a specific story from the last briefing.
-
-        Shows full analysis: confidence band, key assumptions,
-        evidence/novelty breakdown, discovery agent, lifecycle stage.
-        """
-        item = self._engine.get_report_item(user_id, story_num)
-        if not item:
-            self._bot.send_message(
-                chat_id,
-                f"Story #{story_num} not found. Run /briefing first, then tap Dive deeper."
-            )
-            return {"action": "deep_dive_not_found", "user_id": user_id}
-
-        formatter = self._engine.formatter
-        card = formatter.format_deep_dive(item, story_num)
-        self._bot.send_message(chat_id, card)
-
-        self._engine.analytics.record_interaction(
-            user_id=user_id, chat_id=chat_id,
-            interaction_type="deep_dive", command="deep_dive",
-            args=str(story_num), raw_text="",
-            result_action="deep_dive_story",
-            result_data={"story": story_num, "title": item.candidate.title},
-        )
-
-        return {"action": "deep_dive_story", "user_id": user_id, "story": story_num}
-
     def _show_stats(self, chat_id: int | str,
                     user_id: str) -> dict[str, Any]:
         """Show personal analytics dashboard with engagement metrics."""
@@ -2473,7 +2693,10 @@ class CommunicationAgent:
             if not name:
                 self._bot.send_message(chat_id, "Usage: /preset save [name]")
                 return {"action": "preset_save_help", "user_id": user_id}
-            self._engine.preferences.save_preset(user_id, name)
+            _, preset_err = self._engine.preferences.save_preset(user_id, name)
+            if preset_err:
+                self._bot.send_message(chat_id, preset_err)
+                return {"action": "preset_save_error", "user_id": user_id}
             self._persist_prefs()
             self._bot.send_message(
                 chat_id,
@@ -2716,16 +2939,37 @@ class CommunicationAgent:
         )
         return {"action": "source_help", "user_id": user_id}
 
+    # Rate limit for /source add: max 3 source additions per 60 seconds per user.
+    _SOURCE_ADD_WINDOW = 60
+    _SOURCE_ADD_MAX = 3
+
     def _source_add(self, chat_id: int | str, user_id: str,
                     args: str) -> dict[str, Any]:
         """Handle /source add <url> [name] — discover, validate, and register a feed."""
         import html as html_mod
+        import time as _time
         from urllib.parse import urlparse
 
         from newsfeed.agents.dynamic_sources import (
             discover_feed,
             validate_source_name,
         )
+
+        # Per-user rate limit for source additions to prevent abuse/DoS.
+        if not hasattr(self, "_source_add_times"):
+            self._source_add_times: BoundedUserDict[list[float]] = BoundedUserDict(maxlen=500)
+        now = _time.monotonic()
+        times = self._source_add_times.get(user_id, [])
+        times = [t for t in times if now - t < self._SOURCE_ADD_WINDOW]
+        if len(times) >= self._SOURCE_ADD_MAX:
+            self._bot.send_message(
+                chat_id,
+                f"\u26a0\ufe0f Rate limited: max {self._SOURCE_ADD_MAX} source additions "
+                f"per {self._SOURCE_ADD_WINDOW} seconds. Please wait.",
+            )
+            return {"action": "source_add_rate_limited", "user_id": user_id}
+        times.append(now)
+        self._source_add_times[user_id] = times
 
         if not args:
             self._bot.send_message(
@@ -2883,7 +3127,7 @@ class CommunicationAgent:
 
         if field == "confidence":
             try:
-                val = float(value)
+                val = max(0.0, min(float(value), 1.0))
                 self._engine.preferences.set_filter(user_id, "confidence", str(val))
                 self._persist_prefs()
                 label = f"{val:.0%}" if val > 0 else "off"
@@ -2917,6 +3161,7 @@ class CommunicationAgent:
         if field in ("max_per_source", "source_limit"):
             try:
                 val = int(value) if value.lower() != "off" else 0
+                val = max(0, min(val, 10))
                 self._engine.preferences.set_filter(user_id, "max_per_source", str(val))
                 self._persist_prefs()
                 label = str(val) if val > 0 else "off"
@@ -2930,7 +3175,7 @@ class CommunicationAgent:
 
         if field == "georisk":
             try:
-                val = float(value)
+                val = max(0.1, min(float(value), 1.0))
                 self._engine.preferences.set_filter(user_id, "georisk", str(val))
                 self._persist_prefs()
                 self._bot.send_message(
@@ -2944,7 +3189,7 @@ class CommunicationAgent:
 
         if field == "trend":
             try:
-                val = float(value)
+                val = max(1.5, min(float(value), 10.0))
                 self._engine.preferences.set_filter(user_id, "trend", str(val))
                 self._persist_prefs()
                 self._bot.send_message(
@@ -3012,6 +3257,41 @@ class CommunicationAgent:
     # ADMIN COMMANDS — owner-only analytics dashboard via Telegram
     # ──────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _categorize_error(exc: Exception) -> str:
+        """Turn an exception into a user-friendly message.
+
+        Instead of generic "Something went wrong", tell the user what
+        class of problem occurred so they can decide whether to retry,
+        wait, or report.
+        """
+        name = type(exc).__name__
+        msg = str(exc)[:100] if str(exc) else ""
+
+        if "timeout" in name.lower() or "timeout" in msg.lower():
+            return (
+                "\u23f3 The request timed out. News sources may be slow right now. "
+                "Please try again in a moment."
+            )
+        if "connection" in name.lower() or "urlerror" in name.lower():
+            return (
+                "\U0001f310 Network error \u2014 couldn't reach news sources. "
+                "Check your connection and try again."
+            )
+        if "permission" in name.lower() or "auth" in name.lower():
+            return (
+                "\U0001f512 Access error. If this persists, contact the bot admin."
+            )
+        if isinstance(exc, (ValueError, TypeError, KeyError)):
+            return (
+                "\u26a0\ufe0f Something unexpected happened while processing your request. "
+                "Try again, or use /help to see available commands."
+            )
+        return (
+            "\u26a0\ufe0f Something went wrong. "
+            "Try again in a moment, or use /help for available commands."
+        )
+
     def _is_admin(self, user_id: str) -> bool:
         """Check if user is the admin/owner.
 
@@ -3054,7 +3334,8 @@ class CommunicationAgent:
                 "/admin request [id] \u2014 Full request detail\n"
                 "/admin topics \u2014 Top topics (30 days)\n"
                 "/admin sources \u2014 Top sources (30 days)\n"
-                "/admin briefings [user_id] \u2014 User briefing history"
+                "/admin briefings [user_id] \u2014 User briefing history\n"
+                "/admin health \u2014 Delivery success rates"
             ))
             return {"action": "admin_help", "user_id": user_id}
 
@@ -3283,6 +3564,20 @@ class CommunicationAgent:
                 )
             self._bot.send_message(chat_id, "\n".join(lines))
             return {"action": "admin_briefings", "user_id": user_id}
+
+        if subcmd == "health":
+            health = self._delivery_metrics.summary()
+            lines = ["<b>Delivery Health</b>", ""]
+            for ch in ("telegram", "webhook", "email"):
+                h = health[ch]
+                rate_pct = h["rate"] * 100
+                icon = "\u2705" if rate_pct >= 95 else ("\u26a0\ufe0f" if rate_pct >= 80 else "\u274c")
+                lines.append(
+                    f"  {icon} {ch}: {h['success']}/{h['total']} "
+                    f"({rate_pct:.0f}% success)"
+                )
+            self._bot.send_message(chat_id, "\n".join(lines))
+            return {"action": "admin_health", "user_id": user_id}
 
         self._bot.send_message(chat_id, f"Unknown admin command: {html_mod.escape(subcmd)}. Try /admin help")
         return {"action": "admin_unknown", "user_id": user_id}

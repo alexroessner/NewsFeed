@@ -27,7 +27,7 @@ python -m newsfeed.orchestration.bootstrap
 
 ## API keys
 
-Copy `.env.example` to `.env` for reference. Keys go in `config/pipelines.json` under `api_keys`. All keys are optional — agents without keys fall back to simulated data. Free agents (BBC, HackerNews, Al Jazeera, arXiv, GDELT, Google News) work without any keys.
+API keys go in `config/secrets.json` (gitignored) or directly in `config/pipelines.json` under `api_keys`. See `.env.example` for the full list of supported keys. All keys are optional — agents without keys fall back to simulated data. Free agents (BBC, HackerNews, Al Jazeera, arXiv, GDELT, Google News) work without any keys.
 
 ## Tests
 

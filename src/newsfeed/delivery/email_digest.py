@@ -147,11 +147,20 @@ class EmailDigest:
 
         return "\n".join(parts)
 
+    @staticmethod
+    def _sanitize_header(value: str) -> str:
+        """Strip characters that could inject additional email headers."""
+        return value.replace("\r", "").replace("\n", "").replace("\x00", "")
+
     def send(self, to_address: str, subject: str, html_body: str) -> bool:
         """Send an HTML email via SMTP."""
         if not self.is_configured:
             log.warning("Email not configured — skipping send to %s", to_address)
             return False
+
+        # Defense-in-depth: strip CRLF to prevent header injection
+        to_address = self._sanitize_header(to_address)
+        subject = self._sanitize_header(subject)
 
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject

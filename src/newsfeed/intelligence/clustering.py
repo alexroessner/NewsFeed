@@ -118,6 +118,8 @@ class StoryClustering:
 
     def _compute_confidence(self, items: list[CandidateItem],
                             score_cache: dict[str, float] | None = None) -> ConfidenceBand:
+        if not items:
+            return ConfidenceBand(low=0.0, mid=0.0, high=0.0, key_assumptions=["No items in cluster"])
         scores = [score_cache[c.candidate_id] if score_cache else c.composite_score() for c in items]
         sources = {c.source for c in items}
         avg = sum(scores) / len(scores)

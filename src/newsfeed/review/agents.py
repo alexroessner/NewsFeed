@@ -159,16 +159,21 @@ class StyleReviewAgent:
 
     def _rewrite_why(self, base: str, c: CandidateItem, profile: UserProfile,
                      templates: dict[str, str]) -> str:
-        # Use the full summary as the basis — it's the actual story content
-        summary = c.summary.strip()
-        if not summary:
-            summary = c.title.strip()
+        # Use the narrative-generated base text — it explains *why* the story
+        # matters (source quality, corroboration, urgency, user alignment).
+        # The summary is already shown separately; duplicating it here wastes
+        # the reader's time and discards the pipeline's analytical value.
+        text = base.strip()
+        if not text:
+            # Fallback only if narrative generation returned nothing
+            text = c.title.strip()
 
-        # Corroboration adds genuine editorial value
-        if c.corroborated_by:
-            summary += f" Confirmed by {', '.join(c.corroborated_by[:2])}."
+        # Add urgency framing if not already present
+        urgency_prefix = self._urgency_framing.get(c.urgency, "")
+        if urgency_prefix and urgency_prefix.strip().rstrip(".").lower() not in text.lower():
+            text = f"{urgency_prefix}{text}"
 
-        return summary
+        return text
 
     def _rewrite_changed(self, base: str, c: CandidateItem,
                          templates: dict[str, str]) -> str:
@@ -218,16 +223,36 @@ class StyleReviewAgent:
 
         return f"{prefix}{'; '.join(parts)}."
 
+    @staticmethod
+    def _sanitize_for_prompt(value: str, max_len: int = 50) -> str:
+        """Sanitize user-controlled values before embedding in LLM prompts.
+
+        Strips characters that could be used for prompt injection:
+        newlines, control sequences, and instruction-like prefixes.
+        """
+        # Remove newlines and control chars
+        cleaned = re.sub(r"[\n\r\x00-\x1f]", " ", str(value))
+        # Collapse whitespace
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        # Truncate to prevent overlong injections
+        return cleaned[:max_len]
+
     def _review_llm(self, item: ReportItem, profile: UserProfile) -> ReportItem:
         """Use LLM to rewrite report item fields for style."""
         c = item.candidate
+        safe_tone = self._sanitize_for_prompt(profile.tone, 20)
+        safe_format = self._sanitize_for_prompt(profile.format, 20)
+        safe_topics = ", ".join(
+            self._sanitize_for_prompt(k, 30)
+            for k, v in profile.topic_weights.items() if v > 0.3
+        )
         system_prompt = (
             "You are an editorial style agent for a personal news intelligence system. "
             "Your job is to rewrite three text fields so they match the user's preferred tone "
             "and voice. Maintain all factual content — only reshape the presentation.\n\n"
-            f"User's preferred tone: {profile.tone}\n"
-            f"User's preferred format: {profile.format}\n"
-            f"User's high-priority topics: {', '.join(k for k, v in profile.topic_weights.items() if v > 0.3)}\n"
+            f"User's preferred tone: {safe_tone}\n"
+            f"User's preferred format: {safe_format}\n"
+            f"User's high-priority topics: {safe_topics}\n"
         )
         if self._persona_context:
             system_prompt += f"Review lenses to apply: {'; '.join(self._persona_context)}\n"

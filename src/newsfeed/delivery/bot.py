@@ -95,37 +95,76 @@ class TelegramBot:
     # Core API methods
     # ──────────────────────────────────────────────────────────────
 
+    _MAX_RETRIES = 3
+    _RETRY_BASE_DELAY = 1.0  # seconds
+
     def _api_call(self, method: str, params: dict | None = None, data: dict | None = None) -> dict:
-        """Make a Telegram Bot API call."""
+        """Make a Telegram Bot API call with retry on 429 rate limits."""
         url = f"{self._base_url}/{method}"
 
-        try:
-            if data:
-                body = json.dumps(data).encode("utf-8")
-                req = urllib.request.Request(
-                    url,
-                    data=body,
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-            elif params:
-                url = f"{url}?{urlencode(params)}"
-                req = urllib.request.Request(url)
-            else:
-                req = urllib.request.Request(url)
+        for attempt in range(self._MAX_RETRIES + 1):
+            try:
+                if data:
+                    body = json.dumps(data).encode("utf-8")
+                    req = urllib.request.Request(
+                        url,
+                        data=body,
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                elif params:
+                    call_url = f"{url}?{urlencode(params)}"
+                    req = urllib.request.Request(call_url)
+                else:
+                    req = urllib.request.Request(url)
 
-            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-                result = json.loads(resp.read().decode("utf-8"))
+                with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                    result = json.loads(resp.read().decode("utf-8"))
 
-            if not result.get("ok"):
-                log.error("Telegram API error: %s", result.get("description", "unknown"))
+                if not result.get("ok"):
+                    log.error("Telegram API error: %s", result.get("description", "unknown"))
+                    return {}
+
+                return result.get("result", {})
+
+            except urllib.error.HTTPError as e:
+                if e.code == 429 and attempt < self._MAX_RETRIES:
+                    # Respect Retry-After header if present, otherwise exponential backoff
+                    retry_after = None
+                    try:
+                        err_body = json.loads(e.read().decode("utf-8"))
+                        retry_after = err_body.get("parameters", {}).get("retry_after")
+                    except (json.JSONDecodeError, OSError):
+                        pass
+                    delay = retry_after if retry_after else self._RETRY_BASE_DELAY * (2 ** attempt)
+                    delay = min(delay, 30)  # cap at 30s
+                    log.warning("Telegram 429 rate limit on %s, retrying in %.1fs (attempt %d/%d)",
+                                method, delay, attempt + 1, self._MAX_RETRIES)
+                    time.sleep(delay)
+                    continue
+                # Retry on server errors (5xx) — these are transient
+                if e.code >= 500 and attempt < self._MAX_RETRIES:
+                    delay = self._RETRY_BASE_DELAY * (2 ** attempt)
+                    log.warning("Telegram %d error on %s, retrying in %.1fs (attempt %d/%d)",
+                                e.code, method, delay, attempt + 1, self._MAX_RETRIES)
+                    time.sleep(delay)
+                    continue
+                log.error("Telegram API call %s failed: HTTP %d %s", method, e.code, e)
                 return {}
-
-            return result.get("result", {})
-
-        except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, OSError, ValueError) as e:
-            log.error("Telegram API call %s failed: %s", method, e)
-            return {}
+            except (urllib.error.URLError, OSError) as e:
+                # Retry on network errors (timeout, connection refused, DNS failure)
+                if attempt < self._MAX_RETRIES:
+                    delay = self._RETRY_BASE_DELAY * (2 ** attempt)
+                    log.warning("Telegram network error on %s: %s, retrying in %.1fs (attempt %d/%d)",
+                                method, e, delay, attempt + 1, self._MAX_RETRIES)
+                    time.sleep(delay)
+                    continue
+                log.error("Telegram API call %s failed after %d retries: %s", method, self._MAX_RETRIES, e)
+                return {}
+            except (json.JSONDecodeError, ValueError) as e:
+                log.error("Telegram API call %s failed: %s", method, e)
+                return {}
+        return {}
 
     def get_me(self) -> dict:
         """Verify bot token and get bot info."""
@@ -392,7 +431,16 @@ class TelegramBot:
                     "args": "",
                     "text": "",
                 }
-            return None
+            # Unknown callback — log and surface as stale action
+            log.warning("Unknown callback_data: %r from user=%s", data, user_id)
+            return {
+                "type": "command",
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "command": "_stale_callback",
+                "args": data,
+                "text": "",
+            }
 
         # Handle text messages
         msg = update.get("message", {})
@@ -621,6 +669,30 @@ class BriefingScheduler:
             # Invalid timezone or zoneinfo unavailable — fall back to UTC
             return datetime.now(timezone.utc).strftime("%H:%M")
 
+    @staticmethod
+    def _time_within_window(schedule_time: str, current_time: str,
+                            window_minutes: int = 2) -> bool:
+        """Check if current_time is within window_minutes of schedule_time.
+
+        Both are HH:MM strings. Uses a forward window so that if the
+        scheduler poll misses the exact minute, the briefing still fires.
+        The 120-second cooldown in get_due_users() prevents duplicates.
+        """
+        try:
+            sh, sm = int(schedule_time[:2]), int(schedule_time[3:5])
+            ch, cm = int(current_time[:2]), int(current_time[3:5])
+        except (ValueError, IndexError):
+            return False
+        sched_mins = sh * 60 + sm
+        curr_mins = ch * 60 + cm
+        diff = curr_mins - sched_mins
+        # Handle midnight wrap (e.g., schedule=23:59, current=00:01)
+        if diff > 720:
+            diff -= 1440
+        elif diff < -720:
+            diff += 1440
+        return 0 <= diff < window_minutes
+
     def set_schedule(self, user_id: str, schedule_type: str, time_str: str = "") -> str:
         """Set a briefing schedule for a user.
 
@@ -666,7 +738,7 @@ class BriefingScheduler:
                     continue
 
                 user_now = self._user_local_time(user_id)
-                if schedule["time"] == user_now:
+                if self._time_within_window(schedule["time"], user_now):
                     last = self._last_sent.get(user_id, 0)
                     if time.time() - last > 120:
                         due.append(user_id)
@@ -701,5 +773,28 @@ class BriefingScheduler:
     def snapshot(self) -> dict:
         return {
             "schedules": dict(self._schedules),
+            "timezones": dict(self._user_timezones),
             "muted": {uid: until for uid, until in self._muted_until.items() if time.time() < until},
         }
+
+    def restore(self, data: dict) -> int:
+        """Restore scheduler state from a persisted snapshot.
+
+        Returns the number of schedules restored.
+        """
+        restored = 0
+        schedules = data.get("schedules")
+        if isinstance(schedules, dict):
+            for uid, sched in schedules.items():
+                if isinstance(uid, str) and isinstance(sched, dict):
+                    stype = sched.get("type", "")
+                    stime = sched.get("time", "")
+                    if stype in ("morning", "evening", "realtime"):
+                        self._schedules[uid] = {"type": stype, "time": stime}
+                        restored += 1
+        timezones = data.get("timezones")
+        if isinstance(timezones, dict):
+            for uid, tz in timezones.items():
+                if isinstance(uid, str) and isinstance(tz, str) and len(tz) <= 40:
+                    self._user_timezones[uid] = tz
+        return restored

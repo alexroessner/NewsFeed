@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import re
+from typing import Sequence
 
 from newsfeed.models.domain import (
     BriefingType,
@@ -12,6 +13,32 @@ from newsfeed.models.domain import (
     TrendSnapshot,
     UrgencyLevel,
 )
+
+
+def _close_unclosed_html_tags(text: str) -> str:
+    """Close any unclosed HTML tags to prevent garbled rendering in Telegram.
+
+    Only handles the subset of tags Telegram supports: b, i, a, code, pre, u, s.
+    """
+    _TELEGRAM_TAGS = {"b", "i", "a", "code", "pre", "u", "s"}
+    open_stack: list[str] = []
+    for m in re.finditer(r"<(/?)(\w+)(?:\s[^>]*)?>", text):
+        is_close = m.group(1) == "/"
+        tag = m.group(2).lower()
+        if tag not in _TELEGRAM_TAGS:
+            continue
+        if is_close:
+            # Pop matching tag from stack (if present)
+            for j in range(len(open_stack) - 1, -1, -1):
+                if open_stack[j] == tag:
+                    open_stack.pop(j)
+                    break
+        else:
+            open_stack.append(tag)
+    # Close remaining open tags in reverse order
+    for tag in reversed(open_stack):
+        text += f"</{tag}>"
+    return text
 
 _URGENCY_ICON = {
     UrgencyLevel.ROUTINE: "",
@@ -41,6 +68,21 @@ _HEAVY_LINE = "\u2501" * 28
 def _esc(text: str) -> str:
     """Escape HTML special characters for Telegram."""
     return html.escape(text, quote=False)
+
+
+def _esc_md(text: str) -> str:
+    """Escape Markdown special characters for export to note-taking apps.
+
+    Preserves readability while preventing accidental formatting like
+    *bold*, _italic_, [links], or #headings from source text.
+    """
+    for ch in ("\\", "`", "*", "_", "{", "}", "[", "]", "(", ")", "#", "+", "-", ".", "!"):
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
+
+# Telegram message limit with safety margin for HTML overhead
+_MAX_CARD_LENGTH = 3800
 
 
 _SAFE_URL_SCHEMES = frozenset({"http", "https", "ftp"})
@@ -353,6 +395,12 @@ class TelegramFormatter:
         # ── Metadata footer ──
         meta_parts: list[str] = []
 
+        # Reading time estimate from card word count
+        word_count = len((c.summary or "").split()) + len((item.why_it_matters or "").split())
+        if word_count > 20:
+            read_min = max(1, round(word_count / 200))
+            meta_parts.append(f"{read_min} min read")
+
         conf = _confidence_label(item)
         if conf:
             meta_parts.append(conf)
@@ -379,24 +427,61 @@ class TelegramFormatter:
                 lines.append("")
                 lines.append("<b>Related:</b> " + " \u2022 ".join(reads))
 
-        return "\n".join(lines).strip()
+        result = "\n".join(lines).strip()
+
+        # Safety: truncate if approaching Telegram's 4096 char limit
+        if len(result) > _MAX_CARD_LENGTH:
+            result = result[:_MAX_CARD_LENGTH - 60]
+            # Cut at last complete line to avoid broken HTML tags
+            last_nl = result.rfind("\n")
+            if last_nl > _MAX_CARD_LENGTH // 2:
+                result = result[:last_nl]
+            result = _close_unclosed_html_tags(result)
+            result += "\n\n<i>[Card truncated \u2014 tap \U0001f50d Dive deeper for full analysis]</i>"
+
+        return result
 
     def format_footer(self, payload: DeliveryPayload) -> str:
-        """Format the footer stats message."""
+        """Format the footer with topic distribution, source count, and reading time."""
+        from collections import Counter
+
         lines: list[str] = []
         lines.append(f"<b>{_SECTION_LINE}</b>")
+
+        # Topic distribution — what this briefing covered
+        if payload.items:
+            topics = Counter(item.candidate.topic for item in payload.items)
+            sources = set(item.candidate.source for item in payload.items)
+            topic_parts = [
+                f"{_esc(topic.replace('_', ' '))}: {count}"
+                for topic, count in topics.most_common(4)
+            ]
+            sep = " \u2502 "
+            lines.append(f"<i>{sep.join(topic_parts)}</i>")
+            lines.append(
+                f"<i>{len(payload.items)} stories from {len(sources)} sources</i>"
+            )
+
+            # Total reading time estimate
+            total_words = sum(
+                len((item.candidate.summary or "").split())
+                + len((item.why_it_matters or "").split())
+                for item in payload.items
+            )
+            total_min = max(1, round(total_words / 200))
+            lines.append(f"<i>~{total_min} min total read time</i>")
+
         meta = payload.metadata
         if meta:
             parts: list[str] = []
-            if "selected_count" in meta:
-                parts.append(f"{meta['selected_count']} items")
-            if "thread_count" in meta:
+            if "thread_count" in meta and meta["thread_count"]:
                 parts.append(f"{meta['thread_count']} threads")
             if meta.get("emerging_trends", 0) > 0:
                 parts.append(f"{meta['emerging_trends']} emerging")
             if parts:
                 sep = " \u2502 "
                 lines.append(f"<i>{sep.join(parts)}</i>")
+
         return "\n".join(lines).strip()
 
     def format_topic_discovery(self, emerging_topics: list[str],
@@ -585,7 +670,8 @@ class TelegramFormatter:
         topics = Counter(item.candidate.topic for item in payload.items)
         top = topics.most_common(5)
         topic_parts = [
-            f"{count} {topic.replace('_', ' ')}" if count > 1 else topic.replace("_", " ")
+            f"{count} {_esc_md(topic.replace('_', ' '))}" if count > 1
+            else _esc_md(topic.replace("_", " "))
             for topic, count in top
         ]
         lines.append(f"**{len(payload.items)} stories:** {', '.join(topic_parts)}")
@@ -596,7 +682,7 @@ class TelegramFormatter:
         if escalating:
             lines.append("## Geo-Risk Alerts")
             for risk in escalating[:4]:
-                region = risk.region.replace("_", " ").title()
+                region = _esc_md(risk.region.replace("_", " ").title())
                 lines.append(f"- **{region}**: {risk.risk_level:.0%} risk (+{risk.escalation_delta:.0%})")
             lines.append("")
 
@@ -605,7 +691,7 @@ class TelegramFormatter:
         if emerging:
             lines.append("## Emerging Trends")
             for t in emerging[:4]:
-                lines.append(f"- **{t.topic}**: {t.anomaly_score:.1f}x baseline")
+                lines.append(f"- **{_esc_md(t.topic)}**: {t.anomaly_score:.1f}x baseline")
             lines.append("")
 
         # Stories
@@ -620,12 +706,13 @@ class TelegramFormatter:
             # Title line
             tracked_mark = " [TRACKED]" if is_tracked else ""
             delta_mark = f" [{tag.upper()}]" if tag else ""
+            title_safe = _esc_md(c.title)
             if c.url and not c.url.startswith("https://example.com") and _esc_url(c.url):
-                lines.append(f"### {idx + 1}. [{c.title}]({c.url}){tracked_mark}{delta_mark}")
+                lines.append(f"### {idx + 1}. [{title_safe}]({c.url}){tracked_mark}{delta_mark}")
             else:
-                lines.append(f"### {idx + 1}. {c.title}{tracked_mark}{delta_mark}")
+                lines.append(f"### {idx + 1}. {title_safe}{tracked_mark}{delta_mark}")
 
-            lines.append(f"*{c.source}*")
+            lines.append(f"*{_esc_md(c.source)}*")
             lines.append("")
 
             # Summary
@@ -634,18 +721,18 @@ class TelegramFormatter:
                 if len(summary) > 800:
                     cut = summary[:800].rfind(".")
                     summary = summary[:cut + 1] if cut > 300 else summary[:797] + "..."
-                lines.append(summary)
+                lines.append(_esc_md(summary))
                 lines.append("")
 
             # Analysis
             if item.why_it_matters:
-                lines.append(f"**Why it matters:** {item.why_it_matters}")
+                lines.append(f"**Why it matters:** {_esc_md(item.why_it_matters)}")
                 lines.append("")
             if item.what_changed:
-                lines.append(f"**What changed:** {item.what_changed}")
+                lines.append(f"**What changed:** {_esc_md(item.what_changed)}")
                 lines.append("")
             if item.predictive_outlook:
-                lines.append(f"> {item.predictive_outlook}")
+                lines.append(f"> {_esc_md(item.predictive_outlook)}")
                 lines.append("")
 
             # Confidence
@@ -654,9 +741,11 @@ class TelegramFormatter:
             if conf:
                 meta.append(conf)
             if c.regions:
-                meta.append(", ".join(r.replace("_", " ").title() for r in c.regions[:3]))
+                meta.append(", ".join(
+                    _esc_md(r.replace("_", " ").title()) for r in c.regions[:3]
+                ))
             if c.corroborated_by:
-                meta.append(f"Verified by {', '.join(c.corroborated_by[:3])}")
+                meta.append(f"Verified by {', '.join(_esc_md(s) for s in c.corroborated_by[:3])}")
             if meta:
                 lines.append(f"*{' · '.join(meta)}*")
                 lines.append("")
@@ -664,7 +753,7 @@ class TelegramFormatter:
             lines.append("---")
             lines.append("")
 
-        lines.append(f"*Generated by NewsFeed Intelligence*")
+        lines.append("*Generated by NewsFeed Intelligence*")
 
         return "\n".join(lines)
 
@@ -765,7 +854,18 @@ class TelegramFormatter:
                 for read in reads[:5]:
                     lines.append(f"  \u2022 {read}")
 
-        return "\n".join(lines).strip()
+        result = "\n".join(lines).strip()
+
+        # Safety: truncate if approaching Telegram's 4096 char limit
+        if len(result) > _MAX_CARD_LENGTH:
+            result = result[:_MAX_CARD_LENGTH - 50]
+            last_nl = result.rfind("\n")
+            if last_nl > _MAX_CARD_LENGTH // 2:
+                result = result[:last_nl]
+            result = _close_unclosed_html_tags(result)
+            result += "\n\n<i>[Truncated for length]</i>"
+
+        return result
 
     def _build_exec_summary(self, payload: DeliveryPayload,
                             tracked_count: int = 0) -> str:
