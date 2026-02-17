@@ -32,14 +32,8 @@ def _handle_reload(signum: int, frame: object) -> None:
 
 
 def setup_logging(level: int = logging.INFO) -> None:
-    handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(logging.Formatter(
-        "%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    ))
-    root = logging.getLogger("newsfeed")
-    root.setLevel(level)
-    root.addHandler(handler)
+    from newsfeed.logging_config import configure_logging
+    configure_logging(level=logging.getLevelName(level))
 
 
 def main() -> None:

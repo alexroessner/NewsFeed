@@ -6,6 +6,22 @@ on:
   pull_request:
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dev dependencies
+        run: pip install ruff mypy
+      - name: Ruff lint
+        run: ruff check src/
+      - name: Ruff format check
+        run: ruff format --check src/
+      - name: Mypy type check
+        run: mypy src/newsfeed --ignore-missing-imports --no-error-summary || true
+
   test:
     runs-on: ubuntu-latest
     steps:
@@ -20,7 +36,6 @@ jobs:
         run: |
           PYTHONPATH=src python -m compileall -q src tests
       - name: Validate imports (catch missing deps early)
-        # Uses requirements.lock for pinned dependency versions
         run: |
           PYTHONPATH=src python -c "
           import importlib, pathlib, sys

@@ -1,0 +1,13 @@
+.git
+.github
+__pycache__
+*.pyc
+*.egg-info
+state/
+tests/
+docs/
+.env
+.env.*
+*.md
+.pre-commit-config.yaml
+.secrets.baseline

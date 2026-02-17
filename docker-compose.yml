@@ -1,0 +1,40 @@
+version: "3.8"
+
+services:
+  newsfeed:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: newsfeed-bot
+    restart: unless-stopped
+    environment:
+      # Required: Telegram bot token
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      # Required for admin access
+      - TELEGRAM_OWNER_ID=${TELEGRAM_OWNER_ID:-}
+      # Optional: Cloudflare D1 for persistent state
+      - CLOUDFLARE_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID:-}
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN:-}
+      - D1_DATABASE_ID=${D1_DATABASE_ID:-}
+      # Optional: LLM for expert voting + editorial review
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      # Optional: Article enrichment
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      # Logging
+      - NEWSFEED_LOG_JSON=1
+      - NEWSFEED_ENV=production
+    volumes:
+      # Persist local SQLite state across container restarts
+      - newsfeed-state:/app/state
+      # Mount secrets file (alternative to env vars)
+      - ./config/secrets.json:/app/config/secrets.json:ro
+    mem_limit: 512m
+    cpus: "1.0"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  newsfeed-state:
