@@ -13,6 +13,7 @@ import logging
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any
 
@@ -89,7 +90,8 @@ class MarketTicker:
             return cached
 
         quotes: list[TickerQuote] = []
-        for coin_id in ids:
+
+        def _fetch_coin(coin_id: str) -> TickerQuote | None:
             data = _fetch_json(f"https://api.coincap.io/v2/assets/{coin_id}")
             if data and isinstance(data.get("data"), dict):
                 d = data["data"]
@@ -97,9 +99,20 @@ class MarketTicker:
                     price = float(d.get("priceUsd", 0))
                     change = float(d.get("changePercent24Hr", 0))
                     label = _CRYPTO_SYMBOL.get(coin_id, d.get("symbol", coin_id.upper()))
-                    quotes.append(TickerQuote(symbol=coin_id, price=price,
-                                              change_pct=change, label=label))
+                    return TickerQuote(symbol=coin_id, price=price,
+                                      change_pct=change, label=label)
                 except (ValueError, TypeError):
+                    pass
+            return None
+
+        with ThreadPoolExecutor(max_workers=len(ids)) as pool:
+            futures = {pool.submit(_fetch_coin, cid): cid for cid in ids}
+            for future in as_completed(futures, timeout=12):
+                try:
+                    q = future.result()
+                    if q:
+                        quotes.append(q)
+                except Exception:
                     pass
 
         if not quotes:
@@ -170,8 +183,7 @@ class MarketTicker:
         if cached is not None:
             return cached
 
-        quotes: list[TickerQuote] = []
-        for ticker in tickers:
+        def _fetch_ticker(ticker: str) -> TickerQuote | None:
             encoded = ticker.replace("^", "%5E")
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded}?range=1d&interval=1d"
             data = _fetch_json(url)
@@ -183,9 +195,21 @@ class MarketTicker:
                     prev = meta.get("chartPreviousClose") or meta.get("previousClose", 0)
                     change_pct = ((price - prev) / prev * 100) if prev else None
                     label = _INDEX_NAME.get(ticker, ticker.replace("^", ""))
-                    quotes.append(TickerQuote(symbol=ticker, price=price,
-                                              change_pct=change_pct, label=label))
+                    return TickerQuote(symbol=ticker, price=price,
+                                      change_pct=change_pct, label=label)
                 except (KeyError, IndexError, TypeError, ZeroDivisionError):
+                    pass
+            return None
+
+        quotes: list[TickerQuote] = []
+        with ThreadPoolExecutor(max_workers=len(tickers)) as pool:
+            futures = {pool.submit(_fetch_ticker, t): t for t in tickers}
+            for future in as_completed(futures, timeout=12):
+                try:
+                    q = future.result()
+                    if q:
+                        quotes.append(q)
+                except Exception:
                     pass
 
         return self._store(cache_key, quotes)

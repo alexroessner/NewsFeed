@@ -10,6 +10,7 @@ import json
 import logging
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 from newsfeed.agents.base import ResearchAgent
@@ -36,12 +37,26 @@ class HackerNewsAgent(ResearchAgent):
         if not story_ids:
             return []
 
-        # Fetch more than needed to allow filtering
-        fetch_count = min(top_k * 3, len(story_ids), 30)
-        candidates: list[CandidateItem] = []
+        # Cap at 15 items and fetch in parallel to avoid sequential N+1 bottleneck
+        fetch_count = min(top_k * 3, len(story_ids), 15)
+        items: dict[int, dict] = {}
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {
+                pool.submit(self._fetch_item, sid): sid
+                for sid in story_ids[:fetch_count]
+            }
+            for future in as_completed(futures, timeout=20):
+                sid = futures[future]
+                try:
+                    result = future.result()
+                    if result:
+                        items[sid] = result
+                except Exception:
+                    pass
 
+        candidates: list[CandidateItem] = []
         for sid in story_ids[:fetch_count]:
-            item = self._fetch_item(sid)
+            item = items.get(sid)
             if not item:
                 continue
 

@@ -314,8 +314,12 @@ class NewsFeedEngine:
 
         return agents
 
+    # Per-agent timeout — prevents a single slow agent (e.g. HackerNews
+    # making 30 sequential HTTP calls) from consuming the pipeline budget.
+    AGENT_TIMEOUT_S = 45
+
     async def _run_agent_with_breaker(self, agent: ResearchAgent, task: ResearchTask, top_k: int) -> tuple[list, str | None]:
-        """Run a single agent with circuit breaker protection.
+        """Run a single agent with circuit breaker protection and timeout.
 
         Returns (results, failure_reason) where failure_reason is None on
         success, a short string on failure or circuit-breaker skip.
@@ -325,9 +329,16 @@ class NewsFeedEngine:
             log.debug("Circuit breaker OPEN — skipping %s", agent.agent_id)
             return [], "circuit_breaker"
         try:
-            result = await agent.run_async(task, top_k=top_k)
+            result = await asyncio.wait_for(
+                agent.run_async(task, top_k=top_k),
+                timeout=self.AGENT_TIMEOUT_S,
+            )
             cb.record_success(agent.agent_id)
             return result, None
+        except asyncio.TimeoutError:
+            cb.record_failure(agent.agent_id)
+            log.warning("Agent %s timed out after %ds", agent.agent_id, self.AGENT_TIMEOUT_S)
+            return [], "timeout"
         except Exception:
             cb.record_failure(agent.agent_id)
             log.warning("Agent %s failed (circuit breaker tracking)", agent.agent_id, exc_info=True)
