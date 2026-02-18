@@ -134,14 +134,23 @@ class TestStoryCard:
         assert "Why it matters" in card
         assert "Trade routes are shifting" in card
 
-    def test_includes_what_changed(self, formatter):
+    def test_what_changed_reserved_for_deep_dive(self, formatter):
+        """Regular cards don't show 'What changed' — it's redundant with the title."""
         item = _make_report_item(what_changed="New policy announced.")
         card = formatter.format_story_card(item, 1)
-        assert "What changed" in card
-        assert "New policy announced" in card
+        assert "What changed" not in card
+        # But deep dive should still show it
+        deep = formatter.format_deep_dive(item, 1)
+        assert "What changed" in deep
 
-    def test_includes_predictive_outlook(self, formatter):
+    def test_predictive_outlook_gated_on_signal(self, formatter):
+        """Outlook only shown when prediction_signal > 0.6."""
         item = _make_report_item(outlook="Markets will react within 48h.")
+        # Default signal is 0.5 — should be suppressed
+        card = formatter.format_story_card(item, 1)
+        assert "Markets will react" not in card
+        # High signal — should appear
+        item.candidate.prediction_signal = 0.8
         card = formatter.format_story_card(item, 1)
         assert "Markets will react" in card
 
@@ -169,24 +178,30 @@ class TestStoryCard:
         assert "Middle East" in card
         assert "Europe" in card
 
-    def test_corroboration_shown(self, formatter):
+    def test_corroboration_shown_with_display_names(self, formatter):
         c = _make_candidate(corroborated_by=["bbc", "ap"])
         item = _make_report_item(candidate=c)
         card = formatter.format_story_card(item, 1)
         assert "Verified by" in card
-        assert "bbc" in card
+        # Source IDs are mapped to human-readable names
+        assert "BBC News" in card
+        assert "AP News" in card
 
-    def test_adjacent_reads(self, formatter):
+    def test_adjacent_reads_reserved_for_deep_dive(self, formatter):
+        """Regular cards don't show 'Related:' — deep dive does."""
         item = _make_report_item(adjacent=["Related story one", "Related story two"])
         card = formatter.format_story_card(item, 1)
-        assert "Related:" in card
-        assert "Related story one" in card
+        assert "Related:" not in card
+        # Deep dive should have them
+        deep = formatter.format_deep_dive(item, 1)
+        assert "Related story one" in deep
 
-    def test_reading_time_shown_for_long_cards(self, formatter):
+    def test_no_reading_time_in_cards(self, formatter):
+        """Reading time is removed — it's obvious for 3-sentence summaries."""
         c = _make_candidate(summary=" ".join(["word"] * 100))
         item = _make_report_item(candidate=c, why=" ".join(["analysis"] * 100))
         card = formatter.format_story_card(item, 1)
-        assert "min read" in card
+        assert "min read" not in card
 
     def test_url_linked_for_real_urls(self, formatter):
         c = _make_candidate(url="https://reuters.com/real-article")
