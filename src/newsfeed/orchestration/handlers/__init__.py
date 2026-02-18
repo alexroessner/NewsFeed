@@ -36,6 +36,16 @@ class HandlerContext:
     last_topic: BoundedUserDict
     last_items: BoundedUserDict
 
+    def get_last_items(self, user_id: str) -> list[dict]:
+        """Get last briefing items for a user, loading from D1 via engine if needed."""
+        items = self.last_items.get(user_id)
+        if items is not None:
+            return items
+        loaded = self.engine.last_briefing_items(user_id)
+        if loaded:
+            self.last_items[user_id] = loaded
+        return loaded
+
     def persist_prefs(self, chat_id: int | str | None = None) -> bool:
         """Persist preferences immediately. Returns True on success.
 

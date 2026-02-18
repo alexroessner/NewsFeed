@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import threading
 import time
@@ -37,8 +38,10 @@ from newsfeed.models.domain import (
     CandidateItem,
     ConfidenceBand,
     DeliveryPayload,
+    NarrativeThread,
     ReportItem,
     ResearchTask,
+    StoryLifecycle,
     UrgencyLevel,
     UserProfile,
     configure_scoring,
@@ -242,7 +245,6 @@ class NewsFeedEngine:
         # Track full ReportItem objects for per-story deep dive
         self._last_report_items: BoundedUserDict[list[ReportItem]] = BoundedUserDict(maxlen=500)
         # Track threads from last briefing for source comparison
-        from newsfeed.models.domain import NarrativeThread
         self._last_threads: BoundedUserDict[list[NarrativeThread]] = BoundedUserDict(maxlen=500)
 
         # State persistence — save and restore preferences, credibility, etc.
@@ -631,6 +633,9 @@ class NewsFeedEngine:
         # Track threads for source comparison
         self._last_threads[user_id] = list(threads)
 
+        # Persist briefing data to D1 so button clicks in future GH Actions runs work
+        self._save_briefing_to_d1(user_id)
+
         # Persist state if enabled
         if self._persistence:
             try:
@@ -790,16 +795,30 @@ class NewsFeedEngine:
 
         return report_items
 
+    def _ensure_briefing_loaded(self, user_id: str) -> None:
+        """Lazy-load briefing data from D1 if not present in memory."""
+        if user_id not in self._last_report_items:
+            self._load_briefing_from_d1(user_id)
+
     def last_briefing_topics(self, user_id: str) -> list[str]:
         """Return the topics from the user's last briefing (in item order)."""
-        return self._last_briefing_topics.get(user_id, [])
+        result = self._last_briefing_topics.get(user_id)
+        if result is None:
+            self._ensure_briefing_loaded(user_id)
+            result = self._last_briefing_topics.get(user_id, [])
+        return result
 
     def last_briefing_items(self, user_id: str) -> list[dict]:
         """Return per-item info [{topic, source}, ...] from the user's last briefing."""
-        return self._last_briefing_items.get(user_id, [])
+        result = self._last_briefing_items.get(user_id)
+        if result is None:
+            self._ensure_briefing_loaded(user_id)
+            result = self._last_briefing_items.get(user_id, [])
+        return result
 
     def get_report_item(self, user_id: str, index: int) -> ReportItem | None:
         """Return a specific ReportItem from the user's last briefing (1-indexed)."""
+        self._ensure_briefing_loaded(user_id)
         items = self._last_report_items.get(user_id, [])
         if 1 <= index <= len(items):
             return items[index - 1]
@@ -952,6 +971,7 @@ class NewsFeedEngine:
 
     def last_report_items(self, user_id: str) -> list[ReportItem]:
         """Return the full ReportItem list from the user's last briefing."""
+        self._ensure_briefing_loaded(user_id)
         return self._last_report_items.get(user_id, [])
 
     def is_telegram_connected(self) -> bool:
@@ -1037,6 +1057,141 @@ class NewsFeedEngine:
                 log.info("Restored credibility data from D1 (%d sources)", len(cred))
         except Exception:
             log.debug("D1 state load failed (non-critical)", exc_info=True)
+
+    # ──────────────────────────────────────────────────────────────
+    # Briefing state persistence — survives across GH Actions runs
+    # ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _serialize_candidate(c: CandidateItem) -> dict:
+        d = dataclasses.asdict(c)
+        d["created_at"] = c.created_at.isoformat()
+        d["lifecycle"] = c.lifecycle.value
+        d["urgency"] = c.urgency.value
+        return d
+
+    @staticmethod
+    def _deserialize_candidate(d: dict) -> CandidateItem:
+        d = dict(d)
+        try:
+            d["created_at"] = datetime.fromisoformat(d["created_at"])
+        except (KeyError, ValueError):
+            d["created_at"] = datetime.now(timezone.utc)
+        d["lifecycle"] = StoryLifecycle(d.get("lifecycle", "developing"))
+        d["urgency"] = UrgencyLevel(d.get("urgency", "routine"))
+        return CandidateItem(**d)
+
+    @staticmethod
+    def _serialize_report_item(ri: ReportItem) -> dict:
+        return {
+            "candidate": NewsFeedEngine._serialize_candidate(ri.candidate),
+            "why_it_matters": ri.why_it_matters,
+            "what_changed": ri.what_changed,
+            "predictive_outlook": ri.predictive_outlook,
+            "adjacent_reads": ri.adjacent_reads,
+            "confidence": dataclasses.asdict(ri.confidence) if ri.confidence else None,
+            "thread_id": ri.thread_id,
+            "contrarian_note": ri.contrarian_note,
+        }
+
+    @staticmethod
+    def _deserialize_report_item(d: dict) -> ReportItem:
+        candidate = NewsFeedEngine._deserialize_candidate(d["candidate"])
+        conf_data = d.get("confidence")
+        confidence = ConfidenceBand(**conf_data) if conf_data else None
+        return ReportItem(
+            candidate=candidate,
+            why_it_matters=d.get("why_it_matters", ""),
+            what_changed=d.get("what_changed", ""),
+            predictive_outlook=d.get("predictive_outlook", ""),
+            adjacent_reads=d.get("adjacent_reads", []),
+            confidence=confidence,
+            thread_id=d.get("thread_id"),
+            contrarian_note=d.get("contrarian_note", ""),
+        )
+
+    def _save_briefing_to_d1(self, user_id: str) -> None:
+        """Persist the user's last briefing data to D1 for cross-run access."""
+        try:
+            report_items = self._last_report_items.get(user_id, [])
+            briefing_items = self._last_briefing_items.get(user_id, [])
+            topics = self._last_briefing_topics.get(user_id, [])
+            threads = self._last_threads.get(user_id, [])
+
+            data = {
+                "report_items": [self._serialize_report_item(ri) for ri in report_items],
+                "briefing_items": briefing_items,
+                "topics": topics,
+                "threads": [
+                    {
+                        "thread_id": t.thread_id,
+                        "headline": t.headline,
+                        "candidates": [self._serialize_candidate(c) for c in t.candidates],
+                        "lifecycle": t.lifecycle.value,
+                        "urgency": t.urgency.value,
+                        "source_count": t.source_count,
+                        "confidence": dataclasses.asdict(t.confidence) if t.confidence else None,
+                    }
+                    for t in threads
+                ],
+            }
+            key = f"brief_{user_id}"
+            self._d1_state.save(key, data)
+            log.info("Saved briefing state to D1 for user=%s (%d items)", user_id, len(report_items))
+        except Exception:
+            log.debug("Failed to save briefing to D1 for user=%s", user_id, exc_info=True)
+
+    def _load_briefing_from_d1(self, user_id: str) -> bool:
+        """Load the user's last briefing data from D1 into memory.
+
+        Returns True if data was loaded, False otherwise.
+        """
+        try:
+            key = f"brief_{user_id}"
+            data = self._d1_state.load(key)
+            if not data or not isinstance(data, dict):
+                return False
+
+            # Restore report items
+            raw_items = data.get("report_items", [])
+            if raw_items:
+                self._last_report_items[user_id] = [
+                    self._deserialize_report_item(d) for d in raw_items
+                ]
+                log.info("Restored %d report items from D1 for user=%s", len(raw_items), user_id)
+
+            # Restore lightweight briefing items
+            bi = data.get("briefing_items", [])
+            if bi:
+                self._last_briefing_items[user_id] = bi
+
+            # Restore topics
+            topics = data.get("topics", [])
+            if topics:
+                self._last_briefing_topics[user_id] = topics
+
+            # Restore threads
+            raw_threads = data.get("threads", [])
+            if raw_threads:
+                restored_threads = []
+                for td in raw_threads:
+                    conf_data = td.get("confidence")
+                    confidence = ConfidenceBand(**conf_data) if conf_data else None
+                    restored_threads.append(NarrativeThread(
+                        thread_id=td["thread_id"],
+                        headline=td.get("headline", ""),
+                        candidates=[self._deserialize_candidate(c) for c in td.get("candidates", [])],
+                        lifecycle=StoryLifecycle(td.get("lifecycle", "developing")),
+                        urgency=UrgencyLevel(td.get("urgency", "routine")),
+                        source_count=td.get("source_count", 0),
+                        confidence=confidence,
+                    ))
+                self._last_threads[user_id] = restored_threads
+
+            return bool(raw_items)
+        except Exception:
+            log.debug("Failed to load briefing from D1 for user=%s", user_id, exc_info=True)
+            return False
 
     # Allowed values for validated string fields on restore.
     # IMPORTANT: These must be a superset of the values accepted by the
