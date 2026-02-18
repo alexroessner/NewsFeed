@@ -180,10 +180,13 @@ class StyleReviewAgent:
         prefix = templates["changed_prefix"]
 
         # Ground the "what changed" in actual story content, not generic labels.
-        # Use the first key phrase from the title as context.
-        title_hint = c.title[:80].rstrip(".")
-        parts = []
+        title_hint = c.title[:80].rstrip(".").strip()
+        # Clean stray spacing around punctuation that slips through from
+        # source feeds (e.g. "banks , healthcare rally ; investors ,").
+        title_hint = re.sub(r"\s+([,;:.])", r"\1", title_hint)
+        title_hint = re.sub(r"[,;]+\s*$", "", title_hint)
 
+        parts = []
         if c.urgency in (UrgencyLevel.BREAKING, UrgencyLevel.CRITICAL):
             parts.append(f"{title_hint} — developing now")
         elif c.lifecycle.value == "developing":
@@ -192,7 +195,8 @@ class StyleReviewAgent:
             parts.append(title_hint)
 
         if c.corroborated_by:
-            parts.append(f"confirmed by {', '.join(c.corroborated_by[:2])}")
+            sources = " and ".join(c.corroborated_by[:2])
+            parts.append(f"confirmed by {sources}")
 
         return f"{prefix}{'; '.join(parts)}."
 
@@ -200,13 +204,26 @@ class StyleReviewAgent:
                          templates: dict[str, str]) -> str:
         prefix = templates["outlook_prefix"]
 
+        # Vary the predictive-signal text by topic so it doesn't read
+        # identically on every card (the old "Moderate predictive indicators
+        # present" appeared on ~90% of items because the default baseline
+        # signal falls in the 0.4-0.7 band).
+        _MODERATE_VARIANTS: dict[str, str] = {
+            "markets": "Market-moving potential — watch for follow-on price action",
+            "geopolitics": "Situation likely to evolve — diplomatic or military response expected",
+            "technology": "Development trajectory signals further announcements ahead",
+            "health": "Public health impact may expand — monitoring indicators",
+            "climate": "Environmental trajectory warrants continued monitoring",
+            "ai_policy": "Regulatory or industry response anticipated",
+        }
+
         parts = []
         if c.prediction_signal > 0.7:
-            parts.append("Strong forward-looking signal")
+            parts.append("Strong forward signal — high likelihood of near-term follow-on developments")
         elif c.prediction_signal > 0.4:
-            parts.append("Moderate predictive indicators present")
+            parts.append(_MODERATE_VARIANTS.get(c.topic, "Situation likely to develop further"))
         else:
-            parts.append("Limited predictive signal at this stage")
+            parts.append("Early-stage signal — limited predictive clarity at this point")
 
         if c.regions:
             parts.append(f"regional focus: {', '.join(c.regions[:2])}")
@@ -385,8 +402,14 @@ class ClarityReviewAgent:
         return f"{outlook} {watchpoint}"
 
     def _improve_adjacent_reads(self, reads: list[str], c: CandidateItem) -> list[str]:
-        """Replace generic adjacent reads with topic-specific suggestions."""
+        """Generate contextual adjacent-read suggestions grounded in the story.
+
+        Uses the candidate's title, region, and topic to produce suggestions
+        that feel specific to *this* story rather than copy-pasted boilerplate.
+        """
         region = ", ".join(c.regions[:1]) or "this region"
+        # Extract a short subject phrase from the title for grounding
+        subject = c.title.split(" — ")[0].split(": ")[-1][:60].rstrip(".")
 
         if self._topic_adjacent_reads and c.topic in self._topic_adjacent_reads:
             templates = self._topic_adjacent_reads[c.topic]
@@ -394,34 +417,12 @@ class ClarityReviewAgent:
         elif self._default_adjacent_reads:
             specific = [t.format(region=region, topic=c.topic) for t in self._default_adjacent_reads]
         else:
-            # Hardcoded fallback for backward compatibility
-            _fallback_reads = {
-                "geopolitics": [
-                    f"Historical context: prior escalation patterns in {region}",
-                    "Stakeholder analysis: key actors and their stated positions",
-                    "Timeline: sequence of events leading to current development",
-                ],
-                "ai_policy": [
-                    "Technical assessment: capabilities and limitations at play",
-                    "Regulatory landscape: existing and proposed frameworks",
-                    "Industry response: major player positions and commitments",
-                ],
-                "markets": [
-                    "Sector impact analysis: direct and indirect exposure",
-                    "Historical parallel: similar market events and outcomes",
-                    "Policy implications: regulatory and central bank response potential",
-                ],
-                "technology": [
-                    "Technical deep-dive: architecture and implementation details",
-                    "Competitive landscape: market positioning and alternatives",
-                    "Adoption trajectory: deployment timeline and barriers",
-                ],
-            }
-            specific = _fallback_reads.get(c.topic, [
-                f"Background context for {c.topic}",
-                f"Expert analysis on {c.topic} implications",
-                f"Related developments in {c.topic}",
-            ])
+            # Contextual fallback grounded in the actual story
+            specific = [
+                f"Background: prior developments related to {subject}",
+                f"Key players and stakeholders involved in {subject}",
+                f"Impact analysis: what {subject} means for {region}",
+            ]
         return specific[:len(reads)]
 
     def _deduplicate(self, text: str, seen: set[str]) -> str:

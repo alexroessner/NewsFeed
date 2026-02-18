@@ -151,7 +151,24 @@ class GDELTAgent(ResearchAgent):
         for prefix, topic in _THEME_TOPIC_MAP.items():
             if prefix.lower().rstrip("_") in text:
                 return topic
-        return max(task.weighted_topics, key=task.weighted_topics.get, default="geopolitics")
+        # Content-based fallback: scan title for topic keywords instead of
+        # blindly using the user's highest-weighted topic (which caused
+        # mismatches like "health" label on a banking/markets story).
+        _TITLE_KEYWORDS: dict[str, list[str]] = {
+            "markets": ["stock", "share", "bank", "rally", "investor", "trading",
+                        "bond", "equity", "fund", "dow", "nasdaq", "ftse", "index"],
+            "technology": ["tech", "software", "chip", "semiconductor", "app", "startup"],
+            "geopolitics": ["war", "sanction", "diplomat", "treaty", "troop", "nato",
+                            "summit", "election", "conflict", "border"],
+            "health": ["vaccine", "disease", "hospital", "drug", "pandemic", "who"],
+            "climate": ["climate", "emission", "carbon", "renewable", "wildfire"],
+            "science": ["study", "research", "discovery", "nasa", "space", "genome"],
+            "ai_policy": ["artificial intelligence", " ai ", "chatbot", "llm", "openai"],
+        }
+        for topic, keywords in _TITLE_KEYWORDS.items():
+            if any(kw in text for kw in keywords):
+                return topic
+        return "geopolitics"
 
     def _detect_regions(self, title: str, source_domain: str) -> list[str]:
         text = f"{title} {source_domain}".lower()
