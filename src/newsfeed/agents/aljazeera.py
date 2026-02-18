@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import html
 import logging
-import xml.etree.ElementTree as ET
+from newsfeed.agents._xml_safe import ParseError, safe_fromstring
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from urllib.error import URLError
@@ -89,8 +89,8 @@ class AlJazeeraAgent(ResearchAgent):
             return []
 
         try:
-            root = ET.fromstring(xml_data)
-        except ET.ParseError as e:
+            root = safe_fromstring(xml_data)
+        except ParseError as e:
             log.error("AlJazeera RSS parse failed for %s: %s", feed_name, e)
             return []
 

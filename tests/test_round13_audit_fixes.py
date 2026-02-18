@@ -92,7 +92,8 @@ class TestPreferenceStoreVersioning(unittest.TestCase):
     def test_mute_unmute_bumps_version(self):
         store = self._store()
         store.get_or_create("u1")
-        p = store.mute_topic("u1", "sports")
+        p, hint = store.mute_topic("u1", "sports")
+        self.assertEqual(hint, "")
         self.assertEqual(p.version, 1)
         p = store.unmute_topic("u1", "sports")
         self.assertEqual(p.version, 2)
@@ -244,7 +245,7 @@ class TestReadmeSourceCount(unittest.TestCase):
     def test_readme_test_count_current(self):
         readme = Path(__file__).resolve().parent.parent / "README.md"
         text = readme.read_text()
-        self.assertIn("821+", text)
+        self.assertIn("839+", text)
 
     def test_readme_free_sources_complete(self):
         readme = Path(__file__).resolve().parent.parent / "README.md"
@@ -643,6 +644,119 @@ class TestPipelineTimeout(unittest.TestCase):
         with self.assertRaises(TimeoutError) as ctx:
             engine._run_with_deadline("u1", "test", {}, None)
         self.assertIn("1s", str(ctx.exception))
+
+
+# ── 8. Safe XML Parsing (XXE Prevention) ──────────────────────────
+
+
+class TestSafeXmlParsing(unittest.TestCase):
+    """Verify safe_fromstring strips DOCTYPE and ENTITY declarations."""
+
+    def test_normal_xml_parses_correctly(self):
+        from newsfeed.agents._xml_safe import safe_fromstring
+        xml = "<root><item>hello</item></root>"
+        root = safe_fromstring(xml)
+        self.assertEqual(root.tag, "root")
+        self.assertEqual(root.find("item").text, "hello")
+
+    def test_doctype_stripped(self):
+        from newsfeed.agents._xml_safe import safe_fromstring
+        xml = '<?xml version="1.0"?><!DOCTYPE foo SYSTEM "http://evil.com/xxe.dtd"><root/>'
+        root = safe_fromstring(xml)
+        self.assertEqual(root.tag, "root")
+
+    def test_entity_declarations_stripped(self):
+        from newsfeed.agents._xml_safe import safe_fromstring
+        xml = '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe "pwned">]><root/>'
+        root = safe_fromstring(xml)
+        self.assertEqual(root.tag, "root")
+
+    def test_all_xml_agents_use_safe_parser(self):
+        """Verify no agent still imports xml.etree.ElementTree for parsing."""
+        agent_dir = Path(__file__).resolve().parent.parent / "src" / "newsfeed" / "agents"
+        for py_file in agent_dir.glob("*.py"):
+            if py_file.name.startswith("_"):
+                continue
+            text = py_file.read_text()
+            if "ET.fromstring" in text:
+                self.fail(f"{py_file.name} still uses ET.fromstring — should use safe_fromstring")
+
+    def test_parseerror_reexported(self):
+        from newsfeed.agents._xml_safe import ParseError
+        import xml.etree.ElementTree as ET
+        self.assertIs(ParseError, ET.ParseError)
+
+
+# ── 9. Mute Topic Cap Feedback ───────────────────────────────────
+
+
+class TestMuteTopicCapFeedback(unittest.TestCase):
+    """Verify mute_topic returns a hint when the cap is reached."""
+
+    def _store(self):
+        from newsfeed.memory.store import PreferenceStore
+        return PreferenceStore()
+
+    def test_mute_within_cap_returns_empty_hint(self):
+        store = self._store()
+        store.get_or_create("u1")
+        _, hint = store.mute_topic("u1", "sports")
+        self.assertEqual(hint, "")
+
+    def test_mute_at_cap_returns_error_hint(self):
+        store = self._store()
+        store.get_or_create("u1")
+        # Fill to cap
+        for i in range(store.MAX_MUTED_TOPICS):
+            store.mute_topic("u1", f"topic_{i}")
+        _, hint = store.mute_topic("u1", "one_too_many")
+        self.assertIn("50", hint)
+        self.assertIn("Unmute", hint)
+
+    def test_mute_duplicate_no_error(self):
+        store = self._store()
+        store.get_or_create("u1")
+        store.mute_topic("u1", "sports")
+        _, hint = store.mute_topic("u1", "sports")
+        self.assertEqual(hint, "")
+
+
+# ── 10. Config and Observability Fixes ────────────────────────────
+
+
+class TestConfigAndObservabilityFixes(unittest.TestCase):
+    """Verify gemini_api_key in config, migration log level, .gitignore, CI scan."""
+
+    def test_gemini_api_key_in_pipelines_config(self):
+        import json
+        config_path = Path(__file__).resolve().parent.parent / "config" / "pipelines.json"
+        config = json.loads(config_path.read_text())
+        api_keys = config.get("api_keys", {})
+        self.assertIn("gemini_api_key", api_keys,
+                       "gemini_api_key should be listed in pipelines.json api_keys")
+
+    def test_gitignore_covers_db_files(self):
+        gitignore = Path(__file__).resolve().parent.parent / ".gitignore"
+        text = gitignore.read_text()
+        self.assertIn("*.db", text)
+        self.assertIn(".mypy_cache/", text)
+        self.assertIn(".ruff_cache/", text)
+        self.assertIn("dist/", text)
+        self.assertIn("build/", text)
+
+    def test_ci_secrets_scan_includes_telegram_pattern(self):
+        ci_path = Path(__file__).resolve().parent.parent / ".github" / "workflows" / "security.yml"
+        text = ci_path.read_text()
+        # Should detect Telegram bot token pattern (numeric_id:AA...)
+        self.assertIn("AA[A-Za-z", text, "CI scan should check for Telegram bot token pattern")
+        self.assertIn("scripts/", text, "CI scan should also check scripts/ directory")
+
+    def test_migration_failure_logged_at_warning(self):
+        """Engine should log migration failures at WARNING level, not DEBUG."""
+        source = (Path(__file__).resolve().parent.parent /
+                  "src" / "newsfeed" / "orchestration" / "engine.py").read_text()
+        self.assertIn("log.warning(\"Migration runner failed", source)
+        self.assertNotIn("log.debug(\"Migration runner skipped", source)
 
 
 if __name__ == "__main__":

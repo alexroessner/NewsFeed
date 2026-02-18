@@ -2,15 +2,10 @@ from __future__ import annotations
 
 import html
 import re
-from typing import Sequence
-
 from newsfeed.models.domain import (
     BriefingType,
     DeliveryPayload,
-    GeoRiskEntry,
-    NarrativeThread,
     ReportItem,
-    TrendSnapshot,
     UrgencyLevel,
 )
 

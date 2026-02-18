@@ -6,7 +6,6 @@ import math
 import re
 import threading
 import time
-from collections import OrderedDict
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -262,14 +261,15 @@ class PreferenceStore:
 
     MAX_MUTED_TOPICS = 50
 
-    def mute_topic(self, user_id: str, topic: str) -> UserProfile:
+    def mute_topic(self, user_id: str, topic: str) -> tuple[UserProfile, str]:
+        """Mute a topic. Returns (profile, hint) where hint is non-empty on cap hit."""
         profile = self.get_or_create(user_id)
         if topic not in profile.muted_topics:
             if len(profile.muted_topics) >= self.MAX_MUTED_TOPICS:
-                return profile
+                return profile, f"Maximum {self.MAX_MUTED_TOPICS} muted topics reached. Unmute a topic first."
             profile.muted_topics.append(topic)
         self._bump_version(profile)
-        return profile
+        return profile, ""
 
     def unmute_topic(self, user_id: str, topic: str) -> UserProfile:
         profile = self.get_or_create(user_id)

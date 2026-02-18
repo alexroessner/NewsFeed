@@ -1815,7 +1815,10 @@ class CommunicationAgent:
             )
             return {"action": "mute_show", "user_id": user_id}
 
-        self._engine.preferences.mute_topic(user_id, topic)
+        _, hint = self._engine.preferences.mute_topic(user_id, topic)
+        if hint:
+            self._bot.send_message(chat_id, hint)
+            return {"action": "mute_topic_cap", "user_id": user_id, "topic": topic}
         self._persist_prefs()
         import html as html_mod
         self._bot.send_message(chat_id, f"Topic <code>{html_mod.escape(topic)}</code> muted. /unmute {html_mod.escape(topic)} to reverse.")
@@ -2382,7 +2385,7 @@ class CommunicationAgent:
             if summary and summary.get("chat_id"):
                 return summary["chat_id"]
         except Exception:
-            pass
+            log.debug("Failed to resolve chat_id from analytics for user=%s", user_id, exc_info=True)
         # In Telegram DMs, user_id works as chat_id
         return user_id
 
@@ -2402,7 +2405,7 @@ class CommunicationAgent:
                         f"Fix your endpoint and run /webhook test to re-enable."
                     )
                 except Exception:
-                    pass
+                    log.debug("Failed to notify user=%s about webhook disable", user_id, exc_info=True)
             profile.webhook_url = ""
             self._persist_prefs()
 

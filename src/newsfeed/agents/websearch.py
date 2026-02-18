@@ -12,7 +12,7 @@ import hashlib
 import html
 import logging
 import re
-import xml.etree.ElementTree as ET
+from newsfeed.agents._xml_safe import ParseError, safe_fromstring
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from urllib.error import URLError
@@ -109,8 +109,8 @@ class WebSearchAgent(ResearchAgent):
             return []
 
         try:
-            root = ET.fromstring(xml_data)
-        except ET.ParseError as e:
+            root = safe_fromstring(xml_data)
+        except ParseError as e:
             log.error("Google News RSS parse failed: %s", e)
             return []
 

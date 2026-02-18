@@ -33,9 +33,9 @@ jobs:
       - name: Check for secrets in source code
         run: |
           # Fail if any common secret patterns found in tracked source files
-          if grep -rn --include='*.py' --include='*.json' --include='*.yml' --include='*.js' \
-            -E '(sk-[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{36}|AKIA[A-Z0-9]{16}|-----BEGIN (RSA |EC )?PRIVATE KEY-----)' \
-            src/ config/ cloudflare-worker/ .github/ 2>/dev/null; then
+          if grep -rn --include='*.py' --include='*.json' --include='*.yml' --include='*.js' --include='*.sh' \
+            -E '(sk-[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{36}|AKIA[A-Z0-9]{16}|-----BEGIN (RSA |EC )?PRIVATE KEY-----|[0-9]{8,}:AA[A-Za-z0-9_-]{35})' \
+            src/ config/ cloudflare-worker/ .github/ scripts/ 2>/dev/null; then
             echo "ERROR: Potential secrets detected in source code!"
             exit 1
           fi

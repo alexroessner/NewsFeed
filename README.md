@@ -51,7 +51,7 @@ Set `TELEGRAM_OWNER_ID` env var to your Telegram user ID for admin access. Confi
 ## Tests
 
 ```bash
-python -m pytest tests/ -v          # 821+ tests
+python -m pytest tests/ -v          # 839+ tests
 ```
 
 ## Architecture
@@ -111,6 +111,6 @@ src/newsfeed/
   models/                  # Domain models (CandidateItem, ReportItem, etc.) + config loading
   orchestration/           # Engine, orchestrator, communication, optimizer, configurator, audit
   review/                  # Style + clarity review agents, persona stack
-tests/                     # 821+ tests across all components
+tests/                     # 839+ tests across all components
 docs/                      # Architecture docs, execution plan, vision
 ```

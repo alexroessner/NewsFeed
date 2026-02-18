@@ -11,7 +11,7 @@ from newsfeed.agents.base import ResearchAgent
 from newsfeed.agents.dynamic_sources import create_custom_agent
 from newsfeed.agents.experts import ExpertCouncil
 from newsfeed.agents.registry import create_agent
-from newsfeed.db.analytics import AnalyticsDB, create_analytics_db
+from newsfeed.db.analytics import create_analytics_db
 from newsfeed.db.state_store import D1StateStore
 from newsfeed.delivery.telegram import TelegramFormatter
 from newsfeed.intelligence.clustering import StoryClustering
@@ -272,7 +272,7 @@ class NewsFeedEngine:
             if applied:
                 log.info("Applied %d database migrations (now at v%d)", applied, migration_runner.current_version())
         except Exception:
-            log.debug("Migration runner skipped (non-critical)", exc_info=True)
+            log.warning("Migration runner failed — schema may be outdated", exc_info=True)
 
         # Operator dashboard
         from newsfeed.monitoring.dashboard import OperatorDashboard

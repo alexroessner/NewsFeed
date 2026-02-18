@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import xml.etree.ElementTree as ET
+from newsfeed.agents._xml_safe import ParseError, safe_fromstring
 from datetime import datetime, timezone
 from urllib.error import URLError
 from urllib.parse import quote_plus
@@ -66,8 +66,8 @@ class ArXivAgent(ResearchAgent):
             return []
 
         try:
-            root = ET.fromstring(xml_data)
-        except ET.ParseError as e:
+            root = safe_fromstring(xml_data)
+        except ParseError as e:
             log.error("arXiv XML parse failed: %s", e)
             return []
 
