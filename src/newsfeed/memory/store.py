@@ -119,6 +119,25 @@ class PreferenceStore:
                 self._profiles[user_id] = UserProfile(user_id=user_id)
             return self._profiles[user_id]
 
+    def _bump_version(self, profile: UserProfile) -> None:
+        """Increment the optimistic concurrency version after a mutation."""
+        profile.version += 1
+
+    def update_if_current(self, user_id: str, expected_version: int) -> UserProfile | None:
+        """Return the profile only if its version matches *expected_version*.
+
+        This enables optimistic concurrency: a caller reads the profile,
+        makes changes, then calls update_if_current() before persisting.
+        If another thread mutated the profile in the meantime the version
+        will have advanced and this method returns ``None`` — signalling a
+        conflict that the caller should retry.
+        """
+        with self._lock:
+            profile = self._profiles.get(user_id)
+            if profile is None or profile.version != expected_version:
+                return None
+            return profile
+
     MAX_WEIGHTS = 100  # Max distinct topic/source weight entries per user
 
     @staticmethod
@@ -151,6 +170,7 @@ class PreferenceStore:
             new_val = round(max(min(current + delta, 1.0), -1.0), 3)
             profile.topic_weights[topic] = new_val
             self._record_weight_touch(user_id, topic)
+            self._bump_version(profile)
             hint = ""
             if new_val == current:
                 direction = "maximum" if delta > 0 else "minimum"
@@ -163,22 +183,26 @@ class PreferenceStore:
             profile.tone = tone
         if fmt:
             profile.format = fmt
+        self._bump_version(profile)
         return profile
 
     def apply_region(self, user_id: str, region: str) -> UserProfile:
         profile = self.get_or_create(user_id)
         if region not in profile.regions_of_interest:
             profile.regions_of_interest.append(region)
+        self._bump_version(profile)
         return profile
 
     def apply_cadence(self, user_id: str, cadence: str) -> UserProfile:
         profile = self.get_or_create(user_id)
         profile.briefing_cadence = cadence
+        self._bump_version(profile)
         return profile
 
     def apply_max_items(self, user_id: str, max_items: int) -> UserProfile:
         profile = self.get_or_create(user_id)
         profile.max_items = max(1, min(max_items, 50))
+        self._bump_version(profile)
         return profile
 
     def apply_source_weight(self, user_id: str, source: str,
@@ -201,6 +225,7 @@ class PreferenceStore:
             new_val = round(max(min(current + delta, 2.0), -2.0), 3)
             profile.source_weights[source] = new_val
             self._record_weight_touch(user_id, source)
+            self._bump_version(profile)
             hint = ""
             if new_val == current:
                 direction = "maximum" if delta > 0 else "minimum"
@@ -211,6 +236,7 @@ class PreferenceStore:
         profile = self.get_or_create(user_id)
         if region in profile.regions_of_interest:
             profile.regions_of_interest.remove(region)
+        self._bump_version(profile)
         return profile
 
     MAX_WATCHLIST_SIZE = 50  # Prevent resource exhaustion via unbounded lists
@@ -222,6 +248,7 @@ class PreferenceStore:
             profile.watchlist_crypto = crypto[:self.MAX_WATCHLIST_SIZE]
         if stocks is not None:
             profile.watchlist_stocks = stocks[:self.MAX_WATCHLIST_SIZE]
+        self._bump_version(profile)
         return profile
 
     _MAX_TIMEZONE_LEN = 50  # Longest IANA tz is ~32 chars (e.g. "America/Argentina/Buenos_Aires")
@@ -230,6 +257,7 @@ class PreferenceStore:
         profile = self.get_or_create(user_id)
         tz = tz[:self._MAX_TIMEZONE_LEN]
         profile.timezone = tz
+        self._bump_version(profile)
         return profile
 
     MAX_MUTED_TOPICS = 50
@@ -240,12 +268,14 @@ class PreferenceStore:
             if len(profile.muted_topics) >= self.MAX_MUTED_TOPICS:
                 return profile
             profile.muted_topics.append(topic)
+        self._bump_version(profile)
         return profile
 
     def unmute_topic(self, user_id: str, topic: str) -> UserProfile:
         profile = self.get_or_create(user_id)
         if topic in profile.muted_topics:
             profile.muted_topics.remove(topic)
+        self._bump_version(profile)
         return profile
 
     def track_story(self, user_id: str, topic: str,
@@ -268,6 +298,7 @@ class PreferenceStore:
         # Cap at 20 tracked stories
         if len(profile.tracked_stories) > 20:
             profile.tracked_stories = profile.tracked_stories[-20:]
+        self._bump_version(profile)
         return profile
 
     def untrack_story(self, user_id: str, index: int) -> UserProfile:
@@ -275,6 +306,7 @@ class PreferenceStore:
         profile = self.get_or_create(user_id)
         if 1 <= index <= len(profile.tracked_stories):
             profile.tracked_stories.pop(index - 1)
+        self._bump_version(profile)
         return profile
 
     def save_bookmark(self, user_id: str, title: str, source: str,
@@ -295,6 +327,7 @@ class PreferenceStore:
         # Cap at 50 bookmarks
         if len(profile.bookmarks) > 50:
             profile.bookmarks = profile.bookmarks[-50:]
+        self._bump_version(profile)
         return profile
 
     def remove_bookmark(self, user_id: str, index: int) -> UserProfile:
@@ -302,6 +335,7 @@ class PreferenceStore:
         profile = self.get_or_create(user_id)
         if 1 <= index <= len(profile.bookmarks):
             profile.bookmarks.pop(index - 1)
+        self._bump_version(profile)
         return profile
 
     _MAX_PRESET_NAME_LEN = 50  # Reasonable limit for a human-typed preset name
@@ -339,6 +373,7 @@ class PreferenceStore:
             if first_key is None:
                 break
             del profile.presets[first_key]
+        self._bump_version(profile)
         return profile, ""
 
     def load_preset(self, user_id: str, name: str) -> UserProfile | None:
@@ -361,6 +396,7 @@ class PreferenceStore:
         except (TypeError, AttributeError) as e:
             log.warning("Failed to load preset %r for user %s: %s", name, user_id, e)
             return None
+        self._bump_version(profile)
         return profile
 
     def delete_preset(self, user_id: str, name: str) -> bool:
@@ -368,6 +404,7 @@ class PreferenceStore:
         profile = self.get_or_create(user_id)
         if name in profile.presets:
             del profile.presets[name]
+            self._bump_version(profile)
             return True
         return False
 
@@ -386,6 +423,7 @@ class PreferenceStore:
             profile.alert_georisk_threshold = max(0.1, min(float(value), 1.0))
         elif field == "trend":
             profile.alert_trend_threshold = max(1.5, min(float(value), 10.0))
+        self._bump_version(profile)
         return profile
 
     # ── Keyword alert management ────────────────────────────────
@@ -404,6 +442,7 @@ class PreferenceStore:
         if len(profile.alert_keywords) >= self._MAX_ALERT_KEYWORDS:
             return profile, f"Maximum {self._MAX_ALERT_KEYWORDS} alert keywords reached."
         profile.alert_keywords.append(keyword)
+        self._bump_version(profile)
         return profile, ""
 
     def remove_alert_keyword(self, user_id: str, keyword: str) -> tuple[UserProfile, bool]:
@@ -412,6 +451,7 @@ class PreferenceStore:
         keyword = keyword.strip().lower()
         if keyword in profile.alert_keywords:
             profile.alert_keywords.remove(keyword)
+            self._bump_version(profile)
             return profile, True
         return profile, False
 
@@ -419,6 +459,7 @@ class PreferenceStore:
         """Set the user's email address for digest delivery."""
         profile = self.get_or_create(user_id)
         profile.email = email.strip()
+        self._bump_version(profile)
         return profile
 
     # ── Custom source management ──────────────────────────────────
@@ -449,6 +490,7 @@ class PreferenceStore:
             "added_at": time.time(),
             "items_seen": 0,
         })
+        self._bump_version(profile)
         return profile, ""
 
     def remove_custom_source(self, user_id: str, name: str) -> tuple[UserProfile, bool]:
@@ -457,6 +499,7 @@ class PreferenceStore:
         for i, src in enumerate(profile.custom_sources):
             if src["name"].lower() == name.lower():
                 profile.custom_sources.pop(i)
+                self._bump_version(profile)
                 return profile, True
         return profile, False
 
@@ -483,6 +526,7 @@ class PreferenceStore:
             profile.max_per_source = 0
             profile.alert_georisk_threshold = 0.5
             profile.alert_trend_threshold = 3.0
+            self._bump_version(profile)
         # Keep watchlists, tracked stories, bookmarks, and email on reset — those are data, not weights
         return profile
 
@@ -517,6 +561,7 @@ class PreferenceStore:
                 "webhook_url": p.webhook_url,
                 "custom_sources": list(p.custom_sources),
                 "alert_keywords": list(p.alert_keywords),
+                "version": p.version,
             }
         return result
 
@@ -606,6 +651,7 @@ class PreferenceStore:
                 profile.webhook_url = str(profile_data.get("webhook_url") or "")
                 profile.custom_sources = self._capped_list(profile_data.get("custom_sources"), 10)
                 profile.alert_keywords = self._capped_list(profile_data.get("alert_keywords"), 50)
+                profile.version = self._safe_int(profile_data.get("version"), 0)
                 restored += 1
         log.info("Restored %d user profiles from persistent storage", restored)
         return restored

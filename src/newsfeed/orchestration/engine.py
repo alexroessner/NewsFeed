@@ -292,34 +292,46 @@ class NewsFeedEngine:
 
         return agents
 
-    async def _run_agent_with_breaker(self, agent: ResearchAgent, task: ResearchTask, top_k: int) -> list:
-        """Run a single agent with circuit breaker protection."""
+    async def _run_agent_with_breaker(self, agent: ResearchAgent, task: ResearchTask, top_k: int) -> tuple[list, str | None]:
+        """Run a single agent with circuit breaker protection.
+
+        Returns (results, failure_reason) where failure_reason is None on
+        success, a short string on failure or circuit-breaker skip.
+        """
         cb = self.optimizer.circuit_breaker
         if not cb.allow_request(agent.agent_id):
             log.debug("Circuit breaker OPEN — skipping %s", agent.agent_id)
-            return []
+            return [], "circuit_breaker"
         try:
             result = await agent.run_async(task, top_k=top_k)
             cb.record_success(agent.agent_id)
-            return result
+            return result, None
         except Exception:
             cb.record_failure(agent.agent_id)
             log.warning("Agent %s failed (circuit breaker tracking)", agent.agent_id, exc_info=True)
-            return []
+            return [], "error"
 
-    async def _run_research_async(self, task: ResearchTask, top_k: int) -> list:
+    async def _run_research_async(self, task: ResearchTask, top_k: int) -> tuple[list, list[str]]:
+        """Run all agents and return (candidates, failed_agent_ids)."""
+        agents = self._research_agents(task.user_id)
         coros = [
             self._run_agent_with_breaker(agent, task, top_k)
-            for agent in self._research_agents(task.user_id)
+            for agent in agents
         ]
         batch = await asyncio.gather(*coros)
-        flattened = []
-        for chunk in batch:
-            flattened.extend(chunk)
-        return flattened
+        flattened: list = []
+        failed_agents: list[str] = []
+        for agent, (results, failure) in zip(agents, batch):
+            flattened.extend(results)
+            if failure is not None:
+                failed_agents.append(agent.agent_id)
+        return flattened, failed_agents
 
-    def _run_research(self, task: ResearchTask, top_k: int) -> list[CandidateItem]:
-        """Run research fan-out, safely handling sync/async contexts."""
+    def _run_research(self, task: ResearchTask, top_k: int) -> tuple[list[CandidateItem], list[str]]:
+        """Run research fan-out, safely handling sync/async contexts.
+
+        Returns (candidates, failed_agent_ids).
+        """
         return _run_sync(self._run_research_async(task, top_k))
 
     def handle_request_payload(self, user_id: str, prompt: str, weighted_topics: dict[str, float], max_items: int | None = None) -> DeliveryPayload:
@@ -346,7 +358,7 @@ class NewsFeedEngine:
         lifecycle.advance(RequestStage.RESEARCHING)
         top_k = self.pipeline.get("limits", {}).get("top_discoveries_per_research_agent", 5)
         t0 = time.monotonic()
-        all_candidates = self._run_research(task, top_k)
+        all_candidates, failed_agents = self._run_research(task, top_k)
         research_ms = (time.monotonic() - t0) * 1000
         self.orchestrator.record_research_results(lifecycle, len(all_candidates))
         self.optimizer.record_stage_run("research", research_ms)
@@ -533,6 +545,7 @@ class NewsFeedEngine:
                     "agents_total": len(self.config.get("research_agents", [])),
                     "agents_contributing": len(by_agent),
                     "agents_silent": len(self.config.get("research_agents", [])) - len(by_agent),
+                    "agents_failed": failed_agents,
                     "stages_enabled": list(self._enabled_stages),
                     "total_candidates": len(all_candidates),
                 },

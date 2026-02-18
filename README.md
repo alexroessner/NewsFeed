@@ -4,7 +4,7 @@ Agentic Telegram news intelligence system powered by a multi-agent research swar
 
 ## What it does
 
-NewsFeed monitors 18 sources (BBC, Reuters, AP, Guardian, FT, Al Jazeera, HackerNews, arXiv, GDELT, Reddit, X/Twitter, Google News), runs candidates through a 7-stage intelligence pipeline (credibility, corroboration, urgency, diversity, clustering, geo-risk, trends), filters via a 5-expert council with weighted debate, applies editorial review (tone/style + clarity), and delivers personalized briefings via Telegram.
+NewsFeed deploys 23 research agents across 17 sources (BBC, Reuters, AP, Guardian, FT, Al Jazeera, NPR, CNBC, France 24, TechCrunch, Nature, HackerNews, arXiv, GDELT, Reddit, X/Twitter, Google News), runs candidates through a 7-stage intelligence pipeline (credibility, corroboration, urgency, diversity, clustering, geo-risk, trends), filters via a 5-expert council with weighted debate, applies editorial review (tone/style + clarity), and delivers personalized briefings via Telegram.
 
 ## Install
 
@@ -63,7 +63,7 @@ User ← Telegram Bot ← Communication Agent
                             ↓
               ┌─────────────┼─────────────┐
               ↓             ↓             ↓
-         18 Research    7 Intelligence   System
+         23 Research    7 Intelligence   System
            Agents         Stages       Optimizer
               ↓             ↓
          5 Expert Council (weighted debate)
@@ -76,7 +76,7 @@ User ← Telegram Bot ← Communication Agent
 **Layers:**
 - **Layer 0 — Communication:** Telegram bot + CommunicationAgent (message relay, commands, scheduling)
 - **Layer 1 — Orchestration:** OrchestratorAgent (brief compilation, lifecycle, routing)
-- **Layer 2 — Research:** 18 agents across 12 source types (async fan-out)
+- **Layer 2 — Research:** 23 agents across 17 source types (async fan-out)
 - **Layer 3 — Intelligence:** Credibility, corroboration, urgency, diversity, clustering, geo-risk, trends
 - **Layer 4 — Expert Council:** 5 experts with heuristic + LLM voting, arbitration, DebateChair influence tracking
 - **Layer 5 — Editorial:** StyleReviewAgent (tone/voice) + ClarityReviewAgent (concision/actionability)
@@ -99,7 +99,7 @@ show me 15 items                  # Delivery preferences
 
 ```
 config/
-  agents.json              # 18 research + 5 expert + 3 control + 2 review agents
+  agents.json              # 23 research + 5 expert + 3 control + 2 review agents
   pipelines.json           # 12 stages, scoring, intelligence, editorial review, API keys
   review_personas.json     # 4 editorial personas with cognitive stance notes
 personas/                  # Persona prompt files (engineer, source_critic, audience, forecaster)
@@ -111,6 +111,6 @@ src/newsfeed/
   models/                  # Domain models (CandidateItem, ReportItem, etc.) + config loading
   orchestration/           # Engine, orchestrator, communication, optimizer, configurator, audit
   review/                  # Style + clarity review agents, persona stack
-tests/                     # 303+ tests across all components
+tests/                     # 779+ tests across all components
 docs/                      # Architecture docs, execution plan, vision
 ```

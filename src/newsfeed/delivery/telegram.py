@@ -482,6 +482,18 @@ class TelegramFormatter:
                 sep = " \u2502 "
                 lines.append(f"<i>{sep.join(parts)}</i>")
 
+            # Surface data quality note when agents failed or were degraded
+            health = meta.get("pipeline_health", {})
+            failed = health.get("agents_failed", [])
+            if failed:
+                n_failed = len(failed)
+                n_total = health.get("agents_total", 0)
+                n_ok = health.get("agents_contributing", 0)
+                lines.append(
+                    f"<i>\u26a0\ufe0f {n_ok}/{n_total} sources reporting "
+                    f"({n_failed} unavailable)</i>"
+                )
+
         return "\n".join(lines).strip()
 
     def format_topic_discovery(self, emerging_topics: list[str],
