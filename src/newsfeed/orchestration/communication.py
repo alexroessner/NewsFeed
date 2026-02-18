@@ -160,6 +160,17 @@ class CommunicationAgent:
             last_items=self._last_items,
         )
 
+    def _get_last_items(self, user_id: str) -> list[dict]:
+        """Get last briefing items for a user, loading from D1 via engine if needed."""
+        items = self._last_items.get(user_id)
+        if items is not None:
+            return items
+        # Lazy-load from engine (which loads from D1 if needed)
+        loaded = self._engine.last_briefing_items(user_id)
+        if loaded:
+            self._last_items[user_id] = loaded
+        return loaded
+
     def handle_update(self, update: dict) -> dict[str, Any] | None:
         """Process a single Telegram update end-to-end.
 
@@ -373,7 +384,7 @@ class CommunicationAgent:
             except (ValueError, TypeError):
                 pass
             # No story number — prompt user to pick one
-            items = self._last_items.get(user_id, [])
+            items = self._get_last_items(user_id)
             if items:
                 import html as html_mod
                 lines = [
@@ -1376,7 +1387,7 @@ class CommunicationAgent:
             return {"action": "rate_error", "user_id": user_id}
 
         direction = parts[2].lower()
-        items = self._last_items.get(user_id, [])
+        items = self._get_last_items(user_id)
 
         if item_num < 1 or item_num > len(items):
             self._bot.send_message(chat_id, "That item is no longer available.")
@@ -1841,7 +1852,7 @@ class CommunicationAgent:
     def _send_rate_prompt(self, chat_id: int | str, user_id: str) -> dict[str, Any]:
         """Send a compact per-item rating prompt on demand."""
         import html as html_mod
-        items = self._last_items.get(user_id, [])
+        items = self._get_last_items(user_id)
         if not items:
             self._bot.send_message(chat_id, "No recent briefing to rate. Run /briefing first.")
             return {"action": "rate_no_items", "user_id": user_id}

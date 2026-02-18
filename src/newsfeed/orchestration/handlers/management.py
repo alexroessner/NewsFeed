@@ -24,7 +24,7 @@ def handle_track(ctx: HandlerContext, chat_id: int | str,
         ctx.bot.send_message(chat_id, "Usage: tap the \U0001f4cc Track button on a story card.")
         return {"action": "track_help", "user_id": user_id}
 
-    items = ctx.last_items.get(user_id, [])
+    items = ctx.get_last_items(user_id)
     if story_num < 1 or story_num > len(items):
         ctx.bot.send_message(chat_id, "That story is no longer available. Run /briefing first.")
         return {"action": "track_expired", "user_id": user_id}
@@ -105,7 +105,7 @@ def handle_save(ctx: HandlerContext, chat_id: int | str,
         ctx.bot.send_message(chat_id, "Usage: tap the \U0001f516 Save button on a story card.")
         return {"action": "save_help", "user_id": user_id}
 
-    items = ctx.last_items.get(user_id, [])
+    items = ctx.get_last_items(user_id)
     if story_num < 1 or story_num > len(items):
         ctx.bot.send_message(chat_id, "That story is no longer available. Run /briefing first.")
         return {"action": "save_expired", "user_id": user_id}
