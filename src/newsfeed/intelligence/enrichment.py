@@ -377,7 +377,7 @@ def llm_summary(
             },
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=12) as resp:
             result = json.loads(resp.read().decode("utf-8"))
 
         text = result.get("content", [{}])[0].get("text", "")
@@ -438,7 +438,7 @@ def gemini_summary(
             },
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=12) as resp:
             result = json.loads(resp.read().decode("utf-8"))
 
         # Extract text from Gemini response
@@ -533,12 +533,14 @@ class ArticleEnricher:
     def enrich(self, candidates: list[CandidateItem]) -> list[CandidateItem]:
         """Fetch articles and replace RSS teasers with real summaries.
 
-        Fetches articles in parallel for speed. If a fetch or summary
-        fails, the original RSS description is preserved.  Cached summaries
-        are reused to avoid redundant network and LLM calls.
+        Fetches and summarizes articles in parallel for speed. The entire
+        enrichment stage is capped at 60 seconds — any articles not finished
+        by the deadline keep their original RSS descriptions.
         """
         if not candidates:
             return candidates
+
+        STAGE_DEADLINE_S = 60  # hard cap for entire enrichment stage
 
         # Check cache first — skip fetching URLs we already have summaries for
         cache_hits = 0
@@ -553,44 +555,50 @@ class ArticleEnricher:
             else:
                 to_fetch.append(c)
 
-        # Parallel fetch for uncached URLs
-        article_texts: dict[str, str] = {}
+        # Parallel fetch + summarize (combined per article to avoid sequential bottleneck)
+        enriched_count = 0
+        skipped_deadline = 0
         if to_fetch:
             with ThreadPoolExecutor(max_workers=self._max_workers) as pool:
                 futures = {
-                    pool.submit(fetch_article, c.url, self._fetch_timeout): c
+                    pool.submit(self._fetch_and_summarize, c): c
                     for c in to_fetch
                 }
-                for future in as_completed(futures):
-                    c = futures[future]
-                    try:
-                        article_texts[c.candidate_id] = future.result()
-                    except Exception:
-                        article_texts[c.candidate_id] = ""
-
-        # Summarize uncached articles
-        enriched_count = 0
-        for c in to_fetch:
-            raw_html = article_texts.get(c.candidate_id, "")
-            if not raw_html:
-                continue
-
-            article_text = extract_article_text(raw_html)
-            if len(article_text) < 100:
-                continue
-
-            summary = self._summarize(article_text, c.title, c.source)
-
-            if summary and len(summary) > len(c.summary):
-                c.summary = summary
-                self._put_cached_summary(c.url, summary)
-                enriched_count += 1
+                try:
+                    for future in as_completed(futures, timeout=STAGE_DEADLINE_S):
+                        c = futures[future]
+                        try:
+                            summary = future.result()
+                            if summary and len(summary) > len(c.summary):
+                                c.summary = summary
+                                self._put_cached_summary(c.url, summary)
+                                enriched_count += 1
+                        except Exception:
+                            pass  # keep original RSS description
+                except TimeoutError:
+                    skipped_deadline = sum(1 for f in futures if not f.done())
+                    log.warning(
+                        "Enrichment deadline hit (%ds): %d articles skipped",
+                        STAGE_DEADLINE_S, skipped_deadline,
+                    )
+                    for f in futures:
+                        f.cancel()
 
         log.info(
             "Article enrichment: %d/%d enriched, %d cache hits",
             enriched_count, len(candidates), cache_hits,
         )
         return candidates
+
+    def _fetch_and_summarize(self, c: CandidateItem) -> str:
+        """Fetch a single article and summarize it. Returns summary or empty string."""
+        raw_html = fetch_article(c.url, self._fetch_timeout)
+        if not raw_html:
+            return ""
+        article_text = extract_article_text(raw_html)
+        if len(article_text) < 100:
+            return ""
+        return self._summarize(article_text, c.title, c.source)
 
     def _summarize(self, article_text: str, title: str, source: str) -> str:
         """Generate a summary using the best available backend."""
