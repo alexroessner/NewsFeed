@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -70,12 +71,22 @@ def _run_sync(coro: object) -> object:
 
 
 class NewsFeedEngine:
+    # Maximum concurrent pipeline runs.  Prevents resource exhaustion
+    # when many Telegram users trigger briefings simultaneously.
+    MAX_CONCURRENT_REQUESTS = 4
+
     def __init__(self, config: dict, pipeline: dict, personas: dict, personas_dir: Path) -> None:
         self.config = config
         self.pipeline = pipeline
         self.personas = personas
 
         log.info("Initializing NewsFeedEngine (config v%s)", pipeline.get("version", "?"))
+
+        # Concurrency limiter — excess requests block until a slot opens
+        max_conc = pipeline.get("limits", {}).get(
+            "max_concurrent_requests", self.MAX_CONCURRENT_REQUESTS,
+        )
+        self._request_semaphore = threading.Semaphore(max_conc)
 
         # Inject scoring config into domain models
         scoring_cfg = pipeline.get("scoring", {})
@@ -335,6 +346,18 @@ class NewsFeedEngine:
         return _run_sync(self._run_research_async(task, top_k))
 
     def handle_request_payload(self, user_id: str, prompt: str, weighted_topics: dict[str, float], max_items: int | None = None) -> DeliveryPayload:
+        # Backpressure: block if too many pipeline runs are active.
+        # This prevents resource exhaustion (memory, CPU, API quotas)
+        # when many users trigger briefings simultaneously.
+        acquired = self._request_semaphore.acquire(timeout=30)
+        if not acquired:
+            raise RuntimeError("Server busy — too many concurrent briefing requests. Please retry shortly.")
+        try:
+            return self._handle_request_inner(user_id, prompt, weighted_topics, max_items)
+        finally:
+            self._request_semaphore.release()
+
+    def _handle_request_inner(self, user_id: str, prompt: str, weighted_topics: dict[str, float], max_items: int | None = None) -> DeliveryPayload:
         log.info("handle_request user=%s prompt=%r", user_id, prompt[:80])
         profile = self.preferences.get_or_create(user_id)
         limit = min(max_items or profile.max_items, self.pipeline.get("limits", {}).get("default_max_items", 10))
@@ -413,7 +436,7 @@ class NewsFeedEngine:
 
         # Stage 2: Intelligence enrichment (conditionally enabled, with error isolation)
         t0 = time.monotonic()
-        all_candidates = self._run_intelligence(all_candidates)
+        all_candidates, failed_stages = self._run_intelligence(all_candidates)
         intel_ms = (time.monotonic() - t0) * 1000
         self.optimizer.record_stage_run("intelligence", intel_ms)
 
@@ -459,10 +482,13 @@ class NewsFeedEngine:
         # Stage 3.5: Article enrichment — fetch full articles and generate real summaries
         # Only the selected stories get enriched (not all candidates)
         t0 = time.monotonic()
+        enrichment_ok = True
         try:
             selected = self.enricher.enrich(selected)
         except Exception:
             log.exception("Article enrichment failed, continuing with RSS summaries")
+            enrichment_ok = False
+            failed_stages.append("enrichment")
         enrich_ms = (time.monotonic() - t0) * 1000
         self.optimizer.record_stage_run("article_enrichment", enrich_ms)
         log.info("Article enrichment completed in %.0fms", enrich_ms)
@@ -474,6 +500,7 @@ class NewsFeedEngine:
                 threads = self.clustering.cluster(selected)
             except Exception:
                 log.exception("Clustering stage failed, continuing without threads")
+                failed_stages.append("clustering")
 
         # Stage 5: Geo-risk assessment
         geo_risks = []
@@ -482,6 +509,7 @@ class NewsFeedEngine:
                 geo_risks = self.georisk.assess(all_candidates)
             except Exception:
                 log.exception("Georisk stage failed, continuing without geo risks")
+                failed_stages.append("georisk")
 
         # Stage 6: Trend analysis
         trend_snapshots = []
@@ -490,6 +518,7 @@ class NewsFeedEngine:
                 trend_snapshots = self.trends.analyze(all_candidates)
             except Exception:
                 log.exception("Trend stage failed, continuing without trends")
+                failed_stages.append("trends")
 
         # Stage 7: Report assembly with editorial review
         lifecycle.advance(RequestStage.EDITORIAL_REVIEW)
@@ -547,6 +576,7 @@ class NewsFeedEngine:
                     "agents_silent": len(self.config.get("research_agents", [])) - len(by_agent),
                     "agents_failed": failed_agents,
                     "stages_enabled": list(self._enabled_stages),
+                    "stages_failed": failed_stages,
                     "total_candidates": len(all_candidates),
                 },
             },
@@ -610,26 +640,35 @@ class NewsFeedEngine:
         payload = self.handle_request_payload(user_id, prompt, weighted_topics, max_items)
         return self.formatter.format(payload)
 
-    def _run_intelligence(self, candidates: list[CandidateItem]) -> list[CandidateItem]:
-        """Run intelligence enrichment stages with error isolation."""
+    def _run_intelligence(self, candidates: list[CandidateItem]) -> tuple[list[CandidateItem], list[str]]:
+        """Run intelligence enrichment stages with error isolation.
+
+        Returns (candidates, failed_stages) where failed_stages lists
+        the names of any stages that raised exceptions.
+        """
+        failed_stages: list[str] = []
+
         if "credibility" in self._enabled_stages:
             try:
                 for c in candidates:
                     self.credibility.record_item(c)
             except Exception:
                 log.exception("Credibility stage failed")
+                failed_stages.append("credibility")
 
         if "corroboration" in self._enabled_stages:
             try:
                 candidates = detect_cross_corroboration(candidates)
             except Exception:
                 log.exception("Corroboration stage failed")
+                failed_stages.append("corroboration")
 
         if "urgency" in self._enabled_stages:
             try:
                 candidates = self.breaking_detector.assess(candidates)
             except Exception:
                 log.exception("Urgency stage failed")
+                failed_stages.append("urgency")
 
         if "diversity" in self._enabled_stages:
             try:
@@ -637,8 +676,9 @@ class NewsFeedEngine:
                 candidates = enforce_source_diversity(candidates, max_per_source=max_per_source)
             except Exception:
                 log.exception("Diversity stage failed")
+                failed_stages.append("diversity")
 
-        return candidates
+        return candidates, failed_stages
 
     def _assemble_report(self, selected: list[CandidateItem], threads: list,
                          profile: UserProfile | None = None,

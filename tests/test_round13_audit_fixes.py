@@ -4,6 +4,9 @@ Covers:
 - Optimistic concurrency (version counter) on PreferenceStore
 - README source count accuracy
 - Agent failure surfacing in briefing footer
+- Cloudflare Worker payload validation
+- Engine concurrency backpressure (semaphore)
+- Intelligence stage failure tracking in metadata + footer
 """
 from __future__ import annotations
 
@@ -260,7 +263,7 @@ class TestAgentFailureSurfacing(unittest.TestCase):
     """Verify the formatter surfaces agent failures in the footer."""
 
     def _make_payload(self, failed_agents=None, agents_total=23,
-                      agents_contributing=20):
+                      agents_contributing=20, failed_stages=None):
         from newsfeed.models.domain import (
             CandidateItem, DeliveryPayload, ReportItem, ConfidenceBand,
         )
@@ -284,6 +287,7 @@ class TestAgentFailureSurfacing(unittest.TestCase):
             "agents_silent": agents_total - agents_contributing,
             "agents_failed": failed_agents or [],
             "stages_enabled": ["credibility"],
+            "stages_failed": failed_stages or [],
             "total_candidates": 10,
         }
         return DeliveryPayload(
@@ -349,6 +353,218 @@ class TestAgentFailureSurfacing(unittest.TestCase):
         health = payload.metadata.get("pipeline_health", {})
         # agents_failed should be a list (possibly empty for simulated agents)
         self.assertIsInstance(health.get("agents_failed"), list)
+        # stages_failed should also be a list
+        self.assertIsInstance(health.get("stages_failed"), list)
+
+
+# ── 4. Cloudflare Worker Payload Validation ───────────────────────
+
+
+class TestWorkerPayloadValidation(unittest.TestCase):
+    """Verify the Cloudflare Worker validates Telegram update structure."""
+
+    def test_worker_js_validates_update_id(self):
+        """Worker.js must reject payloads without update_id."""
+        worker_path = Path(__file__).resolve().parent.parent / "cloudflare-worker" / "worker.js"
+        code = worker_path.read_text()
+        self.assertIn("update.update_id", code)
+        self.assertIn("422", code, "Should return 422 for invalid payloads")
+
+    def test_worker_js_checks_message_or_callback(self):
+        """Worker must require at least one recognized Telegram field."""
+        worker_path = Path(__file__).resolve().parent.parent / "cloudflare-worker" / "worker.js"
+        code = worker_path.read_text()
+        self.assertIn("update.message", code)
+        self.assertIn("update.callback_query", code)
+
+    def test_worker_js_rejects_missing_webhook_secret(self):
+        """Worker must reject requests when WEBHOOK_SECRET is not configured."""
+        worker_path = Path(__file__).resolve().parent.parent / "cloudflare-worker" / "worker.js"
+        code = worker_path.read_text()
+        # Must check !env.WEBHOOK_SECRET (not just env.WEBHOOK_SECRET &&)
+        self.assertIn("!env.WEBHOOK_SECRET", code)
+
+
+# ── 5. Engine Concurrency Backpressure ────────────────────────────
+
+
+class TestEngineConcurrency(unittest.TestCase):
+    """Verify the engine limits concurrent pipeline runs."""
+
+    def _make_engine(self, max_concurrent=2):
+        import json
+        config_path = Path(__file__).resolve().parent.parent / "config"
+        agents_cfg = json.loads((config_path / "agents.json").read_text())
+        pipeline_cfg = json.loads((config_path / "pipelines.json").read_text())
+        pipeline_cfg.setdefault("limits", {})["max_concurrent_requests"] = max_concurrent
+        personas_cfg = {"default_personas": ["engineer"]}
+        personas_dir = Path(__file__).resolve().parent.parent / "personas"
+        from newsfeed.orchestration.engine import NewsFeedEngine
+        return NewsFeedEngine(agents_cfg, pipeline_cfg, personas_cfg, personas_dir)
+
+    def test_engine_has_semaphore(self):
+        engine = self._make_engine(max_concurrent=3)
+        self.assertIsNotNone(engine._request_semaphore)
+        # Semaphore should allow up to 3 concurrent acquires
+        acquired = [engine._request_semaphore.acquire(timeout=0) for _ in range(3)]
+        self.assertTrue(all(acquired))
+        # 4th should fail (non-blocking)
+        self.assertFalse(engine._request_semaphore.acquire(timeout=0))
+        # Release all
+        for _ in range(3):
+            engine._request_semaphore.release()
+
+    def test_concurrent_requests_complete(self):
+        """Multiple concurrent briefings should all complete under backpressure."""
+        engine = self._make_engine(max_concurrent=2)
+        results = []
+        errors = []
+
+        def run_briefing(user_id):
+            try:
+                payload = engine.handle_request_payload(
+                    user_id=user_id,
+                    prompt="Test briefing",
+                    weighted_topics={"technology": 0.8},
+                )
+                results.append(payload)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=run_briefing, args=(f"user_{i}",)) for i in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+
+        self.assertEqual(len(errors), 0, f"Errors: {errors}")
+        self.assertEqual(len(results), 3)
+
+    def test_default_max_concurrent_from_class(self):
+        """Engine should use class default when config doesn't specify."""
+        import json
+        from newsfeed.orchestration.engine import NewsFeedEngine
+        config_path = Path(__file__).resolve().parent.parent / "config"
+        agents_cfg = json.loads((config_path / "agents.json").read_text())
+        pipeline_cfg = json.loads((config_path / "pipelines.json").read_text())
+        # Remove any explicit max_concurrent_requests
+        pipeline_cfg.get("limits", {}).pop("max_concurrent_requests", None)
+        personas_cfg = {"default_personas": ["engineer"]}
+        personas_dir = Path(__file__).resolve().parent.parent / "personas"
+        engine = NewsFeedEngine(agents_cfg, pipeline_cfg, personas_cfg, personas_dir)
+        self.assertEqual(engine.MAX_CONCURRENT_REQUESTS, 4)
+
+
+# ── 6. Intelligence Stage Failure Tracking ────────────────────────
+
+
+class TestStageFailureSurfacing(unittest.TestCase):
+    """Verify the formatter surfaces intelligence stage failures."""
+
+    def _make_payload(self, failed_stages):
+        from newsfeed.models.domain import (
+            CandidateItem, DeliveryPayload, ReportItem, ConfidenceBand,
+        )
+        candidate = CandidateItem(
+            candidate_id="c1", title="Test", source="bbc",
+            summary="S", url="https://x.com", topic="tech",
+            evidence_score=0.8, novelty_score=0.7, preference_fit=0.6,
+            prediction_signal=0.5, discovered_by="bbc_agent",
+        )
+        item = ReportItem(
+            candidate=candidate, why_it_matters="M",
+            what_changed="C", predictive_outlook="O",
+            adjacent_reads=[],
+            confidence=ConfidenceBand(low=0.5, mid=0.7, high=0.9),
+        )
+        health = {
+            "agents_total": 23, "agents_contributing": 23,
+            "agents_silent": 0, "agents_failed": [],
+            "stages_enabled": ["credibility", "urgency", "enrichment"],
+            "stages_failed": failed_stages,
+            "total_candidates": 10,
+        }
+        return DeliveryPayload(
+            user_id="u1",
+            generated_at=datetime.now(timezone.utc),
+            items=[item],
+            metadata={"pipeline_health": health},
+        )
+
+    def test_footer_shows_degraded_stages(self):
+        from newsfeed.delivery.telegram import TelegramFormatter
+        fmt = TelegramFormatter()
+        payload = self._make_payload(["enrichment", "clustering"])
+        footer = fmt.format_footer(payload)
+        self.assertIn("Degraded stages", footer)
+        self.assertIn("enrichment", footer)
+        self.assertIn("clustering", footer)
+
+    def test_footer_no_stage_warning_when_all_ok(self):
+        from newsfeed.delivery.telegram import TelegramFormatter
+        fmt = TelegramFormatter()
+        payload = self._make_payload([])
+        footer = fmt.format_footer(payload)
+        self.assertNotIn("Degraded stages", footer)
+
+    def test_footer_shows_both_agent_and_stage_failures(self):
+        """When both agents and stages fail, both warnings should appear."""
+        from newsfeed.delivery.telegram import TelegramFormatter
+        from newsfeed.models.domain import (
+            CandidateItem, DeliveryPayload, ReportItem, ConfidenceBand,
+        )
+        candidate = CandidateItem(
+            candidate_id="c1", title="Test", source="bbc",
+            summary="S", url="https://x.com", topic="tech",
+            evidence_score=0.8, novelty_score=0.7, preference_fit=0.6,
+            prediction_signal=0.5, discovered_by="bbc_agent",
+        )
+        item = ReportItem(
+            candidate=candidate, why_it_matters="M",
+            what_changed="C", predictive_outlook="O",
+            adjacent_reads=[],
+            confidence=ConfidenceBand(low=0.5, mid=0.7, high=0.9),
+        )
+        health = {
+            "agents_total": 23, "agents_contributing": 21,
+            "agents_silent": 2, "agents_failed": ["x_agent_1", "gdelt_agent"],
+            "stages_enabled": ["credibility", "urgency"],
+            "stages_failed": ["enrichment"],
+            "total_candidates": 10,
+        }
+        payload = DeliveryPayload(
+            user_id="u1",
+            generated_at=datetime.now(timezone.utc),
+            items=[item],
+            metadata={"pipeline_health": health},
+        )
+        fmt = TelegramFormatter()
+        footer = fmt.format_footer(payload)
+        self.assertIn("21/23 sources reporting", footer)
+        self.assertIn("2 unavailable", footer)
+        self.assertIn("Degraded stages: enrichment", footer)
+
+    def test_engine_tracks_stages_failed_in_metadata(self):
+        """Verify the engine populates stages_failed in pipeline_health."""
+        import json
+        config_path = Path(__file__).resolve().parent.parent / "config"
+        agents_cfg = json.loads((config_path / "agents.json").read_text())
+        pipeline_cfg = json.loads((config_path / "pipelines.json").read_text())
+        personas_cfg = {"default_personas": ["engineer"]}
+        personas_dir = Path(__file__).resolve().parent.parent / "personas"
+
+        from newsfeed.orchestration.engine import NewsFeedEngine
+        engine = NewsFeedEngine(agents_cfg, pipeline_cfg, personas_cfg, personas_dir)
+
+        payload = engine.handle_request_payload(
+            user_id="test_user",
+            prompt="Daily briefing",
+            weighted_topics={"technology": 0.8},
+        )
+        health = payload.metadata.get("pipeline_health", {})
+        self.assertIsInstance(health.get("stages_failed"), list)
+        # With simulated agents, no stages should fail
+        self.assertEqual(len(health["stages_failed"]), 0)
 
 
 if __name__ == "__main__":

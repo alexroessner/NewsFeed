@@ -482,16 +482,22 @@ class TelegramFormatter:
                 sep = " \u2502 "
                 lines.append(f"<i>{sep.join(parts)}</i>")
 
-            # Surface data quality note when agents failed or were degraded
+            # Surface data quality note when agents or stages are degraded
             health = meta.get("pipeline_health", {})
-            failed = health.get("agents_failed", [])
-            if failed:
-                n_failed = len(failed)
+            failed_agents = health.get("agents_failed", [])
+            failed_stages = health.get("stages_failed", [])
+            if failed_agents:
+                n_failed = len(failed_agents)
                 n_total = health.get("agents_total", 0)
                 n_ok = health.get("agents_contributing", 0)
                 lines.append(
                     f"<i>\u26a0\ufe0f {n_ok}/{n_total} sources reporting "
                     f"({n_failed} unavailable)</i>"
+                )
+            if failed_stages:
+                stage_names = ", ".join(s.replace("_", " ") for s in failed_stages)
+                lines.append(
+                    f"<i>\u26a0\ufe0f Degraded stages: {_esc(stage_names)}</i>"
                 )
 
         return "\n".join(lines).strip()
