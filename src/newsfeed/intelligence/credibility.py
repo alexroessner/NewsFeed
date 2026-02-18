@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import hashlib
 from collections import defaultdict
 from typing import Any
 
+from newsfeed.intelligence.source_tiers import SourceTiers
 from newsfeed.models.domain import CandidateItem, SourceReliability
 
 
@@ -15,25 +15,14 @@ class CredibilityTracker:
         cfg = intel_cfg or {}
         self._sources: dict[str, SourceReliability] = {}
 
-        tiers = cfg.get("source_tiers", {})
-        t1 = tiers.get("tier_1", {})
-        t1b = tiers.get("tier_1b", {})
-        t2 = tiers.get("tier_2", {})
-        t_academic = tiers.get("tier_academic", {})
-        self._tier1_sources = frozenset(t1.get("sources", ["reuters", "ap", "bbc", "guardian", "ft"]))
-        self._tier1b_sources = frozenset(t1b.get("sources", ["aljazeera"]))
-        self._tier2_sources = frozenset(t2.get("sources", ["x", "reddit", "web", "hackernews", "gdelt"]))
-        self._academic_sources = frozenset(t_academic.get("sources", ["arxiv"]))
-        self._tier1_base = t1.get("base_reliability", 0.85)
-        self._tier1b_base = t1b.get("base_reliability", 0.78)
-        self._tier2_base = t2.get("base_reliability", 0.55)
-        self._academic_base = t_academic.get("base_reliability", 0.72)
-        self._unknown_base = tiers.get("unknown_base_reliability", 0.50)
-        self._bias_profiles: dict[str, str] = cfg.get("bias_profiles", {
-            "reuters": "center", "ap": "center", "bbc": "center-left",
-            "guardian": "left-leaning", "ft": "center-right",
-            "x": "variable", "reddit": "community-driven", "web": "unverified",
-        })
+        # Use unified source tiers — single source of truth
+        self._tiers = SourceTiers(cfg)
+        self._tier1_sources = self._tiers.sources_in_tier("tier_1")
+        self._tier1b_sources = self._tiers.sources_in_tier("tier_1b")
+        self._tier2_sources = self._tiers.sources_in_tier("tier_2")
+        self._academic_sources = self._tiers.sources_in_tier("tier_academic")
+        self._unknown_base = 0.50
+        self._bias_profiles = {s: self._tiers.bias(s) for s in self._tiers.all_known_sources()}
         self._corroboration_increment = cfg.get("corroboration_increment", 0.02)
 
         scoring = cfg.get("_scoring", {}).get("credibility_weights", {})
@@ -44,20 +33,11 @@ class CredibilityTracker:
         self._bonus_cap = scoring.get("corroboration_bonus_cap", 0.20)
 
     def _init_source(self, source_id: str) -> SourceReliability:
-        if source_id in self._tier1_sources:
-            base = self._tier1_base
-        elif source_id in self._tier1b_sources:
-            base = self._tier1b_base
-        elif source_id in self._academic_sources:
-            base = self._academic_base
-        elif source_id in self._tier2_sources:
-            base = self._tier2_base
-        else:
-            base = self._unknown_base
+        base = self._tiers.base_reliability(source_id)
         return SourceReliability(
             source_id=source_id,
             reliability_score=base,
-            bias_rating=self._bias_profiles.get(source_id, "unrated"),
+            bias_rating=self._tiers.bias(source_id),
             historical_accuracy=base,
             corroboration_rate=0.5,
         )

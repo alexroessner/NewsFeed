@@ -90,11 +90,10 @@ _DEFAULT_TOPIC_CAPABILITIES: dict[str, list[str]] = {
     "africa": ["aljazeera", "bbc", "reuters", "gdelt", "guardian", "web"],
 }
 
-# Default source reliability — overridden by agents.json source_priority
+# Default source reliability — derived from unified SourceTiers
+from newsfeed.intelligence.source_tiers import SourceTiers as _SourceTiers
 _DEFAULT_SOURCE_PRIORITY: dict[str, float] = {
-    "reuters": 0.95, "ap": 0.93, "bbc": 0.90, "guardian": 0.88, "ft": 0.90,
-    "aljazeera": 0.80, "arxiv": 0.78, "hackernews": 0.65, "reddit": 0.58,
-    "x": 0.55, "gdelt": 0.60, "web": 0.50,
+    s: _SourceTiers().priority(s) for s in _SourceTiers().all_known_sources()
 }
 
 

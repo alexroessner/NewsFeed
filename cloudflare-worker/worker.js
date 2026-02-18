@@ -22,8 +22,9 @@ export default {
     }
 
     // Validate Telegram's secret token header (set via setWebhook secret_token param)
+    // SECURITY: reject if WEBHOOK_SECRET is not configured OR if it doesn't match
     const secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
-    if (env.WEBHOOK_SECRET && secret !== env.WEBHOOK_SECRET) {
+    if (!env.WEBHOOK_SECRET || secret !== env.WEBHOOK_SECRET) {
       return new Response("Unauthorized", { status: 403 });
     }
 
@@ -32,6 +33,18 @@ export default {
       update = await request.json();
     } catch {
       return new Response("Bad JSON", { status: 400 });
+    }
+
+    // Validate Telegram update structure — must have update_id and at least
+    // one recognized field (message, callback_query, etc.) to prevent
+    // arbitrary payload injection into GitHub Actions dispatches.
+    if (
+      typeof update !== "object" ||
+      update === null ||
+      typeof update.update_id !== "number" ||
+      (!update.message && !update.callback_query && !update.edited_message)
+    ) {
+      return new Response("Invalid Telegram update", { status: 422 });
     }
 
     // Fire repository_dispatch to GitHub Actions

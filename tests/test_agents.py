@@ -1316,9 +1316,13 @@ class ClarityReviewAgentTests(unittest.TestCase):
         result = agent.review(item, profile)
         # Should replace generic reads with topic-specific ones
         self.assertNotEqual(result.adjacent_reads[0], "Read 1")
-        # ai_policy reads should reference technical/regulatory content
+        # Adjacent reads should be grounded in the story, not generic boilerplate
         combined = " ".join(result.adjacent_reads).lower()
-        self.assertTrue("technical" in combined or "regulatory" in combined or "industry" in combined)
+        self.assertTrue(
+            "background" in combined or "players" in combined or
+            "impact" in combined or "stakeholder" in combined,
+            f"Adjacent reads should be contextual, got: {result.adjacent_reads}"
+        )
 
     def test_batch_review(self) -> None:
         agent = ClarityReviewAgent()
@@ -1452,6 +1456,10 @@ class CommunicationAgentTests(unittest.TestCase):
             {"topic": "geopolitics", "source": "reuters"},
             {"topic": "technology", "source": "bbc"},
         ]
+
+        # Access control mock — allow all users, no admin by default
+        self.mock_engine.access_control.is_allowed.return_value = True
+        self.mock_engine.access_control.is_admin.return_value = False
 
         self.mock_bot = MagicMock()
         self.mock_bot.parse_command.return_value = None

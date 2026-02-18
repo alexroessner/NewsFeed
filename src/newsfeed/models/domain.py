@@ -102,6 +102,10 @@ class UserProfile:
     max_items: int = 10
     briefing_cadence: str = "on_demand"
     regions_of_interest: list[str] = field(default_factory=list)
+    # Optimistic concurrency version — incremented on every mutation.
+    # Callers can use PreferenceStore.update_if_current() to detect
+    # lost updates from concurrent requests.
+    version: int = 0
     watchlist_crypto: list[str] = field(default_factory=list)
     watchlist_stocks: list[str] = field(default_factory=list)
     timezone: str = "UTC"

@@ -7,8 +7,8 @@
 #
 # Example:
 #   ./scripts/setup_webhook.sh https://newsfeed-telegram-webhook.YOUR_SUBDOMAIN.workers.dev \
-#       8321195344:AAGVPmP2yzFHuM1EFXzYR1MlurTm7SToGm8 \
-#       my-secret-token-123
+#       <YOUR_BOT_TOKEN> \
+#       <YOUR_WEBHOOK_SECRET>
 
 set -euo pipefail
 

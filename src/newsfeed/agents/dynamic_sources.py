@@ -23,7 +23,7 @@ from __future__ import annotations
 import html as html_mod
 import logging
 import re
-import xml.etree.ElementTree as ET
+from newsfeed.agents._xml_safe import ParseError, safe_fromstring
 from dataclasses import dataclass
 from typing import Any
 from urllib.error import URLError
@@ -118,8 +118,8 @@ def _probe_feed(url: str) -> FeedProbeResult:
         return FeedProbeResult(valid=False, error=f"Fetch failed: {e}")
 
     try:
-        root = ET.fromstring(data)
-    except ET.ParseError:
+        root = safe_fromstring(data)
+    except ParseError:
         return FeedProbeResult(valid=False, error="Not valid XML.")
 
     # Check for RSS 2.0 (<rss> with <channel>/<item>)

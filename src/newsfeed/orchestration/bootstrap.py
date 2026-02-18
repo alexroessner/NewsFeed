@@ -32,14 +32,8 @@ def _handle_reload(signum: int, frame: object) -> None:
 
 
 def setup_logging(level: int = logging.INFO) -> None:
-    handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(logging.Formatter(
-        "%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    ))
-    root = logging.getLogger("newsfeed")
-    root.setLevel(level)
-    root.addHandler(handler)
+    from newsfeed.logging_config import configure_logging
+    configure_logging(level=logging.getLevelName(level))
 
 
 def main() -> None:
@@ -95,6 +89,13 @@ def main() -> None:
     log.info("  LLM-backed experts: %s", "yes" if engine.is_llm_backed() else "no (heuristic only)")
     log.info("  Intelligence stages: %d/%d enabled", len(enabled_stages), 7)
     log.info("=" * 60)
+
+    # Start health check + metrics server
+    try:
+        from newsfeed.monitoring.health import start_health_server
+        start_health_server(engine=engine)
+    except Exception:
+        log.debug("Health server not started (non-critical)", exc_info=True)
 
     # If Telegram bot is configured, start the polling loop
     if engine.is_telegram_connected():

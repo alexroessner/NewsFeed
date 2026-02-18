@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,7 +11,8 @@ from newsfeed.agents.base import ResearchAgent
 from newsfeed.agents.dynamic_sources import create_custom_agent
 from newsfeed.agents.experts import ExpertCouncil
 from newsfeed.agents.registry import create_agent
-from newsfeed.db.analytics import AnalyticsDB, create_analytics_db
+from newsfeed.db.analytics import create_analytics_db
+from newsfeed.db.state_store import D1StateStore
 from newsfeed.delivery.telegram import TelegramFormatter
 from newsfeed.intelligence.clustering import StoryClustering
 from newsfeed.intelligence.enrichment import ArticleEnricher
@@ -42,6 +44,7 @@ from newsfeed.models.domain import (
     configure_scoring,
     validate_candidate,
 )
+from newsfeed.orchestration.access_control import AccessControl
 from newsfeed.orchestration.audit import AuditTrail
 from newsfeed.orchestration.communication import CommunicationAgent
 from newsfeed.orchestration.configurator import SystemConfigurator
@@ -68,12 +71,31 @@ def _run_sync(coro: object) -> object:
 
 
 class NewsFeedEngine:
+    # Maximum concurrent pipeline runs.  Prevents resource exhaustion
+    # when many Telegram users trigger briefings simultaneously.
+    MAX_CONCURRENT_REQUESTS = 4
+    # Hard deadline for a single pipeline run (seconds).  If the pipeline
+    # exceeds this, handle_request_payload raises TimeoutError so the
+    # caller can send an apologetic partial response instead of hanging.
+    DEFAULT_PIPELINE_TIMEOUT_S = 120
+
     def __init__(self, config: dict, pipeline: dict, personas: dict, personas_dir: Path) -> None:
         self.config = config
         self.pipeline = pipeline
         self.personas = personas
 
         log.info("Initializing NewsFeedEngine (config v%s)", pipeline.get("version", "?"))
+
+        # Concurrency limiter — excess requests block until a slot opens
+        max_conc = pipeline.get("limits", {}).get(
+            "max_concurrent_requests", self.MAX_CONCURRENT_REQUESTS,
+        )
+        self._request_semaphore = threading.Semaphore(max_conc)
+
+        # Pipeline deadline — prevents runaway requests from hanging forever
+        self._pipeline_timeout_s: float = pipeline.get("limits", {}).get(
+            "pipeline_timeout_seconds", self.DEFAULT_PIPELINE_TIMEOUT_S,
+        )
 
         # Inject scoring config into domain models
         scoring_cfg = pipeline.get("scoring", {})
@@ -147,6 +169,10 @@ class NewsFeedEngine:
 
         # Audit trail (full decision tracking)
         self.audit = AuditTrail()
+
+        # Access control (user allowlist + admin roles)
+        ac_cfg = pipeline.get("access_control", {})
+        self.access_control = AccessControl(ac_cfg)
 
         # Universal configurator (plain-text config changes)
         self.configurator = SystemConfigurator(pipeline, config, personas)
@@ -232,6 +258,26 @@ class NewsFeedEngine:
         analytics_dir.mkdir(parents=True, exist_ok=True)
         self.analytics = create_analytics_db(local_path=analytics_dir / "analytics.db")
 
+        # D1-backed state store — persists preferences, trends, etc. across runs
+        self._d1_state = D1StateStore(self.analytics)
+        # Load state from D1 if file-based persistence didn't find anything
+        if not self._persistence or not (Path(persist_cfg.get("state_dir", "state")) / "preferences.json").exists():
+            self._load_d1_state()
+
+        # Run pending database migrations
+        from newsfeed.db.migrations import MigrationRunner
+        try:
+            migration_runner = MigrationRunner(self.analytics)
+            applied = migration_runner.apply_all()
+            if applied:
+                log.info("Applied %d database migrations (now at v%d)", applied, migration_runner.current_version())
+        except Exception:
+            log.warning("Migration runner failed — schema may be outdated", exc_info=True)
+
+        # Operator dashboard
+        from newsfeed.monitoring.dashboard import OperatorDashboard
+        self.dashboard = OperatorDashboard(self)
+
         log.info(
             "Engine ready: %d agents, %d experts, stages=%s",
             len(config.get("research_agents", [])),
@@ -266,37 +312,83 @@ class NewsFeedEngine:
 
         return agents
 
-    async def _run_agent_with_breaker(self, agent: ResearchAgent, task: ResearchTask, top_k: int) -> list:
-        """Run a single agent with circuit breaker protection."""
+    async def _run_agent_with_breaker(self, agent: ResearchAgent, task: ResearchTask, top_k: int) -> tuple[list, str | None]:
+        """Run a single agent with circuit breaker protection.
+
+        Returns (results, failure_reason) where failure_reason is None on
+        success, a short string on failure or circuit-breaker skip.
+        """
         cb = self.optimizer.circuit_breaker
         if not cb.allow_request(agent.agent_id):
             log.debug("Circuit breaker OPEN — skipping %s", agent.agent_id)
-            return []
+            return [], "circuit_breaker"
         try:
             result = await agent.run_async(task, top_k=top_k)
             cb.record_success(agent.agent_id)
-            return result
+            return result, None
         except Exception:
             cb.record_failure(agent.agent_id)
             log.warning("Agent %s failed (circuit breaker tracking)", agent.agent_id, exc_info=True)
-            return []
+            return [], "error"
 
-    async def _run_research_async(self, task: ResearchTask, top_k: int) -> list:
+    async def _run_research_async(self, task: ResearchTask, top_k: int) -> tuple[list, list[str]]:
+        """Run all agents and return (candidates, failed_agent_ids)."""
+        agents = self._research_agents(task.user_id)
         coros = [
             self._run_agent_with_breaker(agent, task, top_k)
-            for agent in self._research_agents(task.user_id)
+            for agent in agents
         ]
         batch = await asyncio.gather(*coros)
-        flattened = []
-        for chunk in batch:
-            flattened.extend(chunk)
-        return flattened
+        flattened: list = []
+        failed_agents: list[str] = []
+        for agent, (results, failure) in zip(agents, batch):
+            flattened.extend(results)
+            if failure is not None:
+                failed_agents.append(agent.agent_id)
+        return flattened, failed_agents
 
-    def _run_research(self, task: ResearchTask, top_k: int) -> list[CandidateItem]:
-        """Run research fan-out, safely handling sync/async contexts."""
+    def _run_research(self, task: ResearchTask, top_k: int) -> tuple[list[CandidateItem], list[str]]:
+        """Run research fan-out, safely handling sync/async contexts.
+
+        Returns (candidates, failed_agent_ids).
+        """
         return _run_sync(self._run_research_async(task, top_k))
 
     def handle_request_payload(self, user_id: str, prompt: str, weighted_topics: dict[str, float], max_items: int | None = None) -> DeliveryPayload:
+        # Backpressure: block if too many pipeline runs are active.
+        # This prevents resource exhaustion (memory, CPU, API quotas)
+        # when many users trigger briefings simultaneously.
+        acquired = self._request_semaphore.acquire(timeout=30)
+        if not acquired:
+            raise RuntimeError("Server busy — too many concurrent briefing requests. Please retry shortly.")
+        try:
+            return self._run_with_deadline(user_id, prompt, weighted_topics, max_items)
+        finally:
+            self._request_semaphore.release()
+
+    def _run_with_deadline(self, user_id: str, prompt: str, weighted_topics: dict[str, float], max_items: int | None) -> DeliveryPayload:
+        """Run the pipeline in a thread with a hard deadline.
+
+        If the pipeline exceeds ``_pipeline_timeout_s``, raises
+        ``TimeoutError`` so the caller can send a partial/error response
+        instead of hanging indefinitely on a stuck external API.
+        """
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(self._handle_request_inner, user_id, prompt, weighted_topics, max_items)
+            try:
+                return future.result(timeout=self._pipeline_timeout_s)
+            except concurrent.futures.TimeoutError:
+                log.error(
+                    "Pipeline timeout after %.0fs for user=%s prompt=%r",
+                    self._pipeline_timeout_s, user_id, prompt[:80],
+                )
+                raise TimeoutError(
+                    f"Briefing timed out after {self._pipeline_timeout_s:.0f}s. "
+                    "An external source may be unresponsive. Please retry."
+                ) from None
+
+    def _handle_request_inner(self, user_id: str, prompt: str, weighted_topics: dict[str, float], max_items: int | None = None) -> DeliveryPayload:
         log.info("handle_request user=%s prompt=%r", user_id, prompt[:80])
         profile = self.preferences.get_or_create(user_id)
         limit = min(max_items or profile.max_items, self.pipeline.get("limits", {}).get("default_max_items", 10))
@@ -320,7 +412,7 @@ class NewsFeedEngine:
         lifecycle.advance(RequestStage.RESEARCHING)
         top_k = self.pipeline.get("limits", {}).get("top_discoveries_per_research_agent", 5)
         t0 = time.monotonic()
-        all_candidates = self._run_research(task, top_k)
+        all_candidates, failed_agents = self._run_research(task, top_k)
         research_ms = (time.monotonic() - t0) * 1000
         self.orchestrator.record_research_results(lifecycle, len(all_candidates))
         self.optimizer.record_stage_run("research", research_ms)
@@ -375,7 +467,7 @@ class NewsFeedEngine:
 
         # Stage 2: Intelligence enrichment (conditionally enabled, with error isolation)
         t0 = time.monotonic()
-        all_candidates = self._run_intelligence(all_candidates)
+        all_candidates, failed_stages = self._run_intelligence(all_candidates)
         intel_ms = (time.monotonic() - t0) * 1000
         self.optimizer.record_stage_run("intelligence", intel_ms)
 
@@ -421,10 +513,13 @@ class NewsFeedEngine:
         # Stage 3.5: Article enrichment — fetch full articles and generate real summaries
         # Only the selected stories get enriched (not all candidates)
         t0 = time.monotonic()
+        enrichment_ok = True
         try:
             selected = self.enricher.enrich(selected)
         except Exception:
             log.exception("Article enrichment failed, continuing with RSS summaries")
+            enrichment_ok = False
+            failed_stages.append("enrichment")
         enrich_ms = (time.monotonic() - t0) * 1000
         self.optimizer.record_stage_run("article_enrichment", enrich_ms)
         log.info("Article enrichment completed in %.0fms", enrich_ms)
@@ -436,6 +531,7 @@ class NewsFeedEngine:
                 threads = self.clustering.cluster(selected)
             except Exception:
                 log.exception("Clustering stage failed, continuing without threads")
+                failed_stages.append("clustering")
 
         # Stage 5: Geo-risk assessment
         geo_risks = []
@@ -444,6 +540,7 @@ class NewsFeedEngine:
                 geo_risks = self.georisk.assess(all_candidates)
             except Exception:
                 log.exception("Georisk stage failed, continuing without geo risks")
+                failed_stages.append("georisk")
 
         # Stage 6: Trend analysis
         trend_snapshots = []
@@ -452,6 +549,7 @@ class NewsFeedEngine:
                 trend_snapshots = self.trends.analyze(all_candidates)
             except Exception:
                 log.exception("Trend stage failed, continuing without trends")
+                failed_stages.append("trends")
 
         # Stage 7: Report assembly with editorial review
         lifecycle.advance(RequestStage.EDITORIAL_REVIEW)
@@ -507,7 +605,9 @@ class NewsFeedEngine:
                     "agents_total": len(self.config.get("research_agents", [])),
                     "agents_contributing": len(by_agent),
                     "agents_silent": len(self.config.get("research_agents", [])) - len(by_agent),
+                    "agents_failed": failed_agents,
                     "stages_enabled": list(self._enabled_stages),
+                    "stages_failed": failed_stages,
                     "total_candidates": len(all_candidates),
                 },
             },
@@ -571,26 +671,35 @@ class NewsFeedEngine:
         payload = self.handle_request_payload(user_id, prompt, weighted_topics, max_items)
         return self.formatter.format(payload)
 
-    def _run_intelligence(self, candidates: list[CandidateItem]) -> list[CandidateItem]:
-        """Run intelligence enrichment stages with error isolation."""
+    def _run_intelligence(self, candidates: list[CandidateItem]) -> tuple[list[CandidateItem], list[str]]:
+        """Run intelligence enrichment stages with error isolation.
+
+        Returns (candidates, failed_stages) where failed_stages lists
+        the names of any stages that raised exceptions.
+        """
+        failed_stages: list[str] = []
+
         if "credibility" in self._enabled_stages:
             try:
                 for c in candidates:
                     self.credibility.record_item(c)
             except Exception:
                 log.exception("Credibility stage failed")
+                failed_stages.append("credibility")
 
         if "corroboration" in self._enabled_stages:
             try:
                 candidates = detect_cross_corroboration(candidates)
             except Exception:
                 log.exception("Corroboration stage failed")
+                failed_stages.append("corroboration")
 
         if "urgency" in self._enabled_stages:
             try:
                 candidates = self.breaking_detector.assess(candidates)
             except Exception:
                 log.exception("Urgency stage failed")
+                failed_stages.append("urgency")
 
         if "diversity" in self._enabled_stages:
             try:
@@ -598,8 +707,9 @@ class NewsFeedEngine:
                 candidates = enforce_source_diversity(candidates, max_per_source=max_per_source)
             except Exception:
                 log.exception("Diversity stage failed")
+                failed_stages.append("diversity")
 
-        return candidates
+        return candidates, failed_stages
 
     def _assemble_report(self, selected: list[CandidateItem], threads: list,
                          profile: UserProfile | None = None,
@@ -865,22 +975,68 @@ class NewsFeedEngine:
         return sum(len(v) for v in self.cache._entries.values())
 
     def persist_preferences(self) -> None:
-        """Persist current preferences to disk (if persistence is enabled)."""
+        """Persist current preferences to disk and D1."""
         if self._persistence:
             self._persistence.save("preferences", self.preferences.snapshot())
+        self._save_d1_state()
 
     def _save_state(self) -> None:
-        if not self._persistence:
-            return
-        self._persistence.save("preferences", self.preferences.snapshot())
-        self._persistence.save("credibility", self.credibility.snapshot())
-        self._persistence.save("georisk", self.georisk.snapshot())
-        self._persistence.save("trends", self.trends.snapshot())
-        self._persistence.save("optimizer", self.optimizer.snapshot())
-        self._persistence.save("debate_chair", self.experts.chair.snapshot())
-        # Persist scheduler so scheduled briefings survive restarts
-        if hasattr(self, "_scheduler") and self._scheduler:
-            self._persistence.save("scheduler", self._scheduler.snapshot())
+        if self._persistence:
+            self._persistence.save("preferences", self.preferences.snapshot())
+            self._persistence.save("credibility", self.credibility.snapshot())
+            self._persistence.save("georisk", self.georisk.snapshot())
+            self._persistence.save("trends", self.trends.snapshot())
+            self._persistence.save("optimizer", self.optimizer.snapshot())
+            self._persistence.save("debate_chair", self.experts.chair.snapshot())
+            if hasattr(self, "_scheduler") and self._scheduler:
+                self._persistence.save("scheduler", self._scheduler.snapshot())
+            if hasattr(self, "access_control"):
+                self._persistence.save("access_control", self.access_control.snapshot())
+        # Also persist to D1 for cross-run durability
+        self._save_d1_state()
+
+    def _save_d1_state(self) -> None:
+        """Persist state to D1 so it survives across ephemeral GH Actions runs."""
+        try:
+            self._d1_state.save("preferences", self.preferences.snapshot())
+            self._d1_state.save("credibility", self.credibility.snapshot())
+            self._d1_state.save("georisk", self.georisk.snapshot())
+            self._d1_state.save("trends", self.trends.snapshot())
+            self._d1_state.save("optimizer", self.optimizer.snapshot())
+            self._d1_state.save("debate_chair", self.experts.chair.snapshot())
+            if hasattr(self, "_scheduler") and self._scheduler:
+                self._d1_state.save("scheduler", self._scheduler.snapshot())
+            if hasattr(self, "access_control"):
+                self._d1_state.save("access_control", self.access_control.snapshot())
+        except Exception:
+            log.debug("D1 state save failed (non-critical)", exc_info=True)
+
+    def _load_d1_state(self) -> None:
+        """Load state from D1 on startup (fallback when file-based state is absent)."""
+        try:
+            prefs = self._d1_state.load("preferences")
+            if prefs and isinstance(prefs, dict):
+                # Delegate to existing _load_state validation logic by temporarily
+                # injecting into persistence, or directly restore minimal state
+                for uid, pdata in prefs.items():
+                    if isinstance(pdata, dict):
+                        profile = self.preferences.get_or_create(uid)
+                        tw = pdata.get("topic_weights", {})
+                        if isinstance(tw, dict):
+                            for k, v in list(tw.items())[:50]:
+                                profile.topic_weights[str(k)] = round(max(-1.0, min(1.0, float(v))), 3)
+                log.info("Restored %d user preferences from D1", len(prefs))
+
+            ac_data = self._d1_state.load("access_control")
+            if ac_data and isinstance(ac_data, dict) and hasattr(self, "access_control"):
+                self.access_control.restore(ac_data)
+                log.info("Restored access control state from D1")
+
+            cred = self._d1_state.load("credibility")
+            if cred and isinstance(cred, dict):
+                log.info("Restored credibility data from D1 (%d sources)", len(cred))
+        except Exception:
+            log.debug("D1 state load failed (non-critical)", exc_info=True)
 
     # Allowed values for validated string fields on restore.
     # IMPORTANT: These must be a superset of the values accepted by the

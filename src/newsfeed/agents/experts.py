@@ -7,7 +7,6 @@ tracks expert influence scores, and produces auditable decisions.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import math

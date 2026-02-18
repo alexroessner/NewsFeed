@@ -136,6 +136,12 @@ class CommunicationAgent:
         self._rate_limits: BoundedUserDict[float] = BoundedUserDict(maxlen=500)
         self._RATE_LIMIT_SECONDS = 15  # Min seconds between briefing/sitrep/quick
         self._cmd_rate_windows: dict[str, list[float]] = {}  # Per-command sliding window
+        # Global concurrent pipeline cap — prevents resource exhaustion
+        self._active_pipelines = 0
+        self._MAX_CONCURRENT_PIPELINES = 5
+        # Per-user daily cost budget (briefing count)
+        self._daily_briefing_counts: BoundedUserDict[list] = BoundedUserDict(maxlen=500)
+        self._MAX_DAILY_BRIEFINGS = 50  # Per-user cap
         # Alert dedup: track which alerts have been sent to avoid repeat notifications.
         # Key: "user_id:alert_type:region_or_topic", Value: monotonic timestamp.
         self._sent_alerts: dict[str, float] = {}
@@ -172,6 +178,18 @@ class CommunicationAgent:
 
         if not chat_id or not user_id:
             return None
+
+        # Access control gate — check authorization before processing
+        ac = self._engine.access_control
+        if cmd_type == "command" and command == "start":
+            pass  # /start always allowed — triggers registration flow
+        elif not ac.is_allowed(user_id):
+            self._bot.send_message(
+                chat_id,
+                "You don't have access to this bot.\n"
+                "Use /start to request access from the administrator.",
+            )
+            return {"action": "access_denied", "user_id": user_id}
 
         log.info("Processing %s from user=%s: cmd=%s args=%r", cmd_type, user_id, command, args)
 
@@ -217,11 +235,15 @@ class CommunicationAgent:
     def _check_rate_limit(self, chat_id: int | str, user_id: str) -> bool:
         """Check if user is rate-limited for expensive commands.
 
-        Returns True if the request should be BLOCKED (rate limited).
-        Uses monotonic clock so system time adjustments can't bypass limits.
+        Returns True if the request should be BLOCKED. Enforces:
+        1. Per-user cooldown (15s between briefings)
+        2. Global concurrent pipeline cap (5 max)
+        3. Per-user daily budget (50 briefings/day)
         """
         import time
         now = time.monotonic()
+
+        # Check 1: Per-user cooldown
         last = self._rate_limits.get(user_id, 0)
         if now - last < self._RATE_LIMIT_SECONDS:
             remaining = int(self._RATE_LIMIT_SECONDS - (now - last))
@@ -230,6 +252,29 @@ class CommunicationAgent:
                 f"Please wait {remaining}s before requesting another briefing."
             )
             return True
+
+        # Check 2: Global concurrent pipeline cap
+        if self._active_pipelines >= self._MAX_CONCURRENT_PIPELINES:
+            self._bot.send_message(
+                chat_id,
+                "System is processing multiple briefings. Please try again in a moment."
+            )
+            return True
+
+        # Check 3: Per-user daily budget
+        daily = self._daily_briefing_counts.get(user_id, [])
+        day_start = time.time() - 86400  # 24 hours ago
+        daily = [t for t in daily if t > day_start]
+        if len(daily) >= self._MAX_DAILY_BRIEFINGS:
+            self._bot.send_message(
+                chat_id,
+                f"Daily briefing limit reached ({self._MAX_DAILY_BRIEFINGS}/day). "
+                "Resets in 24 hours."
+            )
+            return True
+
+        daily.append(time.time())
+        self._daily_briefing_counts[user_id] = daily
         self._rate_limits[user_id] = now
         return False
 
@@ -484,6 +529,49 @@ class CommunicationAgent:
         if command == "admin":
             return self._handle_admin(chat_id, user_id, args)
 
+        if command == "approve":
+            ac = self._engine.access_control
+            msg = ac.approve_user(user_id, args.strip())
+            self._bot.send_message(chat_id, msg)
+            return {"action": "approve_user", "user_id": user_id, "target": args.strip()}
+
+        if command == "reject":
+            ac = self._engine.access_control
+            msg = ac.reject_user(user_id, args.strip())
+            self._bot.send_message(chat_id, msg)
+            return {"action": "reject_user", "user_id": user_id, "target": args.strip()}
+
+        if command == "promote":
+            ac = self._engine.access_control
+            msg = ac.promote_to_admin(user_id, args.strip())
+            self._bot.send_message(chat_id, msg)
+            return {"action": "promote_user", "user_id": user_id, "target": args.strip()}
+
+        if command == "demote":
+            ac = self._engine.access_control
+            msg = ac.demote_from_admin(user_id, args.strip())
+            self._bot.send_message(chat_id, msg)
+            return {"action": "demote_user", "user_id": user_id, "target": args.strip()}
+
+        if command == "users":
+            ac = self._engine.access_control
+            counts = ac.get_user_count()
+            pending = ac.get_pending_users()
+            import html as html_mod
+            lines = [
+                "<b>User Access Summary</b>",
+                f"  Allowed: {counts['allowed']}",
+                f"  Admins: {counts['admin']}",
+                f"  Pending: {counts['pending']}",
+            ]
+            if pending:
+                lines.append("")
+                lines.append("<b>Pending Approval:</b>")
+                for uid in pending:
+                    lines.append(f"  {html_mod.escape(uid)} — /approve {html_mod.escape(uid)}")
+            self._bot.send_message(chat_id, "\n".join(lines))
+            return {"action": "users_list", "user_id": user_id}
+
         if command == "_stale_callback":
             self._bot.send_message(
                 chat_id,
@@ -502,7 +590,26 @@ class CommunicationAgent:
 
         Starts a 3-step personalization: topics -> role -> detail level.
         Seeds the profile in ~30 seconds instead of requiring iterative /feedback.
+        If access control is active, handles registration before onboarding.
         """
+        ac = self._engine.access_control
+        if not ac.is_allowed(user_id):
+            msg = ac.request_access(user_id)
+            self._bot.send_message(chat_id, msg)
+            # Notify admins of pending request
+            pending = ac.get_pending_users()
+            if pending and user_id in pending:
+                for admin_id in ac._admin_users:
+                    if admin_id != user_id:
+                        self._bot.send_message(
+                            admin_id,
+                            f"New access request from user {user_id}.\n"
+                            f"Approve: /approve {user_id}\n"
+                            f"Reject: /reject {user_id}",
+                        )
+            if not ac.is_allowed(user_id):
+                return {"action": "access_requested", "user_id": user_id}
+
         self._engine.preferences.get_or_create(user_id)
         self._engine.analytics.record_user_seen(user_id, chat_id)
 
@@ -810,12 +917,16 @@ class CommunicationAgent:
             max_items = min(max_items + 5, 20)
 
         # Run the intelligence pipeline — get structured payload
-        payload = self._engine.handle_request_payload(
-            user_id=user_id,
-            prompt=prompt,
-            weighted_topics=topics,
-            max_items=max_items,
-        )
+        self._active_pipelines += 1
+        try:
+            payload = self._engine.handle_request_payload(
+                user_id=user_id,
+                prompt=prompt,
+                weighted_topics=topics,
+                max_items=max_items,
+            )
+        finally:
+            self._active_pipelines = max(0, self._active_pipelines - 1)
 
         # Apply user-configured advanced filters
         has_filters = profile.confidence_min > 0 or profile.urgency_min or profile.max_per_source > 0
@@ -868,8 +979,13 @@ class CommunicationAgent:
         # Build continuity summary from delta tags
         continuity = self._build_continuity_summary(delta_tags, tracked_count)
 
+        # Build quality indicator from pipeline health metadata
+        quality_badge = self._build_quality_badge(payload)
+
         # Message 1: Header (ticker + exec summary + geo risks + trends + threads)
         header = formatter.format_header(payload, ticker_bar, tracked_count=tracked_count)
+        if quality_badge:
+            header += f"\n{quality_badge}"
         if continuity:
             header += f"\n{continuity}"
         self._bot.send_message(chat_id, header)
@@ -1699,7 +1815,10 @@ class CommunicationAgent:
             )
             return {"action": "mute_show", "user_id": user_id}
 
-        self._engine.preferences.mute_topic(user_id, topic)
+        _, hint = self._engine.preferences.mute_topic(user_id, topic)
+        if hint:
+            self._bot.send_message(chat_id, hint)
+            return {"action": "mute_topic_cap", "user_id": user_id, "topic": topic}
         self._persist_prefs()
         import html as html_mod
         self._bot.send_message(chat_id, f"Topic <code>{html_mod.escape(topic)}</code> muted. /unmute {html_mod.escape(topic)} to reverse.")
@@ -2266,7 +2385,7 @@ class CommunicationAgent:
             if summary and summary.get("chat_id"):
                 return summary["chat_id"]
         except Exception:
-            pass
+            log.debug("Failed to resolve chat_id from analytics for user=%s", user_id, exc_info=True)
         # In Telegram DMs, user_id works as chat_id
         return user_id
 
@@ -2286,7 +2405,7 @@ class CommunicationAgent:
                         f"Fix your endpoint and run /webhook test to re-enable."
                     )
                 except Exception:
-                    pass
+                    log.debug("Failed to notify user=%s about webhook disable", user_id, exc_info=True)
             profile.webhook_url = ""
             self._persist_prefs()
 
@@ -2316,6 +2435,53 @@ class CommunicationAgent:
         except Exception:
             log.debug("Webhook alert failed for user=%s", user_id, exc_info=True)
             self._delivery_metrics.record_failure("webhook")
+
+    @staticmethod
+    @staticmethod
+    def _build_quality_badge(payload) -> str:
+        """Build a quality/confidence indicator for the briefing.
+
+        Shows the user how much of the pipeline was healthy, e.g.:
+        "Based on 16/23 sources, 7 intelligence stages, LLM-enriched"
+        Defensive against MagicMock or missing metadata.
+        """
+        try:
+            meta = getattr(payload, "metadata", None)
+            if not isinstance(meta, dict):
+                return ""
+            health = meta.get("pipeline_health")
+            trace = meta.get("pipeline_trace")
+            if not isinstance(health, dict) or not isinstance(trace, dict):
+                return ""
+
+            agents_total = int(health.get("agents_total", 0) or 0)
+            agents_contributing = int(health.get("agents_contributing", 0) or 0)
+            stages = health.get("stages_enabled", [])
+            enrichment_ms = float(trace.get("enrichment_time_ms", 0) or 0)
+
+            if not agents_total:
+                return ""
+
+            parts: list[str] = []
+            parts.append(f"{agents_contributing}/{agents_total} sources")
+            if isinstance(stages, list) and stages:
+                parts.append(f"{len(stages)} intel stages")
+            if enrichment_ms > 100:
+                parts.append("LLM-enriched")
+            elif enrichment_ms == 0:
+                parts.append("basic mode")
+
+            ratio = agents_contributing / max(agents_total, 1)
+            if ratio >= 0.75:
+                icon = "\u2705"
+            elif ratio >= 0.5:
+                icon = "\u26a0\ufe0f"
+            else:
+                icon = "\U0001f534"
+
+            return f"<i>{icon} Based on {', '.join(parts)}</i>"
+        except (TypeError, ValueError, AttributeError):
+            return ""
 
     @staticmethod
     def _build_continuity_summary(delta_tags: list[str], tracked_count: int) -> str:
@@ -3293,17 +3459,12 @@ class CommunicationAgent:
         )
 
     def _is_admin(self, user_id: str) -> bool:
-        """Check if user is the admin/owner.
+        """Check if user is an admin via AccessControl.
 
-        SECURITY: Requires explicit TELEGRAM_OWNER_ID configuration.
-        If not set, admin access is denied entirely — no fallback to
-        'first user' which would allow arbitrary privilege escalation.
+        Delegates to the engine's AccessControl which supports owner,
+        configured admins, and runtime-promoted admins.
         """
-        import os
-        owner_id = os.environ.get("TELEGRAM_OWNER_ID", "")
-        if not owner_id:
-            return False
-        return str(user_id) == str(owner_id)
+        return self._engine.access_control.is_admin(user_id)
 
     def _handle_admin(self, chat_id: int | str, user_id: str,
                       args: str) -> dict[str, Any]:
@@ -3335,7 +3496,9 @@ class CommunicationAgent:
                 "/admin topics \u2014 Top topics (30 days)\n"
                 "/admin sources \u2014 Top sources (30 days)\n"
                 "/admin briefings [user_id] \u2014 User briefing history\n"
-                "/admin health \u2014 Delivery success rates"
+                "/admin health \u2014 Delivery success rates\n"
+                "/admin dashboard \u2014 Full operator dashboard\n"
+                "/admin alerts \u2014 Recent alerts"
             ))
             return {"action": "admin_help", "user_id": user_id}
 
@@ -3578,6 +3741,29 @@ class CommunicationAgent:
                 )
             self._bot.send_message(chat_id, "\n".join(lines))
             return {"action": "admin_health", "user_id": user_id}
+
+        if subcmd == "dashboard":
+            try:
+                dashboard_text = self._engine.dashboard.format_telegram_dashboard()
+                self._bot.send_message(chat_id, dashboard_text)
+            except Exception:
+                self._bot.send_message(chat_id, "Dashboard generation failed.")
+            return {"action": "admin_dashboard", "user_id": user_id}
+
+        if subcmd == "alerts":
+            from newsfeed.monitoring.alerts import create_default_alerts
+            mgr = create_default_alerts(self._engine)
+            fired = mgr.check_all()
+            recent = mgr.recent_alerts()
+            if not fired and not recent:
+                self._bot.send_message(chat_id, "\u2705 No alerts — all systems healthy.")
+            else:
+                lines = ["<b>Alert Status</b>", ""]
+                for alert in (fired or recent):
+                    icon = "\U0001f534" if alert.get("severity") == "critical" else "\u26a0\ufe0f"
+                    lines.append(f"  {icon} {html_mod.escape(alert.get('message', 'Unknown alert'))}")
+                self._bot.send_message(chat_id, "\n".join(lines))
+            return {"action": "admin_alerts", "user_id": user_id}
 
         self._bot.send_message(chat_id, f"Unknown admin command: {html_mod.escape(subcmd)}. Try /admin help")
         return {"action": "admin_unknown", "user_id": user_id}

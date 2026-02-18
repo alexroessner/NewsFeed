@@ -2,15 +2,10 @@ from __future__ import annotations
 
 import html
 import re
-from typing import Sequence
-
 from newsfeed.models.domain import (
     BriefingType,
     DeliveryPayload,
-    GeoRiskEntry,
-    NarrativeThread,
     ReportItem,
-    TrendSnapshot,
     UrgencyLevel,
 )
 
@@ -87,6 +82,32 @@ _MAX_CARD_LENGTH = 3800
 
 _SAFE_URL_SCHEMES = frozenset({"http", "https", "ftp"})
 
+# Human-readable source names — internal IDs → what users see
+_SOURCE_DISPLAY: dict[str, str] = {
+    "bbc": "BBC News",
+    "guardian": "The Guardian",
+    "aljazeera": "Al Jazeera",
+    "hackernews": "Hacker News",
+    "arxiv": "arXiv",
+    "gdelt": "GDELT",
+    "web": "Google News",
+    "npr": "NPR",
+    "cnbc": "CNBC",
+    "france24": "France 24",
+    "techcrunch": "TechCrunch",
+    "nature": "Nature",
+    "reuters": "Reuters",
+    "ap": "AP News",
+    "ft": "Financial Times",
+    "reddit": "Reddit",
+    "x": "X",
+}
+
+
+def _display_source(source_id: str) -> str:
+    """Map internal source ID to human-readable name."""
+    return _SOURCE_DISPLAY.get(source_id, source_id.replace("_", " ").title())
+
 
 def _esc_url(url: str) -> str:
     """Escape a URL for use inside an href attribute.
@@ -140,15 +161,19 @@ def _format_region(name: str) -> str:
 
 
 def _confidence_label(item: ReportItem) -> str:
-    """Return a short confidence indicator."""
+    """Return a short confidence indicator.
+
+    Only returns a label for high or low confidence — the middle band
+    is uninteresting to users and adds noise to every card.
+    """
     if not item.confidence:
         return ""
     mid = item.confidence.mid
     if mid >= 0.80:
         return "High confidence"
-    if mid >= 0.55:
-        return "Moderate confidence"
-    return "Low confidence"
+    if mid < 0.45:
+        return "Low confidence"
+    return ""
 
 
 class TelegramFormatter:
@@ -329,14 +354,14 @@ class TelegramFormatter:
     def format_story_card(self, item: ReportItem, index: int,
                           is_tracked: bool = False,
                           delta_tag: str = "") -> str:
-        """Format a single story as a rich, readable news card.
+        """Format a single story as a clean, scannable news card.
 
-        Includes the full intelligence context: summary, why it matters,
-        what changed, predictive outlook, confidence, and related reads.
-        Each card is sent as a separate Telegram message (~4096 char limit).
+        Optimized for mobile reading: title + source, summary,
+        why-it-matters, and a slim metadata line. Sections like
+        "What changed" (usually redundant with the title) and "Related"
+        (formulaic filler) are reserved for the deep-dive view only.
 
-        delta_tag can be "new", "updated", or "developing" to show how
-        this story relates to the user's previous briefing.
+        delta_tag can be "new", "updated", or "developing".
         """
         lines: list[str] = []
         c = item.candidate
@@ -353,7 +378,7 @@ class TelegramFormatter:
         elif delta_tag == "developing":
             tag_str = " <b>[DEVELOPING]</b>"
 
-        # ── Title + source ──
+        # ── Title + human-readable source ──
         title_esc = _esc(c.title)
         if c.url and not c.url.startswith("https://example.com"):
             title_line = (
@@ -363,7 +388,8 @@ class TelegramFormatter:
         else:
             title_line = f"<b>{tracked_badge}{index}. {title_esc}</b>"
 
-        source_tag = f"<i>[{_esc(c.source)}]</i>"
+        source_name = _display_source(c.source)
+        source_tag = f"<i>[{_esc(source_name)}]</i>"
         lines.append(f"{title_line} {source_tag}{tag_str}")
 
         # ── Summary ──
@@ -378,12 +404,8 @@ class TelegramFormatter:
             lines.append("")
             lines.append(f"<b>Why it matters:</b> {_esc(item.why_it_matters)}")
 
-        # ── What changed ──
-        if item.what_changed:
-            lines.append(f"<b>What changed:</b> {_esc(item.what_changed)}")
-
-        # ── Predictive outlook ──
-        if item.predictive_outlook:
+        # ── Predictive outlook — only when signal is meaningful ──
+        if item.predictive_outlook and c.prediction_signal > 0.6:
             lines.append("")
             lines.append(f"\U0001f52e <i>{_esc(item.predictive_outlook)}</i>")
 
@@ -392,14 +414,8 @@ class TelegramFormatter:
             lines.append("")
             lines.append(f"\u26a1 {_esc(item.contrarian_note)}")
 
-        # ── Metadata footer ──
+        # ── Metadata footer — only genuinely useful signals ──
         meta_parts: list[str] = []
-
-        # Reading time estimate from card word count
-        word_count = len((c.summary or "").split()) + len((item.why_it_matters or "").split())
-        if word_count > 20:
-            read_min = max(1, round(word_count / 200))
-            meta_parts.append(f"{read_min} min read")
 
         conf = _confidence_label(item)
         if conf:
@@ -407,25 +423,19 @@ class TelegramFormatter:
 
         if c.regions:
             meta_parts.append(
-                ", ".join(_esc(_format_region(r)) for r in c.regions[:4])
+                ", ".join(_esc(_format_region(r)) for r in c.regions[:3])
             )
 
         if c.corroborated_by:
+            sources_list = [_display_source(s) for s in c.corroborated_by[:3]]
             meta_parts.append(
-                f"Verified by {', '.join(_esc(s) for s in c.corroborated_by[:3])}"
+                f"Verified by {', '.join(_esc(s) for s in sources_list)}"
             )
 
         if meta_parts:
             lines.append("")
             dot_sep = " \u00b7 "
             lines.append(f"<i>{dot_sep.join(meta_parts)}</i>")
-
-        # ── Adjacent reads ──
-        if item.adjacent_reads:
-            reads = [_esc(r) for r in item.adjacent_reads[:3] if r]
-            if reads:
-                lines.append("")
-                lines.append("<b>Related:</b> " + " \u2022 ".join(reads))
 
         result = "\n".join(lines).strip()
 
@@ -482,6 +492,24 @@ class TelegramFormatter:
                 sep = " \u2502 "
                 lines.append(f"<i>{sep.join(parts)}</i>")
 
+            # Surface data quality note when agents or stages are degraded
+            health = meta.get("pipeline_health", {})
+            failed_agents = health.get("agents_failed", [])
+            failed_stages = health.get("stages_failed", [])
+            if failed_agents:
+                n_failed = len(failed_agents)
+                n_total = health.get("agents_total", 0)
+                n_ok = health.get("agents_contributing", 0)
+                lines.append(
+                    f"<i>\u26a0\ufe0f {n_ok}/{n_total} sources reporting "
+                    f"({n_failed} unavailable)</i>"
+                )
+            if failed_stages:
+                stage_names = ", ".join(s.replace("_", " ") for s in failed_stages)
+                lines.append(
+                    f"<i>\u26a0\ufe0f Degraded stages: {_esc(stage_names)}</i>"
+                )
+
         return "\n".join(lines).strip()
 
     def format_topic_discovery(self, emerging_topics: list[str],
@@ -519,13 +547,16 @@ class TelegramFormatter:
 
         if topic_weights:
             lines.append("")
-            lines.append("<b>Your Topics</b>")
+            lines.append("<b>Your Focus</b>")
             sorted_topics = sorted(topic_weights.items(), key=lambda x: x[1], reverse=True)
-            topic_strs = []
-            for topic, weight in sorted_topics:
-                name = _esc(topic.replace("_", " ").title())
-                topic_strs.append(f"{name} ({weight:.0%})")
-            lines.append(", ".join(topic_strs))
+            # Show ranked topics without raw percentages — users don't need
+            # to see internal weight values
+            topic_names = [
+                _esc(topic.replace("_", " ").title())
+                for topic, _w in sorted_topics
+                if _w > 0.1  # skip near-zero topics
+            ]
+            lines.append(", ".join(topic_names))
 
         if source_weights:
             lines.append("")
@@ -573,7 +604,7 @@ class TelegramFormatter:
         if urgency_icon:
             urgency_icon += " "
 
-        source_tag = f"<i>[{_esc(c.source)}]</i>"
+        source_tag = f"<i>[{_esc(_display_source(c.source))}]</i>"
 
         # Headlines-only mode: pure one-liner, no context, no confidence
         if headlines_only:
@@ -779,7 +810,7 @@ class TelegramFormatter:
             )
         else:
             lines.append(f"<b>{title_esc}</b>")
-        lines.append(f"<i>[{_esc(c.source)}]</i>")
+        lines.append(f"<i>[{_esc(_display_source(c.source))}]</i>")
 
         # Full summary — no truncation for deep dive
         body = c.summary.strip() if c.summary else ""
@@ -905,7 +936,7 @@ class TelegramFormatter:
         lines.append("")
 
         # The selected story (what the user saw)
-        lines.append(f"<b>\u2500\u2500\u2500 {_esc(c.source)} (selected) \u2500\u2500\u2500</b>")
+        lines.append(f"<b>\u2500\u2500\u2500 {_esc(_display_source(c.source))} (selected) \u2500\u2500\u2500</b>")
         lines.append(f"<b>{_esc(c.title)}</b>")
         if c.summary:
             lines.append(_esc(_clean_summary(c.summary)))
@@ -917,7 +948,7 @@ class TelegramFormatter:
             lines.append("<i>This may be an exclusive or early-breaking report.</i>")
         else:
             for other in others[:5]:
-                lines.append(f"<b>\u2500\u2500\u2500 {_esc(other.source)} \u2500\u2500\u2500</b>")
+                lines.append(f"<b>\u2500\u2500\u2500 {_esc(_display_source(other.source))} \u2500\u2500\u2500</b>")
                 lines.append(f"<b>{_esc(other.title)}</b>")
                 if other.summary:
                     lines.append(_esc(_clean_summary(other.summary)))
@@ -1452,7 +1483,7 @@ class TelegramFormatter:
         """Format a single story as a compact SITREP line item."""
         c = item.candidate
         title = _esc(c.title[:100])
-        source = _esc(c.source)
+        source = _esc(_display_source(c.source))
         conf = _confidence_label(item)
 
         entry_lines = []
