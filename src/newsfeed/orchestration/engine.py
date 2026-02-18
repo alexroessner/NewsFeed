@@ -80,7 +80,7 @@ class NewsFeedEngine:
     # Hard deadline for a single pipeline run (seconds).  If the pipeline
     # exceeds this, handle_request_payload raises TimeoutError so the
     # caller can send an apologetic partial response instead of hanging.
-    DEFAULT_PIPELINE_TIMEOUT_S = 120
+    DEFAULT_PIPELINE_TIMEOUT_S = 300
 
     def __init__(self, config: dict, pipeline: dict, personas: dict, personas_dir: Path) -> None:
         self.config = config
