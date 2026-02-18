@@ -74,6 +74,10 @@ class NewsFeedEngine:
     # Maximum concurrent pipeline runs.  Prevents resource exhaustion
     # when many Telegram users trigger briefings simultaneously.
     MAX_CONCURRENT_REQUESTS = 4
+    # Hard deadline for a single pipeline run (seconds).  If the pipeline
+    # exceeds this, handle_request_payload raises TimeoutError so the
+    # caller can send an apologetic partial response instead of hanging.
+    DEFAULT_PIPELINE_TIMEOUT_S = 120
 
     def __init__(self, config: dict, pipeline: dict, personas: dict, personas_dir: Path) -> None:
         self.config = config
@@ -87,6 +91,11 @@ class NewsFeedEngine:
             "max_concurrent_requests", self.MAX_CONCURRENT_REQUESTS,
         )
         self._request_semaphore = threading.Semaphore(max_conc)
+
+        # Pipeline deadline — prevents runaway requests from hanging forever
+        self._pipeline_timeout_s: float = pipeline.get("limits", {}).get(
+            "pipeline_timeout_seconds", self.DEFAULT_PIPELINE_TIMEOUT_S,
+        )
 
         # Inject scoring config into domain models
         scoring_cfg = pipeline.get("scoring", {})
@@ -353,9 +362,31 @@ class NewsFeedEngine:
         if not acquired:
             raise RuntimeError("Server busy — too many concurrent briefing requests. Please retry shortly.")
         try:
-            return self._handle_request_inner(user_id, prompt, weighted_topics, max_items)
+            return self._run_with_deadline(user_id, prompt, weighted_topics, max_items)
         finally:
             self._request_semaphore.release()
+
+    def _run_with_deadline(self, user_id: str, prompt: str, weighted_topics: dict[str, float], max_items: int | None) -> DeliveryPayload:
+        """Run the pipeline in a thread with a hard deadline.
+
+        If the pipeline exceeds ``_pipeline_timeout_s``, raises
+        ``TimeoutError`` so the caller can send a partial/error response
+        instead of hanging indefinitely on a stuck external API.
+        """
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(self._handle_request_inner, user_id, prompt, weighted_topics, max_items)
+            try:
+                return future.result(timeout=self._pipeline_timeout_s)
+            except concurrent.futures.TimeoutError:
+                log.error(
+                    "Pipeline timeout after %.0fs for user=%s prompt=%r",
+                    self._pipeline_timeout_s, user_id, prompt[:80],
+                )
+                raise TimeoutError(
+                    f"Briefing timed out after {self._pipeline_timeout_s:.0f}s. "
+                    "An external source may be unresponsive. Please retry."
+                ) from None
 
     def _handle_request_inner(self, user_id: str, prompt: str, weighted_topics: dict[str, float], max_items: int | None = None) -> DeliveryPayload:
         log.info("handle_request user=%s prompt=%r", user_id, prompt[:80])

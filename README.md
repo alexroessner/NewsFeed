@@ -32,7 +32,7 @@ python -m newsfeed.orchestration.bootstrap
 
 API keys go in `config/secrets.json` (gitignored). Copy `config/secrets.json.example` to get started. Keys can also be set in `config/pipelines.json` under `api_keys`, or via environment variables in CI/CD.
 
-All keys are optional — agents without keys fall back to simulated data. Free agents (BBC, HackerNews, Al Jazeera, arXiv, GDELT, Google News) work without any keys.
+All keys are optional — agents without keys fall back to simulated data. Free agents (BBC, Al Jazeera, NPR, CNBC, France 24, TechCrunch, Nature, HackerNews, arXiv, GDELT, Google News) work without any keys.
 
 ## Access control
 
@@ -51,7 +51,7 @@ Set `TELEGRAM_OWNER_ID` env var to your Telegram user ID for admin access. Confi
 ## Tests
 
 ```bash
-python -m pytest tests/ -v          # 779+ tests
+python -m pytest tests/ -v          # 821+ tests
 ```
 
 ## Architecture
@@ -111,6 +111,6 @@ src/newsfeed/
   models/                  # Domain models (CandidateItem, ReportItem, etc.) + config loading
   orchestration/           # Engine, orchestrator, communication, optimizer, configurator, audit
   review/                  # Style + clarity review agents, persona stack
-tests/                     # 779+ tests across all components
+tests/                     # 821+ tests across all components
 docs/                      # Architecture docs, execution plan, vision
 ```

@@ -7,11 +7,13 @@ Covers:
 - Cloudflare Worker payload validation
 - Engine concurrency backpressure (semaphore)
 - Intelligence stage failure tracking in metadata + footer
+- Pipeline-level timeout enforcement
+- README accuracy (test count, free source list)
 """
 from __future__ import annotations
 
-import re
 import threading
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -242,7 +244,15 @@ class TestReadmeSourceCount(unittest.TestCase):
     def test_readme_test_count_current(self):
         readme = Path(__file__).resolve().parent.parent / "README.md"
         text = readme.read_text()
-        self.assertIn("779+", text)
+        self.assertIn("821+", text)
+
+    def test_readme_free_sources_complete(self):
+        readme = Path(__file__).resolve().parent.parent / "README.md"
+        text = readme.read_text()
+        for src in ["BBC", "Al Jazeera", "NPR", "CNBC", "France 24",
+                     "TechCrunch", "Nature", "HackerNews", "arXiv",
+                     "GDELT", "Google News"]:
+            self.assertIn(src, text, f"Free source {src!r} missing from README")
 
     def test_config_agent_count_matches_readme(self):
         import json
@@ -565,6 +575,74 @@ class TestStageFailureSurfacing(unittest.TestCase):
         self.assertIsInstance(health.get("stages_failed"), list)
         # With simulated agents, no stages should fail
         self.assertEqual(len(health["stages_failed"]), 0)
+
+
+# ── 7. Pipeline-Level Timeout Enforcement ─────────────────────────
+
+
+class TestPipelineTimeout(unittest.TestCase):
+    """Verify the engine enforces a hard deadline on pipeline runs."""
+
+    def _make_engine(self, timeout_s=120):
+        import json
+        config_path = Path(__file__).resolve().parent.parent / "config"
+        agents_cfg = json.loads((config_path / "agents.json").read_text())
+        pipeline_cfg = json.loads((config_path / "pipelines.json").read_text())
+        pipeline_cfg.setdefault("limits", {})["pipeline_timeout_seconds"] = timeout_s
+        personas_cfg = {"default_personas": ["engineer"]}
+        personas_dir = Path(__file__).resolve().parent.parent / "personas"
+        from newsfeed.orchestration.engine import NewsFeedEngine
+        return NewsFeedEngine(agents_cfg, pipeline_cfg, personas_cfg, personas_dir)
+
+    def test_engine_has_pipeline_timeout_config(self):
+        engine = self._make_engine(timeout_s=60)
+        self.assertEqual(engine._pipeline_timeout_s, 60)
+
+    def test_engine_uses_default_timeout_when_not_configured(self):
+        import json
+        config_path = Path(__file__).resolve().parent.parent / "config"
+        agents_cfg = json.loads((config_path / "agents.json").read_text())
+        pipeline_cfg = json.loads((config_path / "pipelines.json").read_text())
+        pipeline_cfg.get("limits", {}).pop("pipeline_timeout_seconds", None)
+        personas_cfg = {"default_personas": ["engineer"]}
+        personas_dir = Path(__file__).resolve().parent.parent / "personas"
+        from newsfeed.orchestration.engine import NewsFeedEngine
+        engine = NewsFeedEngine(agents_cfg, pipeline_cfg, personas_cfg, personas_dir)
+        self.assertEqual(engine._pipeline_timeout_s, NewsFeedEngine.DEFAULT_PIPELINE_TIMEOUT_S)
+
+    def test_run_with_deadline_raises_on_timeout(self):
+        """Simulate a slow pipeline and verify TimeoutError is raised."""
+        engine = self._make_engine(timeout_s=1)
+        # Monkey-patch _handle_request_inner to sleep longer than the deadline
+        original = engine._handle_request_inner
+
+        def slow_inner(*args, **kwargs):
+            time.sleep(5)
+            return original(*args, **kwargs)
+
+        engine._handle_request_inner = slow_inner
+        with self.assertRaises(TimeoutError) as ctx:
+            engine._run_with_deadline("u1", "test", {"tech": 0.5}, None)
+        self.assertIn("timed out", str(ctx.exception))
+
+    def test_normal_pipeline_completes_within_deadline(self):
+        """A normal pipeline (simulated agents) should finish well within timeout."""
+        engine = self._make_engine(timeout_s=60)
+        payload = engine.handle_request_payload(
+            user_id="timeout_test_user",
+            prompt="Quick briefing",
+            weighted_topics={"technology": 0.8},
+        )
+        self.assertIsNotNone(payload)
+        self.assertTrue(len(payload.items) > 0)
+
+    def test_timeout_error_message_includes_duration(self):
+        """The TimeoutError message should include the configured timeout value."""
+        engine = self._make_engine(timeout_s=1)
+        engine._handle_request_inner = lambda *a, **kw: time.sleep(10)
+        with self.assertRaises(TimeoutError) as ctx:
+            engine._run_with_deadline("u1", "test", {}, None)
+        self.assertIn("1s", str(ctx.exception))
 
 
 if __name__ == "__main__":
