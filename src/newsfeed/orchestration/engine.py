@@ -1027,18 +1027,25 @@ class NewsFeedEngine:
         self._save_d1_state()
 
     def _save_d1_state(self) -> None:
-        """Persist state to D1 so it survives across ephemeral GH Actions runs."""
+        """Persist state to D1 so it survives across ephemeral GH Actions runs.
+
+        Uses save_many() to batch all state into a single D1 API call
+        instead of 8+ sequential HTTP round-trips.
+        """
         try:
-            self._d1_state.save("preferences", self.preferences.snapshot())
-            self._d1_state.save("credibility", self.credibility.snapshot())
-            self._d1_state.save("georisk", self.georisk.snapshot())
-            self._d1_state.save("trends", self.trends.snapshot())
-            self._d1_state.save("optimizer", self.optimizer.snapshot())
-            self._d1_state.save("debate_chair", self.experts.chair.snapshot())
+            batch: dict[str, dict] = {
+                "preferences": self.preferences.snapshot(),
+                "credibility": self.credibility.snapshot(),
+                "georisk": self.georisk.snapshot(),
+                "trends": self.trends.snapshot(),
+                "optimizer": self.optimizer.snapshot(),
+                "debate_chair": self.experts.chair.snapshot(),
+            }
             if hasattr(self, "_scheduler") and self._scheduler:
-                self._d1_state.save("scheduler", self._scheduler.snapshot())
+                batch["scheduler"] = self._scheduler.snapshot()
             if hasattr(self, "access_control"):
-                self._d1_state.save("access_control", self.access_control.snapshot())
+                batch["access_control"] = self.access_control.snapshot()
+            self._d1_state.save_many(batch)
         except Exception:
             log.debug("D1 state save failed (non-critical)", exc_info=True)
 
