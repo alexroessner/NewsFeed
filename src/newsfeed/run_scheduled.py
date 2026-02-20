@@ -79,8 +79,18 @@ def main() -> None:
         profile = engine.preferences.get_or_create(owner_id)
         if not profile.topic_weights:
             profile.topic_weights = {"geopolitics": 0.8, "technology": 0.7, "markets": 0.5}
-        engine._comm_agent._run_briefing(int(owner_id), owner_id, "geopolitics technology")
-        log.info("Default briefing sent to %s", owner_id)
+        try:
+            engine._comm_agent._run_briefing(int(owner_id), owner_id, "geopolitics technology")
+            log.info("Default briefing sent to %s", owner_id)
+        except Exception:
+            log.exception("Default briefing to owner %s failed", owner_id)
+
+    # Persist all state to D1 so credibility learning, preference updates, and
+    # scheduler state survive across ephemeral GH Actions runs.
+    try:
+        engine._save_d1_state()
+    except Exception:
+        log.warning("D1 state save failed at exit", exc_info=True)
 
 
 def _inject_env_secrets(config_dir: Path) -> bool:

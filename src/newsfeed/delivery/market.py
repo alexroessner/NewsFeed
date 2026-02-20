@@ -8,6 +8,7 @@ All fetches use stdlib urllib — no third-party dependencies.
 """
 from __future__ import annotations
 
+import html as html_mod
 import json
 import logging
 import time
@@ -259,6 +260,6 @@ class MarketTicker:
             else:
                 change_str = ""
 
-            parts.append(f"<b>{q.label}</b> ${price_str}{change_str}")
+            parts.append(f"<b>{html_mod.escape(q.label)}</b> ${price_str}{change_str}")
 
         return " \u2502 ".join(parts)  # │ separator

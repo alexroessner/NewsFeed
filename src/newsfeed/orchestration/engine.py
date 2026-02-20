@@ -1380,18 +1380,21 @@ class NewsFeedEngine:
                      len(self.optimizer._disabled_agents), len(self.optimizer._weight_overrides))
 
         # Restore credibility baselines
+        # snapshot() uses short keys: reliability, accuracy, corroboration, seen
         cred_data = self._persistence.load("credibility")
         if cred_data and isinstance(cred_data, dict):
             for source_id, sdata in cred_data.items():
                 if not isinstance(source_id, str) or not isinstance(sdata, dict):
                     continue
                 sr = self.credibility.get_source(source_id)
-                if isinstance(sdata.get("reliability_score"), (int, float)):
-                    sr.reliability_score = max(0.0, min(1.0, float(sdata["reliability_score"])))
-                if isinstance(sdata.get("corroboration_rate"), (int, float)):
-                    sr.corroboration_rate = max(0.0, min(1.0, float(sdata["corroboration_rate"])))
-                if isinstance(sdata.get("total_items_seen"), int):
-                    sr.total_items_seen = max(0, sdata["total_items_seen"])
+                if isinstance(sdata.get("reliability"), (int, float)):
+                    sr.reliability_score = max(0.0, min(1.0, float(sdata["reliability"])))
+                if isinstance(sdata.get("accuracy"), (int, float)):
+                    sr.historical_accuracy = max(0.0, min(1.0, float(sdata["accuracy"])))
+                if isinstance(sdata.get("corroboration"), (int, float)):
+                    sr.corroboration_rate = max(0.0, min(1.0, float(sdata["corroboration"])))
+                if isinstance(sdata.get("seen"), int):
+                    sr.total_items_seen = max(0, sdata["seen"])
             log.info("Restored credibility data for %d sources", len(cred_data))
 
         # Restore georisk baselines

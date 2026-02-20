@@ -642,7 +642,7 @@ class TelegramBot:
         current = ""
 
         for line in text.split("\n"):
-            if len(current) + len(line) + 1 > _MAX_MESSAGE_LENGTH - 100:
+            if len(current) + len(line) + 1 > _MAX_MESSAGE_LENGTH - 200:
                 if current:
                     chunks.append(_close_unclosed_html_tags(current))
                 current = line

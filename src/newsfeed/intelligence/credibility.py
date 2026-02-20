@@ -26,9 +26,8 @@ class CredibilityTracker:
         self._corroboration_increment = cfg.get("corroboration_increment", 0.02)
 
         scoring = cfg.get("_scoring", {}).get("credibility_weights", {})
-        self._w_composite = scoring.get("composite", 0.70)
+        self._w_composite = scoring.get("composite", 0.80)
         self._w_trust = scoring.get("trust", 0.20)
-        self._w_evidence = scoring.get("evidence", 0.10)
         self._bonus_per = scoring.get("corroboration_bonus_per_source", 0.08)
         self._bonus_cap = scoring.get("corroboration_bonus_cap", 0.20)
 
@@ -81,7 +80,7 @@ class CredibilityTracker:
         sr = self.get_source(item.source)
         trust = sr.trust_factor()
         corroboration_bonus = min(self._bonus_cap, self._bonus_per * len(item.corroborated_by))
-        return min(1.0, item.composite_score() * self._w_composite + trust * self._w_trust + corroboration_bonus + self._w_evidence * item.evidence_score)
+        return min(1.0, item.composite_score() * self._w_composite + trust * self._w_trust + corroboration_bonus)
 
     def get_all_sources_by_tier(self) -> dict[str, list[str]]:
         """Return all known source IDs grouped by tier."""
