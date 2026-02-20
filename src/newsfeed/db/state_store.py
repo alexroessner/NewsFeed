@@ -85,6 +85,49 @@ class D1StateStore:
             (key, value, now),
         )
 
+    def save_many(self, items: dict[str, dict]) -> None:
+        """Save multiple state dicts in a single batched call.
+
+        Much faster than calling save() in a loop when using D1, because
+        it sends all writes in one HTTP request instead of one per key.
+        """
+        if not items:
+            return
+        now = time.time()
+        params_list: list[tuple] = []
+        for key, data in items.items():
+            if not _VALID_KEY_RE.match(key):
+                log.warning("Invalid state key rejected: %r", key)
+                continue
+            value = json.dumps(data, default=str)
+            params_list.append((key, value, now))
+
+        if not params_list:
+            return
+
+        # Use execute_many for batching on D1
+        try:
+            if hasattr(self._db, '_d1') and self._db._d1:
+                self._db._d1.execute_many(
+                    "INSERT OR REPLACE INTO state_kv (key, value, updated_at) VALUES (?, ?, ?)",
+                    params_list,
+                )
+            elif hasattr(self._db, '_local'):
+                conn = getattr(self._db._local, 'conn', None)
+                if conn:
+                    conn.executemany(
+                        "INSERT OR REPLACE INTO state_kv (key, value, updated_at) VALUES (?, ?, ?)",
+                        params_list,
+                    )
+                    conn.commit()
+        except Exception:
+            log.warning("Batch state save failed, falling back to individual saves", exc_info=True)
+            for key, data in items.items():
+                try:
+                    self.save(key, data)
+                except Exception:
+                    pass
+
     def load(self, key: str) -> dict | None:
         """Load a state dict by key. Returns None if not found."""
         if not _VALID_KEY_RE.match(key):

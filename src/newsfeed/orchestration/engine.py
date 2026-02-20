@@ -1027,45 +1027,103 @@ class NewsFeedEngine:
         self._save_d1_state()
 
     def _save_d1_state(self) -> None:
-        """Persist state to D1 so it survives across ephemeral GH Actions runs."""
+        """Persist state to D1 so it survives across ephemeral GH Actions runs.
+
+        Uses save_many() to batch all state into a single D1 API call
+        instead of 8+ sequential HTTP round-trips.
+        """
         try:
-            self._d1_state.save("preferences", self.preferences.snapshot())
-            self._d1_state.save("credibility", self.credibility.snapshot())
-            self._d1_state.save("georisk", self.georisk.snapshot())
-            self._d1_state.save("trends", self.trends.snapshot())
-            self._d1_state.save("optimizer", self.optimizer.snapshot())
-            self._d1_state.save("debate_chair", self.experts.chair.snapshot())
+            batch: dict[str, dict] = {
+                "preferences": self.preferences.snapshot(),
+                "credibility": self.credibility.snapshot(),
+                "georisk": self.georisk.snapshot(),
+                "trends": self.trends.snapshot(),
+                "optimizer": self.optimizer.snapshot(),
+                "debate_chair": self.experts.chair.snapshot(),
+            }
             if hasattr(self, "_scheduler") and self._scheduler:
-                self._d1_state.save("scheduler", self._scheduler.snapshot())
+                batch["scheduler"] = self._scheduler.snapshot()
             if hasattr(self, "access_control"):
-                self._d1_state.save("access_control", self.access_control.snapshot())
+                batch["access_control"] = self.access_control.snapshot()
+            self._d1_state.save_many(batch)
         except Exception:
             log.debug("D1 state save failed (non-critical)", exc_info=True)
 
     def _load_d1_state(self) -> None:
-        """Load state from D1 on startup (fallback when file-based state is absent)."""
+        """Load state from D1 on startup (fallback when file-based state is absent).
+
+        Must mirror _save_d1_state — every key that is saved must also
+        be loaded here, otherwise state is silently lost across GH Actions runs.
+        """
         try:
-            prefs = self._d1_state.load("preferences")
-            if prefs and isinstance(prefs, dict):
-                # Delegate to existing _load_state validation logic by temporarily
-                # injecting into persistence, or directly restore minimal state
-                for uid, pdata in prefs.items():
-                    if isinstance(pdata, dict):
-                        profile = self.preferences.get_or_create(uid)
-                        tw = pdata.get("topic_weights", {})
-                        if isinstance(tw, dict):
-                            for k, v in list(tw.items())[:50]:
-                                profile.topic_weights[str(k)] = round(max(-1.0, min(1.0, float(v))), 3)
-                log.info("Restored %d user preferences from D1", len(prefs))
+            # Preferences: use PreferenceStore.restore() which handles all 25+
+            # fields with proper validation. D1StateStore.load() has the same
+            # signature as StatePersistence.load(), so we can pass it directly.
+            count = self.preferences.restore(self._d1_state, key="preferences")
+            if count:
+                log.info("Restored %d user preferences from D1", count)
 
             ac_data = self._d1_state.load("access_control")
             if ac_data and isinstance(ac_data, dict) and hasattr(self, "access_control"):
                 self.access_control.restore(ac_data)
                 log.info("Restored access control state from D1")
 
+            # Credibility: snapshot keys are {reliability, accuracy, corroboration, seen}
             cred = self._d1_state.load("credibility")
             if cred and isinstance(cred, dict):
+                for source_id, sdata in cred.items():
+                    if isinstance(source_id, str) and isinstance(sdata, dict):
+                        sr = self.credibility.get_source(source_id)
+                        if isinstance(sdata.get("reliability"), (int, float)):
+                            sr.reliability_score = max(0.0, min(1.0, float(sdata["reliability"])))
+                        if isinstance(sdata.get("accuracy"), (int, float)):
+                            sr.historical_accuracy = max(0.0, min(1.0, float(sdata["accuracy"])))
+                        if isinstance(sdata.get("corroboration"), (int, float)):
+                            sr.corroboration_rate = max(0.0, min(1.0, float(sdata["corroboration"])))
+                        if isinstance(sdata.get("seen"), int):
+                            sr.total_items_seen = max(0, sdata["seen"])
                 log.info("Restored credibility data from D1 (%d sources)", len(cred))
+
+            # Georisk: snapshot is {region: risk_float}
+            geo_data = self._d1_state.load("georisk")
+            if geo_data and isinstance(geo_data, dict):
+                for region, level in geo_data.items():
+                    if isinstance(region, str) and isinstance(level, (int, float)):
+                        self.georisk._history[region] = max(0.0, min(1.0, float(level)))
+                log.info("Restored georisk baselines from D1 (%d regions)", len(geo_data))
+
+            # Trends: snapshot is {topic: velocity_float}
+            trend_data = self._d1_state.load("trends")
+            if trend_data and isinstance(trend_data, dict):
+                for topic, velocity in trend_data.items():
+                    if isinstance(topic, str) and isinstance(velocity, (int, float)):
+                        self.trends._baseline[topic] = max(0.0, float(velocity))
+                log.info("Restored trend baselines from D1 (%d topics)", len(trend_data))
+
+            # Optimizer: snapshot is {disabled: [...], weights: {...}, agent_stats: {...}}
+            opt_data = self._d1_state.load("optimizer")
+            if opt_data and isinstance(opt_data, dict):
+                if isinstance(opt_data.get("disabled"), list):
+                    for aid in opt_data["disabled"]:
+                        if isinstance(aid, str) and len(aid) <= 100:
+                            self.optimizer._disabled_agents.add(aid)
+                if isinstance(opt_data.get("weights"), dict):
+                    for aid, w in opt_data["weights"].items():
+                        if isinstance(aid, str) and len(aid) <= 100:
+                            self.optimizer._weight_overrides[str(aid)] = max(0.1, min(float(w), 2.0))
+                log.info("Restored optimizer state from D1")
+
+            chair_data = self._d1_state.load("debate_chair")
+            if chair_data and isinstance(chair_data, dict):
+                self.experts.chair.restore(chair_data)
+                log.info("Restored debate chair state from D1")
+
+            # Scheduler: critical for scheduled briefings to survive GH Actions restarts
+            if hasattr(self, "_scheduler") and self._scheduler:
+                sched_data = self._d1_state.load("scheduler")
+                if sched_data and isinstance(sched_data, dict):
+                    count = self._scheduler.restore(sched_data)
+                    log.info("Restored %d briefing schedules from D1", count)
         except Exception:
             log.debug("D1 state load failed (non-critical)", exc_info=True)
 

@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlencode
 
+from newsfeed.delivery.telegram import _close_unclosed_html_tags
 from newsfeed.memory.store import BoundedUserDict
 
 log = logging.getLogger(__name__)
@@ -190,6 +191,7 @@ class TelegramBot:
         """Send a text message to a chat.
 
         Automatically splits messages that exceed Telegram's 4096 char limit.
+        Falls back to plain text if Telegram rejects the HTML.
         """
         if len(text) <= _MAX_MESSAGE_LENGTH:
             payload: dict[str, Any] = {
@@ -200,7 +202,13 @@ class TelegramBot:
             }
             if reply_markup:
                 payload["reply_markup"] = reply_markup
-            return self._api_call("sendMessage", data=payload)
+            result = self._api_call("sendMessage", data=payload)
+            if not result and parse_mode:
+                # Fallback: send without parse_mode so message isn't lost
+                log.warning("HTML send failed for chat=%s, retrying as plain text", chat_id)
+                payload.pop("parse_mode", None)
+                result = self._api_call("sendMessage", data=payload)
+            return result
 
         # Split long messages
         chunks = self._split_message(text)
@@ -215,7 +223,13 @@ class TelegramBot:
             # Only attach reply markup to the last chunk
             if reply_markup and i == len(chunks) - 1:
                 payload["reply_markup"] = reply_markup
-            last_result = self._api_call("sendMessage", data=payload)
+            result = self._api_call("sendMessage", data=payload)
+            if not result and parse_mode:
+                log.warning("HTML chunk %d/%d failed for chat=%s, retrying as plain text",
+                            i + 1, len(chunks), chat_id)
+                payload.pop("parse_mode", None)
+                result = self._api_call("sendMessage", data=payload)
+            last_result = result
         return last_result
 
     def send_briefing(self, chat_id: int | str, formatted_text: str,
@@ -619,20 +633,24 @@ class TelegramBot:
     # ──────────────────────────────────────────────────────────────
 
     def _split_message(self, text: str) -> list[str]:
-        """Split a long message into chunks at paragraph boundaries."""
+        """Split a long message into chunks at paragraph boundaries.
+
+        Closes any unclosed HTML tags at the end of each chunk so
+        Telegram doesn't reject the chunk with a 400 error.
+        """
         chunks: list[str] = []
         current = ""
 
         for line in text.split("\n"):
-            if len(current) + len(line) + 1 > _MAX_MESSAGE_LENGTH - 50:
+            if len(current) + len(line) + 1 > _MAX_MESSAGE_LENGTH - 100:
                 if current:
-                    chunks.append(current)
+                    chunks.append(_close_unclosed_html_tags(current))
                 current = line
             else:
                 current = f"{current}\n{line}" if current else line
 
         if current:
-            chunks.append(current)
+            chunks.append(_close_unclosed_html_tags(current))
 
         return chunks or [text[:_MAX_MESSAGE_LENGTH]]
 

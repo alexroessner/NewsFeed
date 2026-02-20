@@ -22,12 +22,20 @@ log = logging.getLogger(__name__)
 _MAX_RETRIES = 3
 _RETRY_BACKOFF = (1.0, 2.0, 4.0)
 
+# D1 REST API supports up to 100 statements per batch request.
+_BATCH_MAX = 100
+
 
 class D1Client:
     """Minimal Cloudflare D1 REST API client.
 
     Provides execute/query methods that mirror sqlite3.Connection semantics
     so AnalyticsDB can swap backends transparently.
+
+    Uses the D1 batch API (array of SQL objects in a single POST) to
+    minimize HTTP round-trips.  This is critical for performance — a
+    pipeline run can generate 300+ writes; without batching, each write
+    is a separate 300ms+ HTTP call.
     """
 
     def __init__(self, account_id: str, database_id: str, api_token: str) -> None:
@@ -91,7 +99,7 @@ class D1Client:
 
     def execute(self, sql: str, params: tuple = ()) -> list[dict]:
         """Execute a single SQL statement. Returns list of row dicts."""
-        body = {"sql": sql}
+        body: dict[str, Any] = {"sql": sql}
         if params:
             body["params"] = [_convert_param(p) for p in params]
 
@@ -101,37 +109,74 @@ class D1Client:
         return []
 
     def execute_many(self, sql: str, params_list: list[tuple]) -> None:
-        """Execute a parameterized statement for each set of params.
+        """Execute a parameterized statement for multiple param sets.
 
-        The D1 REST API only accepts single statements per request,
-        so we iterate and send each individually.
+        Uses D1's batch API to send up to 100 statements per HTTP
+        request, reducing hundreds of round-trips to a handful.
         """
         if not params_list:
             return
 
+        # Build batch: same SQL with different params for each row
+        batch: list[dict[str, Any]] = []
         for params in params_list:
-            self.execute(sql, params)
+            stmt: dict[str, Any] = {"sql": sql}
+            if params:
+                stmt["params"] = [_convert_param(p) for p in params]
+            batch.append(stmt)
+
+        # Send in chunks of _BATCH_MAX
+        for i in range(0, len(batch), _BATCH_MAX):
+            chunk = batch[i : i + _BATCH_MAX]
+            try:
+                self._post(chunk)
+            except Exception:
+                log.warning(
+                    "D1 batch write failed (chunk %d–%d of %d), falling back to individual",
+                    i, i + len(chunk), len(batch),
+                )
+                # Fallback: try individual writes for this chunk only
+                for stmt in chunk:
+                    try:
+                        self._post(stmt)
+                    except Exception:
+                        pass  # fire-and-forget semantics
 
     def execute_script(self, script: str) -> None:
         """Execute a multi-statement SQL script (schema init).
 
-        Splits on semicolons and sends each statement individually,
-        since the D1 REST API only accepts single statements per request.
-        Bails out on first failure to avoid blocking for minutes when
-        credentials are wrong. All DDL uses IF NOT EXISTS, so re-running
-        on next invocation is safe.
+        Batches DDL statements into chunks of up to 100 per API call,
+        dramatically reducing schema init time from ~40 HTTP calls to ~1.
         """
+        stmts: list[dict[str, Any]] = []
         for raw in script.split(";"):
             # Strip comment-only lines first, then check if anything remains
             lines = [l for l in raw.split("\n") if not l.strip().startswith("--")]
             clean = "\n".join(lines).strip()
             if clean:
-                try:
-                    self.execute(clean)
-                except Exception:
-                    log.warning("D1 schema init failed, skipping remaining statements: %s",
-                                clean.replace("\n", " ")[:100])
-                    return
+                stmts.append({"sql": clean})
+
+        if not stmts:
+            return
+
+        # Send in chunks of _BATCH_MAX
+        for i in range(0, len(stmts), _BATCH_MAX):
+            chunk = stmts[i : i + _BATCH_MAX]
+            try:
+                self._post(chunk)
+            except Exception:
+                log.warning(
+                    "D1 schema batch failed (chunk %d–%d of %d), trying individually",
+                    i, i + len(chunk), len(stmts),
+                )
+                # Fallback: try statements individually (old behavior)
+                for stmt in chunk:
+                    try:
+                        self._post(stmt)
+                    except Exception:
+                        log.warning("D1 schema stmt failed: %s",
+                                    stmt["sql"].replace("\n", " ")[:100])
+                        return  # bail on persistent failure
 
     def query(self, sql: str, params: tuple = ()) -> list[dict]:
         """Execute a read query and return list of row dicts."""
