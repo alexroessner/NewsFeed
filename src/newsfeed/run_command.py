@@ -166,6 +166,9 @@ def _inject_env_secrets(config_dir: Path) -> None:
         "guardian": "GUARDIAN_API_KEY",
         "anthropic_api_key": "ANTHROPIC_API_KEY",
         "x_bearer_token": "X_BEARER_TOKEN",
+        "newsapi": "NEWSAPI_KEY",
+        "reddit_client_id": "REDDIT_CLIENT_ID",
+        "reddit_client_secret": "REDDIT_CLIENT_SECRET",
     }
 
     secrets = {}
