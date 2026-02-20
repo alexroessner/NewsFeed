@@ -140,7 +140,19 @@ def main() -> None:
     except Exception as e:
         log.exception("handle_update failed")
         _send_error_to_chat(update, token, "Something went wrong. Please try again.")
+        # Still persist any partial state changes (e.g. preferences modified before crash)
+        try:
+            engine._save_d1_state()
+        except Exception:
+            log.debug("D1 state save after error failed", exc_info=True)
         sys.exit(1)
+
+    # Persist all state to D1 so preference changes, schedule updates, feedback,
+    # and credibility learning survive across ephemeral GH Actions runs.
+    try:
+        engine._save_d1_state()
+    except Exception:
+        log.warning("D1 state save failed at exit", exc_info=True)
 
     if result:
         log.info("Handled: %s", result)
