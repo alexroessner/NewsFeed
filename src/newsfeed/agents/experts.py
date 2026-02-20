@@ -556,8 +556,8 @@ class ExpertCouncil:
         for candidate_id, cvotes in final_by_candidate.items():
             weighted_keep = self.chair.weighted_keep_count(cvotes)
             weighted_total = self.chair.weighted_total(cvotes)
-            # Accept if weighted keep proportion exceeds threshold
-            if weighted_total > 0 and (weighted_keep / weighted_total) >= 0.5:
+            # Accept if weighted keep proportion meets the configured threshold
+            if weighted_total > 0 and (weighted_keep / weighted_total) >= self.keep_threshold:
                 accepted_ids.add(candidate_id)
 
         # Update debate record with final (potentially revised) votes

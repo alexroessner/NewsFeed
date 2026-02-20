@@ -22,9 +22,8 @@
       "corroboration": 0.20
     },
     "credibility_weights": {
-      "composite": 0.70,
+      "composite": 0.80,
       "trust": 0.20,
-      "evidence": 0.10,
       "corroboration_bonus_per_source": 0.08,
       "corroboration_bonus_cap": 0.20
     },
